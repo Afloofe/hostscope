@@ -1,0 +1,29 @@
+[package]
+name = "hemostat-enforce-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Linux enforcement: reversible removal actions (kill, suspend, quarantine, unit mask, module unload) guarded by a protect-set and frozen-target revalidation."
+
+[dependencies]
+# procfs::read_process supplies the frozen-target identity (starttime/exe/ppid)
+# that every process action re-checks before it signals.
+hemostat-sensor-linux = { path = "../sensor-linux" }
+# The undo journal's line format and durable append (`journal.rs`), shared with
+# the firewall's journal (RFC-002 §1).
+hemostat-evfmt = { path = "../evfmt" }
+# The certificate reader the trust sweep uses (`anchor.rs` finds the chosen
+# certificate in a file by the same reading). Already a dependency of
+# sensor-linux, so it adds nothing to the image.
+hemostat-evcrypto = { path = "../evcrypto" }
+sha2 = { version = "0.10", default-features = false }
+libc = "0.2"
+
+[dev-dependencies]
+# Only so a test can hold uninstall's runit directory list equal to the one the
+# sentinel registers into.
+hemostat-lifecycle = { path = "../lifecycle" }
+
+[lints]
+workspace = true

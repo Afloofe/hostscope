@@ -1,0 +1,35 @@
+# Platform-neutral: the parent and child lists carry both Windows (`\`) and
+# POSIX (`/`) path suffixes. On Linux the procfs events carry no ParentImage,
+# so `detect` lists this rule as one that could not match there.
+title: Web server process starts a command interpreter
+id: 1d764fd6-e7da-416f-9f60-2976c5620546
+status: experimental
+description: The parent image is a web or application server worker and the new process is a shell or script host.
+logsource:
+  category: process_creation
+detection:
+  parent:
+    ParentImage|endswith:
+      - '\w3wp.exe'
+      - '\httpd.exe'
+      - '\nginx.exe'
+      - '\php-cgi.exe'
+      - '\tomcat.exe'
+      - '\tomcat9.exe'
+      - '/nginx'
+      - '/httpd'
+      - '/apache2'
+  child:
+    Image|endswith:
+      - '\cmd.exe'
+      - '\powershell.exe'
+      - '\pwsh.exe'
+      - '\cscript.exe'
+      - '\wscript.exe'
+      - '\mshta.exe'
+      - '\bash.exe'
+      - '/sh'
+      - '/bash'
+      - '/dash'
+  condition: parent and child
+level: high

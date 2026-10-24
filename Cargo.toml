@@ -1,0 +1,108 @@
+# HEMOSTAT workspace root.
+#
+# One workspace, one Cargo.lock, one binary per target (RFC-001 §2). Both
+# runtime roles — the agent process and the sentinel — are subcommands of that
+# single artifact, which keeps self-verification, reproducible-build accounting
+# and release signing to one file per target.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/broker",
+    "crates/buildinfo",
+    "crates/lifecycle",
+    "crates/core",
+    "crates/evcrypto",
+    "crates/detect",
+    "crates/query",
+    "crates/remote",
+    "crates/export",
+    "crates/fleet",
+    "crates/evfmt",
+    "crates/modules",
+    "crates/sensor-linux",
+    "crates/scan",
+    "crates/enforce-linux",
+    "crates/sensor-win",
+    "crates/sensor-freebsd",
+    "crates/enforce-pf",
+    "crates/cli",
+    "crates/tui",
+    "crates/safestr",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "Apache-2.0"
+
+# The unsafe floor (RFC-001 §2). Every crate inherits `forbid(unsafe_code)`;
+# the six FFI crates will override this to `deny(unsafe_op_in_unsafe_fn)` when
+# they land. Declaring it here rather than per-crate means a new crate is safe
+# by default and must opt out explicitly and visibly.
+[workspace.lints.rust]
+# `deny`, not `forbid`, so the FFI crates of RFC-001 §2 can opt in where the
+# design requires a syscall. This is not a weakening: every non-FFI crate
+# carries its own `#![forbid(unsafe_code)]`, which outranks this, and
+# `cargo xtask lint-unsafe` asserts that each one still does — so the guarantee
+# is now checked per crate instead of resting on a setting a crate could quietly
+# stop inheriting.
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Panicking paths are reviewed individually: the agent runs `panic = abort`, so
+# any panic is a whole-process outage with a ~1 s hole until a sentinel
+# relaunches (D11). These are warnings now and become deny before M3.
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+# Every `unsafe` block says why it is sound. Five did not, in the FFI crates
+# where the claim matters most; the lint makes the next one a build failure.
+undocumented_unsafe_blocks = "deny"
+
+# Release profile per design §18.2.5. Determinism first, then speed; size is a
+# measured metric rather than a gate (D26).
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1      # removes parallel-codegen ordering as a reproducibility variable
+panic = "abort"
+strip = "symbols"
+overflow-checks = true # kept ON in release: a silent wrap in an evidence offset is worse than an abort
+debug = 1              # line tables only, for usable crash records
+
+# Iteration only. NEVER shipped, never used for an artefact anybody verifies.
+#
+# `[profile.release]` above is tuned for reproducibility rather than for build
+# time: `codegen-units = 1` exists specifically to remove parallel-codegen
+# ordering as a variable, and `lto = "fat"` is whole-program. Together they are
+# close to the slowest configuration rustc offers, on purpose, and on a tree
+# that pulls in wasmtime for `mod-scan-yara` that is minutes per change.
+#
+# So this is a separate profile rather than a loosening of that one. Release
+# output is byte-for-byte unaffected by anything here.
+#
+# What is relaxed is ONLY compile-time: optimisation level, LTO, codegen
+# parallelism, debug info, incremental reuse. What is deliberately NOT relaxed
+# is anything a program could observe about itself:
+#
+#   * `overflow-checks` stays inherited-on, because release keeps it on and a
+#     silent wrap that happens in one profile and aborts in the other is exactly
+#     the "works in dev, wrong in prod" class this rules out.
+#   * `panic = "abort"` is inherited, so unwinding behaviour matches.
+#   * `debug-assertions` stays off, as in release.
+#
+# A binary built here is slower than a release binary and behaves identically.
+#
+#   cargo build --profile quick        (or: cargo quick)
+[profile.quick]
+inherits = "release"
+opt-level = 1          # enough to keep it usable; 3 is where the time goes
+lto = false            # whole-program LTO is the single biggest cost
+codegen-units = 256    # the point: actually use the cores
+debug = 0              # no line tables; this profile is not for crash records
+incremental = true     # reuse across edits, which release deliberately cannot

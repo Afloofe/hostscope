@@ -1,0 +1,54 @@
+# Lets `cargo xtask <task>` work from anywhere in the workspace.
+[alias]
+# Fast iteration. See the `[profile.quick]` comment in Cargo.toml for what is
+# and is not relaxed. Deliberately not the default: `cargo build --release` is
+# still what produces a verifiable artefact.
+quick = "build --profile quick"
+quick-test = "test --profile quick"
+
+# The musl target needs a C cross-compiler, and that is new.
+#
+# `wasmtime` — pulled in by `yara-x` for `mod-scan-yara` (D23) — compiles
+# `src/runtime/vm/helpers.c` in its build script whenever its `runtime` feature
+# is on, which yara-x requires. Its own build.rs carries a TODO saying the Unix
+# path cannot yet be skipped, so there is no feature that turns it off: building
+# the agent for `x86_64-unknown-linux-musl` now needs a musl-targeting C
+# compiler on the build host.
+#
+# That target is not optional. It produces the portable static binary that ships
+# in `dist/` (`vm/build-portable.sh`), it is what the `no-codegen` gate builds to
+# prove W^X behaviourally — the cage is only meaningful on a static binary — and
+# it is what the `vm` lanes boot.
+#
+# cc-rs finds it by name: it looks for `x86_64-linux-musl-gcc` on PATH, which is
+# what Arch's `musl` package installs (as does every musl-cross toolchain). So
+# there is deliberately no compiler path pinned here — a hardcoded absolute path
+# is wrong on the next machine, and the failure mode is a build that breaks for a
+# reason the error does not name. If a host puts it somewhere unusual, set
+# `CC_x86_64_unknown_linux_musl` in the environment.
+#
+# The symptom when it is missing, so the next person does not have to bisect:
+#
+#     error occurred in cc-rs: failed to find tool "x86_64-linux-musl-gcc"
+#
+# from `wasmtime`'s build script, which also fails the `no-codegen` gate — that
+# gate builds the musl target precisely because the W^X cage is only meaningful
+# on a static binary.
+
+# Static CRT on Windows.
+#
+# Without this the binary imports VCRUNTIME140.dll and the api-ms-win-crt-*
+# stubs, none of which a clean Windows Server carries — a stock 2022 guest
+# refuses to start it with "VCRUNTIME140.dll was not found". For an agent whose
+# whole job is to be dropped onto a host somebody else owns, "install the Visual
+# C++ redistributable first" is not a deployment step that exists: the host is
+# compromised, it may have no network, and putting a new runtime on it changes
+# the evidence.
+#
+# The Linux side already ships a static binary through `vm/build-portable.sh`
+# for the same reason. This is the same decision for the other platform, and it
+# was missed because `cargo xwin build` links fine and `cargo xtask win-check`
+# typechecks fine — the defect only exists at exec time, on a machine that has
+# never had a compiler on it.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,0 +1,17 @@
+[package]
+name = "hemostat-export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Findings out of the agent and into someone else's tooling: JSONL, STIX 2.1, MISP, and a written report."
+
+[dependencies]
+# The event record and identity types the exporters describe. Nothing else:
+# an exporter that pulled in a serialisation framework would put a second
+# hostile-input parser in the process that §5 already notes is holding
+# enforcement handles.
+hemostat-core = { path = "../core" }
+
+[lints]
+workspace = true

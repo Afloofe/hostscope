@@ -1,0 +1,239 @@
+[package]
+name = "hemostat-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The single HEMOSTAT binary: composition root, role and verb dispatch."
+
+# One artifact per target. Both runtime roles (agent, sentinel) are subcommands
+# of this binary rather than separate executables (RFC-001 §2).
+[[bin]]
+name = "hemostat"
+path = "src/main.rs"
+
+[dependencies]
+hemostat-tui = { path = "../tui", optional = true }
+# The render-boundary sanitizer. Mandatory in every variant and never
+# feature-gated (RFC-001 §2): every verb prints host-derived strings — process
+# paths, unit names, cron lines, account names — to a terminal, and an image
+# built without `mod-tui` prints just as many of them as one built with it.
+# Gating this behind the terminal interface is what left ~30 verbs rendering
+# attacker-chosen bytes raw.
+hemostat-safestr = { path = "../safestr" }
+hemostat-broker = { path = "../broker" }
+hemostat-buildinfo = { path = "../buildinfo" }
+hemostat-modules = { path = "../modules" }
+hemostat-detect = { path = "../detect" }
+hemostat-query = { path = "../query" }
+hemostat-remote = { path = "../remote", optional = true }
+# The collector (RFC-003): ingest, its verifier and its ledger. Behind
+# `mod-collector`, so no agent image links it. The parcel codec that `ship`
+# writes in every image is in `hemostat-evfmt`.
+hemostat-fleet = { path = "../fleet", optional = true }
+hemostat-core = { path = "../core" }
+# The evidence store: format + writer + standalone verifier. Unconditional
+# because `verify` is portable (an examiner runs it on any host) and `collect`
+# writes through it on Linux.
+hemostat-evfmt = { path = "../evfmt" }
+# The handover formats. Unconditional: an engagement that cannot hand its
+# findings to the rest of the response is an engagement whose findings stay in
+# this tool, and the four exporters together are smaller than the feature gate
+# that would guard them.
+hemostat-export = { path = "../export" }
+# The evidence seal (Ed25519/COSE_Sign1) that signs each segment footer, and the
+# header key-material codec. Portable: `verify` checks signatures on any host.
+hemostat-evcrypto = { path = "../evcrypto" }
+# For a stable host id in the store header (SHA-256 of the machine id). Already
+# in the lockfile via evfmt, so it consumes no new dependency-ledger slot.
+sha2 = { version = "0.10", default-features = false }
+# The YARA scanner, behind `mod-scan-yara` (RFC-001 §3). Optional is the whole
+# point: yara-x drags wasmtime and ~123 crates in with it, and gating it here —
+# rather than inside the scan crate — is what keeps them out of an image that
+# reports the module NOT-BUILT. `dep:hemostat-scan` in the feature below is the
+# same shape `mod-tui` uses.
+hemostat-scan = { path = "../scan", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hemostat-sensor-linux = { path = "../sensor-linux" }
+# For O_NOFOLLOW only. The setuid remedy has to open its target without
+# following a symlink, and the flag's value is not the same on every Linux
+# architecture, so it is taken from libc rather than written out as a number.
+libc = "0.2"
+# The enforcement family, carved out of sensor-linux into its own crate (the
+# reserved `enforce-linux` FFI slot). Unconditional: its undo executors are
+# mandatory in every variant (RFC-001 §7). Its forward actions are reached from
+# the verbs and the console through the broker, each behind its `mod-*` gate.
+hemostat-enforce-linux = { path = "../enforce-linux" }
+# The sentinel: sealed-image relaunch and the restart policy (§4.3, §5.7.1).
+# Unconditional on Linux because survivability is not a variant choice — an
+# `observe-only` image is exactly as worth killing as an `it-full` one, and the
+# crate actuates nothing but the agent's own resurrection.
+hemostat-lifecycle = { path = "../lifecycle" }
+# The firewall agent's pure modules, on the collector (RFC-002 §2, S11):
+# `correlate` opens the firewall's sealed telemetry store and judges it again
+# with the same code the box ran — the off-host second opinion. Behind
+# `mod-collector`, so no agent image on Linux carries it; Linux only, because
+# `correlate` joins it with the Linux host export.
+hemostat-sensor-freebsd = { path = "../sensor-freebsd", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+hemostat-sensor-win = { path = "../sensor-win" }
+
+# The pfSense agent's platform layer (RFC-002 §1): verified base tools, safe
+# reads, the host id and the store's placement. No FFI and no unsafe, on this
+# target or any other.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+hemostat-sensor-freebsd = { path = "../sensor-freebsd" }
+# Containment on the firewall (RFC-002 §1): unconditional, so the revert that
+# arrives with it is in every FreeBSD variant (RFC-001 §7).
+hemostat-enforce-pf = { path = "../enforce-pf" }
+
+# `src/freebsd.rs` is compiled into the test build on every host, so its probe
+# rendering is tested where the tests run rather than only on VM 112.
+[dev-dependencies]
+hemostat-sensor-freebsd = { path = "../sensor-freebsd" }
+# `src/win_drift.rs` is compiled into the test build on every host too, for
+# the same reason: its store records and rendering are tested where the tests
+# run. The sensor's pure half builds anywhere.
+hemostat-sensor-win = { path = "../sensor-win" }
+hemostat-enforce-pf = { path = "../enforce-pf" }
+# `src/rejudge.rs`, the collector's judges for the firewall's stores, is in the
+# test build on Linux whatever the variant, as `collector.rs` is. A test is
+# never an image, so this puts the collector crate in no agent
+# (`xtask lint-listen` says the same).
+hemostat-fleet = { path = "../fleet" }
+
+[features]
+# No default. A build must name a variant; `build.rs` fails the build otherwise.
+# This is deliberate: a binary built with no variant would report every
+# capability NOT-BUILT and would be a genuinely dangerous thing to drop on a
+# host by accident.
+default = []
+
+# --- Named build variants (RFC-001 §5) --------------------------------------
+# The single source of truth is `variants.toml`; these lists must match it, and
+# `xtask` asserts that they do rather than trusting it. Hand-picking `mod-*`
+# features for a real engagement is prohibited — under time pressure it produces
+# a binary nobody can characterise afterwards.
+
+## Default enterprise IR engagement.
+variant-it-full = [
+    "sense-and-analyse",
+    "mod-enf-net-egress", "mod-enf-net-ingress", "mod-enf-proc",
+    "mod-enf-account", "mod-enf-exec", "mod-enf-persistence", "mod-enf-file",
+    "mod-enf-perimeter", "mod-enf-perimeter-kill",
+    "mod-harden-noreboot", "mod-harden-reboot",
+    "mod-deceive", "mod-sidecar",
+    "mod-remote",
+]
+
+## Plant and process-control hosts. Retains exactly one containment class:
+## egress isolation, which §11.2 of RFC-001 argues for at length. Compiling out
+## every containment would push a responder facing a live OT compromise toward
+## `it-full` — the build with Kill, ExecBlock and account actions all present.
+## `network --arm --egress` also loads the inbound ruleset, which this image
+## leaves out, so until an egress-only one is validated its reachable
+## containment is `--block-pid` / `--block-dest` (build-info says so).
+## On the firewall the same argument keeps the perimeter block and leaves out
+## the state kill, which cannot be undone (RFC-002 §5).
+variant-ot-safe = [
+    "sense-and-analyse",
+    "mod-enf-net-egress",
+    "mod-enf-perimeter",
+    "mod-harden-noreboot",
+    "mod-remote",
+]
+
+## No console, no network path. The listening-socket code is absent from the
+## image entirely, not merely disabled by configuration.
+variant-airgap = [
+    "sense-and-analyse",
+    "mod-enf-net-egress", "mod-enf-net-ingress", "mod-enf-proc",
+    "mod-enf-account", "mod-enf-exec", "mod-enf-persistence", "mod-enf-file",
+    "mod-enf-perimeter", "mod-enf-perimeter-kill",
+    "mod-harden-noreboot", "mod-harden-reboot",
+    "mod-deceive", "mod-sidecar",
+]
+
+## Any engagement whose rules are unknown, restrictive, or not yet read.
+## Defined by a rule-independent property: no action class with an `apply` is
+## compiled in. Safe to drop under any rule set, including one nobody has read.
+variant-observe-only = [
+    "sense-and-analyse",
+    "mod-remote",
+]
+
+## Responder-side jump box. Never dropped on a target: no sensors, no
+## enforcement, no self-protection — it is not an agent.
+variant-collector = [
+    "mod-collector",
+    "mod-tui",
+    "mod-export-stix", "mod-export-misp", "mod-export-jsonl", "mod-export-report",
+    "mod-verify-embedded",
+]
+
+# Shared by every agent variant: telemetry, analysis, evidence, and the local
+# interface. Not a variant itself — an internal grouping so the variant lists
+# stay readable.
+sense-and-analyse = [
+    "mod-sensor-etw", "mod-sensor-evtlog", "mod-sensor-usn",
+    "mod-sensor-sysmon", "mod-sensor-wmi",
+    "mod-sensor-ebpf", "mod-sensor-fanotify", "mod-sensor-audit",
+    "mod-detect-sigma", "mod-correlation", "mod-scan-yara",
+    "mod-query", "mod-query-memory",
+    "mod-collect", "mod-acquire",
+    "mod-tui",
+    "mod-export-stix", "mod-export-misp", "mod-export-jsonl", "mod-export-report",
+    "mod-verify-embedded",
+    "mod-tamper", "mod-selfprotect-lsm", "mod-selfsandbox",
+]
+
+# --- Module passthroughs ----------------------------------------------------
+# Each forwards to the same feature on `hemostat-modules`. Declaring them here
+# too is what lets `build.rs` observe the enabled set via `CARGO_FEATURE_*` and
+# emit an accurate manifest.
+mod-sensor-etw = ["hemostat-modules/mod-sensor-etw"]
+mod-sensor-evtlog = ["hemostat-modules/mod-sensor-evtlog"]
+mod-sensor-usn = ["hemostat-modules/mod-sensor-usn"]
+mod-sensor-sysmon = ["hemostat-modules/mod-sensor-sysmon"]
+mod-sensor-wmi = ["hemostat-modules/mod-sensor-wmi"]
+mod-sensor-ebpf = ["hemostat-modules/mod-sensor-ebpf"]
+mod-sensor-fanotify = ["hemostat-modules/mod-sensor-fanotify"]
+mod-sensor-audit = ["hemostat-modules/mod-sensor-audit"]
+mod-detect-sigma = ["hemostat-modules/mod-detect-sigma"]
+mod-correlation = ["hemostat-modules/mod-correlation"]
+mod-scan-yara = ["hemostat-modules/mod-scan-yara", "dep:hemostat-scan"]
+mod-query = ["hemostat-modules/mod-query"]
+mod-query-memory = ["hemostat-modules/mod-query-memory"]
+mod-enf-net-egress = ["hemostat-modules/mod-enf-net-egress"]
+mod-enf-net-ingress = ["hemostat-modules/mod-enf-net-ingress"]
+mod-enf-proc = ["hemostat-modules/mod-enf-proc"]
+mod-enf-account = ["hemostat-modules/mod-enf-account"]
+mod-enf-exec = ["hemostat-modules/mod-enf-exec"]
+mod-enf-persistence = ["hemostat-modules/mod-enf-persistence"]
+mod-enf-file = ["hemostat-modules/mod-enf-file"]
+mod-enf-perimeter = ["hemostat-modules/mod-enf-perimeter"]
+mod-enf-perimeter-kill = ["hemostat-modules/mod-enf-perimeter-kill"]
+mod-harden-noreboot = ["hemostat-modules/mod-harden-noreboot"]
+mod-harden-reboot = ["hemostat-modules/mod-harden-reboot"]
+mod-deceive = ["hemostat-modules/mod-deceive"]
+mod-sidecar = ["hemostat-modules/mod-sidecar"]
+mod-collect = ["hemostat-modules/mod-collect"]
+mod-acquire = ["hemostat-modules/mod-acquire"]
+mod-tui = ["hemostat-modules/mod-tui", "dep:hemostat-tui"]
+mod-remote = ["hemostat-modules/mod-remote", "dep:hemostat-remote"]
+mod-collector = ["hemostat-modules/mod-collector", "dep:hemostat-sensor-freebsd", "dep:hemostat-fleet"]
+mod-export-stix = ["hemostat-modules/mod-export-stix"]
+mod-export-misp = ["hemostat-modules/mod-export-misp"]
+mod-export-jsonl = ["hemostat-modules/mod-export-jsonl"]
+mod-export-report = ["hemostat-modules/mod-export-report"]
+mod-verify-embedded = ["hemostat-modules/mod-verify-embedded"]
+mod-tamper = ["hemostat-modules/mod-tamper"]
+mod-selfprotect-lsm = ["hemostat-modules/mod-selfprotect-lsm"]
+mod-selfsandbox = ["hemostat-modules/mod-selfsandbox"]
+mod-on-box-key = ["hemostat-modules/mod-on-box-key"]
+driver-tier = ["hemostat-modules/driver-tier"]
+
+[lints]
+workspace = true

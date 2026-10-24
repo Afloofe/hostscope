@@ -1,0 +1,24 @@
+[package]
+name = "hemostat-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The Response Broker: the single gate every state-changing action passes through."
+
+[dependencies]
+hemostat-core = { path = "../core" }
+hemostat-buildinfo = { path = "../buildinfo" }
+
+[target.'cfg(unix)'.dependencies]
+# `O_NONBLOCK` at open time. `read_to_string` on a named pipe does not fail, it
+# waits — so the careful "could not be read" branch in `Allowlist::load` was
+# unreachable for the one case that matters on a host somebody else owns.
+#
+# No new crate enters the lockfile (`sensor-linux` already depends on it), so
+# the D13 native-dependency ledger is untouched, and no `unsafe`: `custom_flags`
+# is a safe API taking an integer constant.
+libc = "0.2"
+
+[lints]
+workspace = true

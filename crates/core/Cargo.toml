@@ -1,0 +1,20 @@
+[package]
+name = "hemostat-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Frozen shared contracts: identity, time, the event record, lanes, mode."
+
+# Note the lib target name. A package whose lib is literally `core` shadows the
+# `::core` prelude path at every use site (RFC-001 §2).
+[lib]
+name = "hs_core"
+path = "src/lib.rs"
+
+# No dependencies and no features, like `hemostat-buildinfo`. Everything above
+# this crate depends on it, so anything it pulls in becomes universal.
+[dependencies]
+
+[lints]
+workspace = true

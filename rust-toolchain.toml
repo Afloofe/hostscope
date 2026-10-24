@@ -1,0 +1,32 @@
+# Pinned toolchain (RFC-001 §2, design §18.2).
+#
+# MSRV 1.91 is set by yara-x 1.19, which the scan module will depend on. Pinning
+# the exact channel — not "stable" — is a reproducible-build requirement: two
+# builders must use the same compiler to produce identical artifacts.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy", "rust-src"]
+# The release targets that a gate actually needs, so a fresh clone can run
+# `cargo xtask all` without a separate provisioning step. `rustup` fetches each
+# once.
+#
+# `x86_64-pc-windows-msvc` is here for the `win-check` gate, which only ever
+# runs `cargo check` — that needs the standard library for the target and **no
+# linker**, which is what makes Windows verification possible at all on a Linux
+# development machine.
+#
+# `aarch64-unknown-linux-musl` stays commented: it is a release target but no
+# gate builds it yet, so listing it would cost every developer a download for
+# nothing.
+#
+# `x86_64-unknown-freebsd` is for the `freebsd-check` gate: the agent on the
+# pfSense firewall (RFC-002). Its link also needs the sysroot in
+# vm/freebsd/, which no toolchain file can fetch, so without one the gate says
+# NOT VERIFIED rather than failing.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-freebsd",
+    # "aarch64-unknown-linux-musl",
+]
+profile = "minimal"

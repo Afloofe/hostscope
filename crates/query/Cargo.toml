@@ -1,0 +1,13 @@
+[package]
+name = "hemostat-query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A SQL subset over live host state, which refuses what it cannot execute rather than executing something else."
+
+[dependencies]
+hemostat-core = { path = "../core" }
+
+[lints]
+workspace = true

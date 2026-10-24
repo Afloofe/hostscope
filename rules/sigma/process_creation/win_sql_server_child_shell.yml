@@ -1,0 +1,20 @@
+# Windows: the SQL Server engine process as the parent of a shell.
+title: SQL Server engine starts a command interpreter
+id: a4c42ffb-53a9-4108-a43c-c07029f79f60
+status: experimental
+description: The parent image is sqlservr.exe and the new process is a shell or script host.
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  parent:
+    ParentImage|endswith: '\sqlservr.exe'
+  child:
+    Image|endswith:
+      - '\cmd.exe'
+      - '\powershell.exe'
+      - '\pwsh.exe'
+      - '\cscript.exe'
+      - '\wscript.exe'
+  condition: parent and child
+level: high

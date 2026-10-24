@@ -1,0 +1,18 @@
+[package]
+name = "hemostat-remote"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The console link: HPKE-sealed frames over TCP, and the heartbeat gap that is the durable evidence of a killed agent."
+
+[dependencies]
+hemostat-core = { path = "../core" }
+hemostat-evcrypto = { path = "../evcrypto" }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+
+[dev-dependencies]
+hemostat-evcrypto = { path = "../evcrypto" }
+
+[lints]
+workspace = true

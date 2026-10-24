@@ -1,0 +1,115 @@
+# Named build variants — the declared expectation (RFC-001 §5).
+#
+# This file is NOT what builds the variants. `crates/cli/Cargo.toml` does that,
+# through its `variant-*` features. This file records what each variant is
+# *supposed* to contain, and `cargo xtask variants` builds each one, asks the
+# resulting binary what it actually contains, and fails on any difference.
+#
+# The distinction matters. Checking Cargo.toml against itself would be
+# circular. Checking the *emitted build manifest* — what the compiler really
+# produced — against an independent declaration catches the failure Cargo.toml
+# alone cannot: feature unification silently pulling in a module through some
+# dependency's feature list, with no change to our own code (RFC-001 §9).
+#
+# When you change a variant, you change it in two places on purpose. The second
+# edit is the review step.
+
+[variant.it-full]
+description = "Default enterprise IR engagement."
+modules = [
+    # sense-and-analyse
+    "mod-sensor-etw", "mod-sensor-evtlog", "mod-sensor-usn",
+    "mod-sensor-sysmon", "mod-sensor-wmi",
+    "mod-sensor-ebpf", "mod-sensor-fanotify", "mod-sensor-audit",
+    "mod-detect-sigma", "mod-correlation", "mod-scan-yara",
+    "mod-query", "mod-query-memory",
+    "mod-collect", "mod-acquire",
+    "mod-tui",
+    "mod-export-stix", "mod-export-misp", "mod-export-jsonl", "mod-export-report",
+    "mod-verify-embedded",
+    "mod-tamper", "mod-selfprotect-lsm", "mod-selfsandbox",
+    # enforcement — all classes
+    "mod-enf-net-egress", "mod-enf-net-ingress", "mod-enf-proc",
+    "mod-enf-account", "mod-enf-exec", "mod-enf-persistence", "mod-enf-file",
+    # the firewall the agent runs on (RFC-002 §5)
+    "mod-enf-perimeter", "mod-enf-perimeter-kill",
+    # posture and sidecars
+    "mod-harden-noreboot", "mod-harden-reboot",
+    "mod-deceive", "mod-sidecar",
+    # transport
+    "mod-remote",
+]
+
+[variant.ot-safe]
+description = """
+Plant and process-control hosts. Retains exactly one containment class — egress
+isolation — because compiling out every containment would push a responder
+facing a live OT compromise toward it-full, the build with Kill, ExecBlock and
+account actions all present (RFC-001 §11.2). Until an egress-only ruleset is
+validated, `network --arm --egress` needs the inbound ruleset this image leaves
+out, so what it can reach is the narrowing: `--block-pid` and `--block-dest`.
+On the firewall it keeps the perimeter block and leaves out the state kill,
+which cannot be undone (RFC-002 §5)."""
+modules = [
+    "mod-sensor-etw", "mod-sensor-evtlog", "mod-sensor-usn",
+    "mod-sensor-sysmon", "mod-sensor-wmi",
+    "mod-sensor-ebpf", "mod-sensor-fanotify", "mod-sensor-audit",
+    "mod-detect-sigma", "mod-correlation", "mod-scan-yara",
+    "mod-query", "mod-query-memory",
+    "mod-collect", "mod-acquire",
+    "mod-tui",
+    "mod-export-stix", "mod-export-misp", "mod-export-jsonl", "mod-export-report",
+    "mod-verify-embedded",
+    "mod-tamper", "mod-selfprotect-lsm", "mod-selfsandbox",
+    "mod-enf-net-egress",
+    "mod-enf-perimeter",
+    "mod-harden-noreboot",
+    "mod-remote",
+]
+
+[variant.airgap]
+description = "No console, no network path. The listening-socket code is absent from the image."
+modules = [
+    "mod-sensor-etw", "mod-sensor-evtlog", "mod-sensor-usn",
+    "mod-sensor-sysmon", "mod-sensor-wmi",
+    "mod-sensor-ebpf", "mod-sensor-fanotify", "mod-sensor-audit",
+    "mod-detect-sigma", "mod-correlation", "mod-scan-yara",
+    "mod-query", "mod-query-memory",
+    "mod-collect", "mod-acquire",
+    "mod-tui",
+    "mod-export-stix", "mod-export-misp", "mod-export-jsonl", "mod-export-report",
+    "mod-verify-embedded",
+    "mod-tamper", "mod-selfprotect-lsm", "mod-selfsandbox",
+    "mod-enf-net-egress", "mod-enf-net-ingress", "mod-enf-proc",
+    "mod-enf-account", "mod-enf-exec", "mod-enf-persistence", "mod-enf-file",
+    "mod-enf-perimeter", "mod-enf-perimeter-kill",
+    "mod-harden-noreboot", "mod-harden-reboot",
+    "mod-deceive", "mod-sidecar",
+]
+
+[variant.observe-only]
+description = """
+Any engagement whose rules are unknown, restrictive, or not yet read. Defined by
+a rule-independent property: no action class with an `apply` is compiled in."""
+modules = [
+    "mod-sensor-etw", "mod-sensor-evtlog", "mod-sensor-usn",
+    "mod-sensor-sysmon", "mod-sensor-wmi",
+    "mod-sensor-ebpf", "mod-sensor-fanotify", "mod-sensor-audit",
+    "mod-detect-sigma", "mod-correlation", "mod-scan-yara",
+    "mod-query", "mod-query-memory",
+    "mod-collect", "mod-acquire",
+    "mod-tui",
+    "mod-export-stix", "mod-export-misp", "mod-export-jsonl", "mod-export-report",
+    "mod-verify-embedded",
+    "mod-tamper", "mod-selfprotect-lsm", "mod-selfsandbox",
+    "mod-remote",
+]
+
+[variant.collector]
+description = "Responder-side jump box. Never dropped on a target: not an agent."
+modules = [
+    "mod-collector",
+    "mod-tui",
+    "mod-export-stix", "mod-export-misp", "mod-export-jsonl", "mod-export-report",
+    "mod-verify-embedded",
+]

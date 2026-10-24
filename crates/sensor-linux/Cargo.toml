@@ -1,0 +1,19 @@
+[package]
+name = "hemostat-sensor-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Linux sensor: capability probing and the procfs floor."
+
+[dependencies]
+hemostat-core = { path = "../core" }
+# The vendor manifest's format and its verified type (`vendor` re-exports
+# them), shared with the firewall's sensor (RFC-002 §1).
+hemostat-evcrypto = { path = "../evcrypto" }
+libc = "0.2"
+# Pure Rust, no C linkage — it does not consume an FFI slot (RFC-001 §2).
+sha2 = { version = "0.10", default-features = false }
+
+[lints]
+workspace = true

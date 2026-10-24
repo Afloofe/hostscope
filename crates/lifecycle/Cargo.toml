@@ -1,0 +1,19 @@
+[package]
+name = "hemostat-lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sentinels: the redundant watchers that relaunch the agent from their own verified copy of its image."
+
+[dependencies]
+sha2 = { version = "0.10", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

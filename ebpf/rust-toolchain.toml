@@ -1,0 +1,18 @@
+# PINNED, and the pin is load-bearing — do not float this to `nightly`.
+#
+# The BPF target is tier 3, so it needs `-Z build-std`, so it needs nightly. But
+# `bpf-linker` links against the *system* LLVM, and LLVM cannot read bitcode from
+# a newer major version than itself. Current nightly emits LLVM 23; the LLVM
+# available here is 22.1.8, and the mismatch fails at link with:
+#
+#     ERROR llvm: Not an int attribute
+#     (Producer: 'LLVM23.1.1-rust-1.100.0-nightly'  Reader: 'LLVM 22.1.8')
+#
+# nightly-2026-05-15 is rustc 1.97.0-nightly with LLVM 22.1.4 — same major as the
+# system LLVM, so its bitcode is readable. If you upgrade system LLVM to 23, move
+# this pin forward to a nightly on LLVM 23 and rebuild bpf-linker against it. The
+# two must always share an LLVM major version.
+[toolchain]
+channel = "nightly-2026-05-15"
+components = ["rust-src"]
+targets = ["bpfel-unknown-none"]

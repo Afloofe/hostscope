@@ -1,0 +1,15 @@
+[package]
+name = "hemostat-buildinfo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Build-time identity types for a HEMOSTAT image: Status, ActionClass, ModuleId, BuildManifest."
+
+# Deliberately empty. This crate sits at the bottom of the graph so that every
+# other crate — including the standalone verifier — can depend on it without
+# inheriting anything. No dependencies, no features, no I/O (RFC-001 §2).
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "hemostat-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Operator terminal interface: posture and ceiling views, and the render-boundary sanitizer."
+
+[dependencies]
+# `windows` is one of crossterm's *default* features, so `default-features =
+# false` switched it off — and crossterm then refuses to compile for Windows at
+# all with a `compile_error!` saying so. That went unnoticed because nothing had
+# ever been built for a Windows target; the `win-check` gate is what found it.
+# The feature's own dependencies are target-gated to `cfg(windows)` inside
+# crossterm, so naming it here costs a Linux build nothing.
+crossterm = { version = "0.29.0", default-features = false, features = ["events", "windows"] }
+ratatui-core = { version = "0.1.2", default-features = false }
+# The sanitizer, factored out into its own crate (design §17, RFC-001 §2). It is
+# mandatory in every variant and shared with the cli's human renderer, so it
+# cannot live behind `mod-tui` — an image built without the terminal interface
+# still prints host-derived strings to a terminal.
+hemostat-safestr = { path = "../safestr" }
+
+[lints]
+workspace = true

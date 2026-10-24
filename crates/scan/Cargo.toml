@@ -1,0 +1,55 @@
+[package]
+name = "hemostat-scan"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Pure-Rust YARA. The classic `yara` crate binds libyara, which is C: it would
+# need the library present on every build host, fights the static-binary
+# requirement for the Windows artefact, and adds a large C attack surface to a
+# tool whose whole claim is that it is memory-safe.
+#
+# Not optional, and this crate declares no `mod-*` feature. The seam lives one
+# level up: `hemostat-cli` takes this crate as an optional dependency behind
+# `mod-scan-yara` (RFC-001 §3). A build that does not want the scanner does not
+# compile this crate, rather than compiling it inert.
+#
+# `pulley` is load-bearing, not a tuning knob. yara-x lowers rule conditions to
+# WebAssembly, and wasmtime's default backend is the Cranelift JIT. D23 claims
+# arbitrary-code guard is FULL process-wide, which holds only while nothing in
+# the image *generates* executable memory at run time. §15.1.1 measured both
+# halves of this: enabling `pulley` does not remove Cranelift from the image —
+# yara-x fixes `features = ["cranelift", "runtime"]` in its own wasmtime
+# dependency — but it does mean the bytecode is interpreted rather than
+# compiled, which is the property the claim actually rests on. Throughput was
+# measured at parity (342 MB/s interpreted against 333 MB/s compiled), so this
+# costs nothing but the feature flag. The `no-codegen` gate fails the build if
+# it is ever dropped.
+#
+# `parallel-compilation` stays off, named by both D23 and §15.1.1: it fans rule
+# compilation across every core through rayon and would blow the §15 scan
+# ceiling on every bundle load.
+yara-x = { version = "1", default-features = false, features = [
+    "constant-folding",
+    "pulley",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# `O_NOFOLLOW | O_NONBLOCK` at open time. The scan targets are names somebody
+# else chose — every line of /etc/ld.so.preload, every `read_dir` entry — so the
+# refusal to follow a link and the refusal to wait on a device have to be made
+# by the open itself, not by a stat of the name beforehand.
+#
+# No new crate enters the lockfile: `sensor-linux` already depends on it, so the
+# D13 native-dependency ledger is untouched. No `unsafe` either — `custom_flags`
+# is a safe API and these are integer constants.
+libc = "0.2"
+
+# The workspace lint floor, which this crate was escaping by omission: not just
+# the unsafe deny (lib.rs forbids that for itself anyway) but unwrap_used,
+# expect_used, indexing_slicing, missing_docs and unreachable_pub. A crate that
+# opts out silently is the one place those rules do not apply, and nothing said
+# so — there was no [lints] section to notice the absence of.
+[lints]
+workspace = true

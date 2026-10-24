@@ -1,0 +1,90 @@
+[package]
+name = "hemostat-modules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The module seam: the only crate that decides which capability modules are compiled in."
+
+[dependencies]
+hemostat-buildinfo = { path = "../buildinfo" }
+
+# The capability feature taxonomy of RFC-001 §4.
+#
+# This crate and `hemostat-cli` are the ONLY two crates permitted to declare
+# `mod-*` features (RFC-001 §3 rule 1). No capability crate declares a feature
+# for its own presence, because a self-gating crate would still be in the
+# dependency graph — present, linked, and merely inert — which defeats the
+# property that excluded code is *absent*.
+#
+# Every feature here is off by default. There is no default variant: choosing
+# one is a decision the builder must make explicitly, and `build.rs` in
+# `hemostat-cli` fails the build if nobody did.
+[features]
+default = []
+
+# --- §4.1 sensors -----------------------------------------------------------
+mod-sensor-etw = []
+mod-sensor-evtlog = []
+mod-sensor-usn = []
+mod-sensor-sysmon = []
+mod-sensor-wmi = []
+mod-sensor-ebpf = []
+mod-sensor-fanotify = []
+mod-sensor-audit = []
+
+# --- §4.2 detection, scanning, query ----------------------------------------
+mod-detect-sigma = []
+mod-correlation = []
+mod-scan-yara = []
+mod-query = []
+mod-query-memory = []
+
+# --- §4.3 enforcement — gates `apply` only (RFC-001 §7) ---------------------
+# Note carefully: these gate the *apply* half of an action class only. Every
+# undo/revert executor compiles into every variant, so a narrow build can always
+# lift what a broad build applied. Without that rule, choosing a variant could
+# strand a contained host.
+mod-enf-net-egress = []
+mod-enf-net-ingress = []
+mod-enf-proc = []
+mod-enf-account = []
+mod-enf-exec = []
+mod-enf-persistence = []
+mod-enf-file = []
+# The firewall the agent runs on (RFC-002 §5, amending RFC-001 §4.3). Two
+# features because a block is reversible and a state kill is not: `ot-safe`
+# carries the block alone. Both classes are `not on this OS` on Linux and
+# Windows whatever is enabled here.
+mod-enf-perimeter = []
+mod-enf-perimeter-kill = []
+
+# --- §4.4 other action families ---------------------------------------------
+mod-harden-noreboot = []
+mod-harden-reboot = []
+mod-deceive = []
+mod-sidecar = []
+mod-collect = []
+mod-acquire = []
+
+# --- §4.5 interface, transport, export --------------------------------------
+mod-tui = []
+mod-remote = []
+mod-collector = []
+mod-export-stix = []
+mod-export-misp = []
+mod-export-jsonl = []
+mod-export-report = []
+mod-verify-embedded = []
+
+# --- §4.6 self-protection and reserved --------------------------------------
+mod-tamper = []
+mod-selfprotect-lsm = []
+mod-selfsandbox = []
+# Off in every shipped variant. The bounded on-box sub-key escape hatch.
+mod-on-box-key = []
+# The reserved signed-driver seam. CI builds a stub against it; no variant ships it.
+driver-tier = []
+
+[lints]
+workspace = true

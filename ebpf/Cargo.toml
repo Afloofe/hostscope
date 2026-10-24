@@ -1,0 +1,13 @@
+[package]
+name = "hemostat-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "TEST/BUILD INFRASTRUCTURE ONLY so far: the in-kernel BPF programs. Never linked into the agent; embedded as bytes."
+
+# Its own workspace: it builds for bpfel-unknown-none with a pinned nightly and
+# -Z build-std, none of which the host workspace should inherit.
+[workspace]
+
+[dependencies]

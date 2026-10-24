@@ -1,0 +1,105 @@
+[package]
+name = "hemostat-sensor-win"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Windows sensor: host posture, and whether the threat model's premise actually holds here."
+
+[dependencies]
+hemostat-core = { path = "../core" }
+# The certificate reader and the trust-anchor grade the Linux and firewall
+# sweeps share (`trust`). Pure Rust, and already linked into every Windows
+# image through the CLI, so it adds nothing to one.
+hemostat-evcrypto = { path = "../evcrypto" }
+
+# Raw Windows API declarations, and only on Windows. `windows-sys` is already on
+# the reviewed pure-Rust list (it arrives through `crossterm` and `mio` for the
+# terminal loop) and on DECLARATION_ONLY_SYS: it compiles and links no C, so
+# naming it here directly costs the D13 ledger nothing.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    # The Local Users and Groups API, for the account sweep: `NetUserEnum`,
+    # `NetLocalGroupGetMembers` and `NetApiBufferFree` live in netapi32, and
+    # resolving the Administrators group from its well-known SID needs
+    # `CreateWellKnownSid` and `LookupAccountSidW`.
+    "Win32_NetworkManagement_NetManagement",
+    # The socket tables, for the overview sweep: `GetExtendedTcpTable` at
+    # `TCP_TABLE_OWNER_PID_ALL` is what carries the owning process id.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    # Resolving a pid to an image name, for the same sweep.
+    "Win32_System_ProcessStatus",
+    # The filter manager, for the Sysmon minifilter check. `EnumDeviceDrivers`
+    # answers "is the image loaded", which `fltmc unload` changes and
+    # `fltmc detach` does not — detach removes the filter from a VOLUME and
+    # leaves the image in memory. `FilterInstanceFindFirst`/`Next` enumerate the
+    # per-volume attachments, which is the question that tells the two apart.
+    "Win32_Storage_InstallableFileSystems",
+    "Win32_System_Diagnostics_ToolHelp",
+    # Event Tracing for Windows (§6.2): `StartTraceW`, `EnableTraceEx2`,
+    # `ControlTraceW`, `OpenTraceW`, `ProcessTrace`, `CloseTrace` and the
+    # `EVENT_TRACE_*` structures. This is the substrate the whole Windows
+    # detection story rests on — until it landed, Windows detection was
+    # point-in-time sweeps with no way to answer "what happened".
+    "Win32_System_Diagnostics_Etw",
+    # `EVENT_TRACE_LOGFILEW` and the buffer-callback types are gated on this in
+    # windows-sys 0.61 — the consumer side of ETW does not exist without it.
+    "Win32_System_Time",
+    # `GetConsoleOutputCP` and `SetConsoleOutputCP`. The agent's output is UTF-8
+    # and a stock US Windows console is code page 437, which renders every
+    # em-dash in it as `ΓÇö`. Measured on Server 2022, not assumed.
+    "Win32_System_Console",
+    # `FindFirstStreamW` and friends, for the alternate-data-stream sweep. A
+    # named stream does not appear in a directory listing and does not change
+    # the file's displayed size, so nothing else in this tree could see one.
+    "Win32_Storage_FileSystem",
+    # Reading a directory's DACL, so "writable by unprivileged users" is a claim
+    # about the ACL rather than about whether this process — which runs as
+    # Administrator — happened to succeed at creating a file.
+    "Win32_Security_Authorization",
+    # `WinVerifyTrust`, for Authenticode. The sideloading judgement has been
+    # built, tested and unreachable without it: the shape it detects is a signed
+    # binary beside an unsigned DLL, and nothing could establish which was which.
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
+    # The catalog half of Authenticode. Most Windows inbox binaries carry no
+    # embedded signature — theirs lives in a `.cat` under CatRoot, keyed by file
+    # hash — so without this the verifier calls `notepad.exe` unsigned, and the
+    # sideloading rule (signed exe beside unsigned DLL) is blind to the exact
+    # population a real sideload abuses.
+    "Win32_Security_Cryptography_Catalog",
+    # `WTHelperProvDataFromStateData` and `WTHelperGetProvSignerFromChain`,
+    # which windows-sys gates on this module as well as on Catalog. They read
+    # the signer's certificate out of a verification's state, so a verdict can
+    # say who signed a file and not only that someone did.
+    "Win32_Security_Cryptography_Sip",
+    # `EvtQuery`, `EvtNext`, `EvtRender` and `EvtClose`, for the event log. The
+    # gap check reads every record id in a channel: an EventRecordID sequence
+    # with a hole in it is a channel somebody deleted records from, and nothing
+    # in the surviving records reveals that.
+    "Win32_System_EventLog",
+    # `DeviceIoControl` and the USN journal FSCTLs, for the NTFS change journal.
+    # It is the only record of a file that was created and then deleted — a
+    # payload that cleans up after itself leaves nothing for a filesystem sweep,
+    # and this is where the pair of records still is.
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+    # `AuditQuerySystemPolicy`, for whether Process Creation is audited. The
+    # event log sweep reported that policy as unread on every host because
+    # nothing here could ask for it; `auditpol` asks through this call.
+    "Win32_Security_Authentication_Identity",
+    # `OpenSCManagerW` / `QueryServiceStatus`, for whether the Sysmon service
+    # is running. The registry says a service is configured; only the service
+    # manager says it is running, and a stopped Sysmon writes nothing while
+    # every key and the driver look exactly as they did.
+    "Win32_System_Services",
+] }
+
+[lints]
+workspace = true

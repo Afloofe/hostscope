@@ -1,0 +1,22 @@
+[package]
+name = "hemostat-enforce-pf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "pfSense containment: preflight, the protect-set, and the one write-command type (RFC-002 §2, §3)."
+
+# `forbid(unsafe_code)` on every target (RFC-002 §1), and no FFI: what this
+# crate learns about the firewall it learns through sensor-freebsd's verified
+# tools. Its judgements are pure and tested on Linux.
+[dependencies]
+hemostat-core = { path = "../core" }
+hemostat-broker = { path = "../broker" }
+hemostat-buildinfo = { path = "../buildinfo" }
+hemostat-evcrypto = { path = "../evcrypto" }
+# The tab-separated journal format the undo journal uses (RFC-002 §1).
+hemostat-evfmt = { path = "../evfmt" }
+hemostat-sensor-freebsd = { path = "../sensor-freebsd" }
+
+[lints]
+workspace = true

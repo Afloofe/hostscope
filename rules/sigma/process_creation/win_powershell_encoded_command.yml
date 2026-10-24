@@ -1,0 +1,20 @@
+# Windows: Image and CommandLine only, so it can match a 4688 written with
+# command-line auditing on, and cannot match one written without it.
+title: PowerShell started with an encoded command
+id: 55fc00b1-f94b-4699-9827-4dbc9d317d53
+status: experimental
+description: powershell.exe or pwsh.exe with -EncodedCommand, or its -enc abbreviation, on the command line.
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection:
+    Image|endswith:
+      - '\powershell.exe'
+      - '\pwsh.exe'
+    CommandLine|contains:
+      - ' -enc '
+      - ' -encodedcommand '
+      - ' -ec '
+  condition: selection
+level: medium

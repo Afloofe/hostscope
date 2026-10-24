@@ -1,0 +1,28 @@
+[package]
+name = "hemostat-fleet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The collector (RFC-003): parcel ingest, the verifier it runs, and the collector's own sealed ledger."
+
+# Optional in the CLI, under `mod-collector` only, so no agent image carries a
+# line of it (RFC-003 §8). The parcel codec itself is in `hemostat-evfmt`,
+# because the push (`ship --to`) and the collector both use parcels, and only the
+# collector reads them.
+[dependencies]
+# The store format, its on-disk verifier (`load_verified`, which `verify`
+# runs) and the parcel codec.
+hemostat-evfmt = { path = "../evfmt" }
+# The seal: footer signatures checked under a store's key, and the ledger's
+# own signing key.
+hemostat-evcrypto = { path = "../evcrypto" }
+# The frames: the listener opens what agents seal with this crate's code,
+# and seals the one receipt back with it. Outbound-only in every agent image;
+# the socket that accepts is here, in the one crate `lint-listen` lets listen.
+hemostat-remote = { path = "../remote" }
+# Parcel identities. Already in the lockfile through evfmt.
+sha2 = { version = "0.10", default-features = false }
+
+[lints]
+workspace = true

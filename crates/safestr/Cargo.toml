@@ -1,0 +1,22 @@
+[package]
+name = "hemostat-safestr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The render-boundary terminal-escape sanitizer: a vte-parsed allowlist."
+
+[dependencies]
+# The DEC-ANSI state machine Alacritty and WezTerm parse with. Parsing input
+# through a real terminal parser and re-emitting only allowlisted code points is
+# what makes this an allowlist rather than a blocklist of sequences someone
+# thought of (design §13.5.2).
+vte = "0.13"
+# Display width, not character count. Design §13.5.2 names this crate for the
+# sanitizer's width caps: a CJK or emoji character occupies two terminal columns
+# and `chars().count()` says one, so any layout computed from the count shifts
+# every column to its right off the edge of the row.
+unicode-width = "0.2"
+
+[lints]
+workspace = true

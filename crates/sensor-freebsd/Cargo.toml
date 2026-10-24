@@ -1,0 +1,35 @@
+[package]
+name = "hemostat-sensor-freebsd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FreeBSD/pfSense platform layer: verified base tools, safe reads, host identity, store placement."
+
+# `forbid(unsafe_code)` on every target (RFC-002 §1): this is a platform layer
+# with no FFI. What the agent learns about pf, processes and sockets it learns
+# by running the box's own tools, verified first (`tools`).
+[dependencies]
+hemostat-core = { path = "../core" }
+# `manifest::Verified`, the only manifest a tool can be checked against.
+hemostat-evcrypto = { path = "../evcrypto" }
+# Pure Rust, no C linkage.
+sha2 = { version = "0.10", default-features = false }
+# The ELF reader for `PT_INTERP`/`PT_DYNAMIC` (RFC-002 §1). Already in the
+# lockfile, through wasmtime; read-only ELF support is all that is asked for.
+object = { version = "0.39", default-features = false, features = ["read_core", "elf", "std"] }
+# The `config.xml` reader (RFC-002 §1, §2: the only new pure dependency).
+# A pull parser with no DTD support at all — it reports a DOCTYPE and never
+# expands one, which `configxml` refuses outright. Default features off: no
+# encoding_rs (pfSense writes UTF-8), no serde, no async. Its one dependency,
+# `memchr`, is already in the tree through yara-x.
+quick-xml = { version = "=0.42.0", default-features = false }
+
+# For the `open(2)` flag values only — `O_NOFOLLOW` and `O_NONBLOCK` differ
+# between FreeBSD and Linux, where the tests run. Constants, no calls: the
+# crate is `forbid(unsafe_code)` and could not make one.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

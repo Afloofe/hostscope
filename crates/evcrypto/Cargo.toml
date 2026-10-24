@@ -1,0 +1,49 @@
+[package]
+name = "hemostat-evcrypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Evidence-path cryptography: HPKE key sealing, with two interchangeable implementations."
+
+[dependencies]
+sha2 = { version = "0.10", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+# `zeroize`: `StaticSecret` (the store and recovery private keys) scrubs itself on
+# drop rather than lingering in freed memory. `zeroize` is already in the tree and
+# on the reviewed pure-Rust ledger, so this activates behaviour, not a new dep.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+rand_core = { version = "0.6", default-features = false }
+# The vendored RFC 9180 implementation. NOT in the default build: it is kept as
+# the alternative half of the B4 pair and as the independent oracle the
+# interop gate checks against. Because it depends on chacha20poly1305
+# unconditionally, excluding it also keeps a second, unused AEAD out of the
+# shipped image.
+hpke = { version = "0.12", default-features = false, features = ["x25519", "alloc"], optional = true }
+# The evidence seal (design D8/D16, §8.2): a software Ed25519 key signs each
+# segment footer as a COSE_Sign1 with a per-type context label, verified
+# `verify_strict` against a per-role algorithm allow-list. Exactly the crate set
+# design §17.3 declares for signed objects; all pure-Rust, all MIT/Apache-2.0.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+coset = { version = "0.3", default-features = false }
+ciborium = { version = "0.2" }
+# Direct, not just transitive. `Secret32` and the HPKE key schedule's
+# intermediates are bare byte arrays that the compiler will not scrub for us, and
+# on a presumed-compromised host a key left in freed memory is a key the resident
+# attacker can read. Already on the reviewed pure-Rust ledger via x25519-dalek.
+zeroize = { version = "1", default-features = false }
+
+[features]
+# Neither selects what seals: `composed` is compiled always, because the
+# envelope and the console link name it. `hpke-vendor` adds the oracle, and both
+# together run the cross-compatibility tests — see lib.rs.
+default = ["hpke-composed"]
+hpke-vendor = ["dep:hpke"]
+hpke-composed = []
+
+[dev-dependencies]
+hex = "0.4"
+
+[lints]
+workspace = true
