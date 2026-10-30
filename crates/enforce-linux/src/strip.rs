@@ -876,7 +876,9 @@ pub(crate) fn replace(
             return Err("the name now points at a different file than the one read".into());
         }
         let mut again = Vec::new();
-        reopen(&r.file)?.take(MAX_BYTES + 1).read_to_end(&mut again).map_err(|e| e.to_string())?;
+
+        let cap = (r.bytes.len() as u64).max(MAX_BYTES).saturating_add(1);
+        reopen(&r.file)?.take(cap).read_to_end(&mut again).map_err(|e| e.to_string())?;
         if sha256(&again) != *expect_sha {
             return Err("the file was changed while the edit was being prepared".into());
         }
@@ -1060,6 +1062,31 @@ pub(crate) fn apply(
         Ok(l) => l,
         Err(why) => return refused(&summary, path, why),
     };
+
+    if matches!(kind, FileKind::Sudoers { .. }) {
+        let file = String::from_utf8_lossy(&r.bytes);
+        let (uid_name, gid_name) = (crate::account::name_of_uid, crate::account::name_of_gid);
+        if let Some(scope) = crate::account::sudoers_scope(&loc.text, &file, &uid_name, &gid_name) {
+            return Outcome::Refused(Refusal {
+                action: summary,
+                message: format!(
+                    "refused to strip line {} of {}: {}",
+                    loc.line_no,
+                    path.display(),
+                    scope.describe()
+                ),
+                cause: match scope {
+                    crate::account::SudoersScope::Protected(_) => {
+                        RefuseCause::Protected(crate::ProtectReason::OutOfScopeAccount)
+                    }
+                    crate::account::SudoersScope::Unresolved(_) => {
+                        RefuseCause::InvalidTarget("a sudoers principal that does not resolve".into())
+                    }
+                },
+                suggested_alternative: None,
+            });
+        }
+    }
     let after = without(&r.bytes, &loc);
     if let Some(why) = result_refusal(path, kind, &r.bytes, &after) {
         return refused(&summary, path, why);

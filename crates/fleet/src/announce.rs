@@ -86,6 +86,19 @@ pub fn lookup(layout: &Layout, host: &[u8; 32], agent_id: &[u8; 16], genesis: &[
     (this, other)
 }
 
+pub fn outstanding(layout: &Layout, host: &[u8; 32], except: &[u8; 32]) -> Vec<Announced> {
+    let held = layout.hosts().join(hex(host));
+    let Ok(rd) = fs::read_dir(layout.announced().join(hex(host))) else { return Vec::new() };
+    let mut out: Vec<Announced> = rd
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
+        .filter_map(|e| read_one(&e.path()))
+        .filter(|a| &a.genesis != except && fs::symlink_metadata(held.join(hex(&a.genesis))).is_err())
+        .collect();
+    out.sort_by_key(|a| a.at_ns);
+    out
+}
+
 pub fn record(layout: &Layout, engagement: &[u8; 16], header: &[u8], agent: &Enrolled, at_ns: i64) -> Result<Recorded, String> {
     let h = match decode(header) {
         Ok(h) => h,

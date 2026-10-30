@@ -26,34 +26,44 @@ impl Table for Processes {
     }
     fn rows(&self) -> TableRows {
         let mut out = TableRows::default();
-        let Ok(dir) = fs::read_dir("/proc") else {
+        let (Ok(dir), Some(proc_dev)) = (fs::read_dir("/proc"), proc_dev()) else {
             out.gaps.push("/proc could not be read at all".into());
             return out;
         };
         let mut unreadable_exe = 0_usize;
+        let mut seen = 0_usize;
+
+        let mut cut_cmdline: Vec<i64> = Vec::new();
+        let mut foreign: Vec<i64> = Vec::new();
+        let mut over_budget: Vec<i64> = Vec::new();
+        let mut budget = MAX_PROCESS_TEXT_BYTES;
         for e in dir.flatten() {
             let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<i64>().ok()) else {
                 continue;
             };
+            seen += 1;
             let base = e.path();
+            let mut refused = false;
+            let mut read = |name: &str, cap: u64| match read_pid_file(&base.join(name), proc_dev, cap) {
+                Ok(got) => Some(got),
+                Err(e) => {
+                    refused |= e.kind() == std::io::ErrorKind::InvalidInput;
+                    None
+                }
+            };
 
-            let stat = fs::read(base.join("stat")).ok().map(|b| String::from_utf8_lossy(&b).into_owned());
+            let mut oversized = false;
+            let stat = match read("stat", MAX_STAT_BYTES) {
+                Some((b, false)) => Some(String::from_utf8_lossy(&b).into_owned()),
+                Some((_, true)) => {
+                    oversized = true;
+                    None
+                }
+                None => None,
+            };
+            let (ppid, state, comm) = stat.as_deref().map_or((None, None, None), stat_fields);
 
-            let (ppid, state, comm) = stat.as_deref().map_or((None, None, None), |s| {
-                let close = s.rfind(')');
-                let comm = close
-                    .and_then(|c| s.find('(').map(|o| s[o + 1..c].to_string()));
-                let rest: Vec<&str> = close
-                    .and_then(|c| s.get(c + 1..))
-                    .map(|r| r.split_whitespace().collect())
-                    .unwrap_or_default();
-                (
-                    rest.get(1).and_then(|v| v.parse::<i64>().ok()),
-                    rest.first().map(|v| (*v).to_string()),
-                    comm,
-                )
-            });
-            let uid = fs::read(base.join("status")).ok().and_then(|b| {
+            let uid = read("status", MAX_STAT_BYTES).and_then(|(b, _)| {
                 let s = String::from_utf8_lossy(&b);
                 s.lines()
                     .find_map(|l| l.strip_prefix("Uid:"))
@@ -66,24 +76,23 @@ impl Table for Processes {
             let deleted = i64::from(raw.as_deref().is_some_and(|p| p.ends_with(" (deleted)")));
             let exe = raw.map(|p| p.trim_end_matches(" (deleted)").to_string());
 
-            let cmdline = fs::File::open(base.join("cmdline"))
-                .ok()
-                .and_then(|f| {
-                    let mut b = Vec::new();
-                    std::io::Read::read_to_end(&mut std::io::Read::take(f, 1 << 20), &mut b).ok()?;
-                    Some(b)
-                })
-                .map(|b| {
-                b.split(|c| *c == 0)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from_utf8_lossy)
-                    .collect::<Vec<_>>()
-                    .join(" ")
+            let cmdline = read("cmdline", MAX_CMDLINE_BYTES).map(|(b, cut)| {
+                if cut {
+                    cut_cmdline.push(pid);
+                }
+                argv_text(&b)
             });
+            if refused || oversized {
+                foreign.push(pid);
+            }
 
             let kernel_thread = !had_link && cmdline.as_deref().is_none_or(str::is_empty);
             if !had_link && !kernel_thread {
                 unreadable_exe += 1;
+            }
+            let ([exe, cmdline], over) = within_budget(&mut budget, [exe, cmdline]);
+            if over {
+                over_budget.push(pid);
             }
 
             out.rows.push(row(vec![
@@ -106,8 +115,155 @@ impl Table for Processes {
                  complete sweep on every host look partial"
             ));
         }
+        out.gaps.extend(process_gaps(&cut_cmdline, &foreign, &over_budget, seen));
         out
     }
+}
+
+const MAX_CMDLINE_BYTES: u64 = 8 * 1024;
+
+const MAX_STAT_BYTES: u64 = 64 * 1024;
+
+const MAX_PROCESS_TEXT_BYTES: u64 = 32 * 1024 * 1024;
+
+#[cfg(unix)]
+const NOT_PROCFS: &str = "not a regular file on the /proc mount — something is mounted over this \
+     process's entry, and it is not read";
+
+#[cfg(unix)]
+fn proc_dev() -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    fs::metadata("/proc").ok().map(|m| m.dev())
+}
+
+#[cfg(not(unix))]
+fn proc_dev() -> Option<u64> {
+    Some(0)
+}
+
+fn read_pid_file(path: &std::path::Path, proc_dev: u64, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        let before = procs_own(path, proc_dev)?;
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(path)?;
+        let after = f.metadata()?;
+        if !after.is_file() || (after.dev(), after.ino()) != (before.dev(), before.ino()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, NOT_PROCFS));
+        }
+        read_bounded(f, cap)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = proc_dev;
+        read_bounded(fs::File::open(path)?, cap)
+    }
+}
+
+#[cfg(unix)]
+fn procs_own(path: &std::path::Path, proc_dev: u64) -> std::io::Result<fs::Metadata> {
+    use std::os::unix::fs::MetadataExt as _;
+    let md = fs::metadata(path)?;
+    if md.is_file() && md.dev() == proc_dev {
+        Ok(md)
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, NOT_PROCFS))
+    }
+}
+
+fn is_procs_own(path: &std::path::Path, proc_dev: u64) -> bool {
+    #[cfg(unix)]
+    {
+        procs_own(path, proc_dev).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, proc_dev);
+        true
+    }
+}
+
+fn stat_fields(s: &str) -> (Option<i64>, Option<String>, Option<String>) {
+    let close = s.rfind(')');
+    let comm = close
+        .and_then(|c| s.find('(').and_then(|o| s.get(o + 1..c)))
+        .map(str::to_string);
+    let rest: Vec<&str> = close
+        .and_then(|c| s.get(c + 1..))
+        .map(|r| r.split_whitespace().collect())
+        .unwrap_or_default();
+    (
+        rest.get(1).and_then(|v| v.parse::<i64>().ok()),
+        rest.first().map(|v| (*v).to_string()),
+        comm,
+    )
+}
+
+fn argv_text(raw: &[u8]) -> String {
+    raw.split(|c| *c == 0)
+        .filter(|s| !s.is_empty())
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn within_budget<const N: usize>(budget: &mut u64, cells: [Option<String>; N]) -> ([Option<String>; N], bool) {
+    let mut over = false;
+    let kept = cells.map(|cell| {
+        let text = cell?;
+        let cost = text.len() as u64;
+        if cost <= *budget {
+            *budget -= cost;
+            Some(text)
+        } else {
+            *budget = 0;
+            over = true;
+            None
+        }
+    });
+    (kept, over)
+}
+
+fn process_gaps(cut_cmdline: &[i64], foreign: &[i64], over_budget: &[i64], seen: usize) -> Vec<String> {
+    let pids = |list: &[i64]| {
+        let shown: Vec<String> = list.iter().take(10).map(i64::to_string).collect();
+        let more = list.len() - shown.len();
+        format!("pid {}{}", shown.join(", "), if more > 0 { format!(" and {more} more") } else { String::new() })
+    };
+    let mut gaps = Vec::new();
+    if !cut_cmdline.is_empty() {
+        gaps.push(format!(
+            "{} of {seen} process(es) have a command line longer than the {} KiB a row keeps, and \
+             `cmdline` holds only its start — {}. A query on what follows has not been answered \
+             for those rows",
+            cut_cmdline.len(),
+            MAX_CMDLINE_BYTES / 1024,
+            pids(cut_cmdline)
+        ));
+    }
+    if !foreign.is_empty() {
+        gaps.push(format!(
+            "{} of {seen} process(es) have a /proc file that is not what the kernel prints there \
+             — something is mounted over it — and it was not read, so their rows are missing what \
+             it holds — {}. A query on those columns has not been answered for those rows, and \
+             a mount over a process's entry is itself worth a look",
+            foreign.len(),
+            pids(foreign)
+        ));
+    }
+    if let Some(first) = over_budget.first() {
+        gaps.push(format!(
+            "the table holds at most {} MiB of `exe` and `cmdline` text and reached it at pid \
+             {first}: from there on {} of {seen} process(es) have them NULL — not read into the \
+             table, not empty. A query on either has not been answered for those rows",
+            MAX_PROCESS_TEXT_BYTES / (1024 * 1024),
+            over_budget.len()
+        ));
+    }
+    gaps
 }
 
 pub struct Users;
@@ -305,7 +461,7 @@ impl Table for MemoryRegions {
     }
     fn rows(&self) -> TableRows {
         let mut out = TableRows::default();
-        let Ok(dir) = fs::read_dir("/proc") else {
+        let (Ok(dir), Some(proc_dev)) = (fs::read_dir("/proc"), proc_dev()) else {
             out.gaps.push("/proc could not be read at all".into());
             return out;
         };
@@ -325,11 +481,17 @@ impl Table for MemoryRegions {
                 continue;
             }
             let base = e.path();
+
             let comm = || {
-                fs::read(base.join("comm"))
+                read_pid_file(&base.join("comm"), proc_dev, MAX_STAT_BYTES)
                     .ok()
-                    .map(|c| String::from_utf8_lossy(&c).trim().to_string())
+                    .map(|(c, _)| String::from_utf8_lossy(&c).trim().to_string())
             };
+
+            if !is_procs_own(&base.join("maps"), proc_dev) {
+                refused += 1;
+                continue;
+            }
             match process_regions(pid, comm, &base.join("maps"), MAX_MAPS_BYTES, MAX_REGION_ROWS, &mut out.rows) {
                 MapRead::Whole => {}
                 MapRead::Cut => cut.push(pid),

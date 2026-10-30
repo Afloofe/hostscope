@@ -15,6 +15,60 @@ use crate::authz::TICKET_ENV;
 #[cfg(not(target_os = "linux"))]
 const TICKET_ENV: &str = "HEMOSTAT_TICKET";
 
+#[cfg(any(target_os = "freebsd", test))]
+const CHILD_ENV: &[&str] = &[
+    "HEMOSTAT_PROFILE",
+    "HEMOSTAT_ENGAGEMENT_ID",
+    "HEMOSTAT_UNIT",
+    "HEMOSTAT_POLICY",
+    "HEMOSTAT_EPOCH_FLOOR",
+    "HEMOSTAT_NONCE_LOG",
+    "HEMOSTAT_ALLOWLIST",
+    "HEMOSTAT_MANIFEST",
+    "HEMOSTAT_CRASH_DIR",
+    "HEMOSTAT_GOOFKIT_MAGIC",
+    "HEMOSTAT_GOLDEN",
+    "HEMOSTAT_TEAM",
+    "HEMOSTAT_ROLE",
+    "HEMOSTAT_MOUSE",
+    "HEMOSTAT_TICKET",
+    "HEMOSTAT_ENGAGEMENT_PUBKEY",
+    "HEMOSTAT_RESPONDER_PUBKEY",
+    "HEMOSTAT_RECOVERY_PUBKEY",
+    "HEMOSTAT_SEAL_PUBKEY",
+    "HEMOSTAT_SNAPSHOT_PUBKEY",
+    "HEMOSTAT_MANIFEST_PUBKEY",
+    "HEMOSTAT_READ_PUBKEY",
+    "HEMOSTAT_OPERATOR_KEY",
+    "HEMOSTAT_ENGAGEMENT_KEY",
+    "HEMOSTAT_RESPONDER_KEY",
+    "HEMOSTAT_RECOVERY_KEY",
+    "HEMOSTAT_RECOVERY_KEY_FILE",
+    "HEMOSTAT_MANIFEST_KEY",
+    "HEMOSTAT_MANIFEST_KEY_FILE",
+    "HEMOSTAT_COLLECTOR",
+    "HEMOSTAT_COLLECTOR_KEY",
+    "HEMOSTAT_LINK_KEY",
+    "SUDO_USER",
+    "SUDO_UID",
+    "SUDO_GID",
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "SSH_TTY",
+    "SSH_USER_AUTH",
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+];
+
 pub(crate) fn this_platform() -> Platform {
     if cfg!(target_os = "windows") {
         Platform::Windows
@@ -129,6 +183,16 @@ impl VerbHost for Host {
         let exe = self.exe.as_ref().map_err(Clone::clone)?;
         let mut cmd = Command::new(exe);
         cmd.args(&req.argv).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        #[cfg(target_os = "freebsd")]
+        {
+            cmd.env_clear();
+            for name in CHILD_ENV {
+                if let Some(v) = std::env::var_os(name) {
+                    cmd.env(name, v);
+                }
+            }
+        }
         match &req.ticket {
             TicketEnv::Inherit => {}
             TicketEnv::Unset => {

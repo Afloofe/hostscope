@@ -69,6 +69,11 @@ pub enum RemovalAction {
         unit: String,
     },
 
+    AllowInboundPort {
+
+        port: u16,
+    },
+
     StopAndRemoveUnit {
 
         unit: String,
@@ -109,6 +114,17 @@ pub enum RemovalAction {
         path: PathBuf,
 
         anchor: crate::anchor::AnchorRef,
+    },
+
+    RestoreKnownGood {
+
+        path: PathBuf,
+
+        content: Vec<u8>,
+
+        want_sha256: String,
+
+        label: String,
     },
 }
 

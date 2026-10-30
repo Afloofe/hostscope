@@ -6,6 +6,33 @@ use crate::{EXIT_OK, EXIT_PARTIAL};
 #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
 pub(crate) const DEFAULT_STORE: &str = "/root/hemostat/fw-rules";
 
+pub(crate) fn sub_flags(sub: &str) -> Option<&'static [&'static str]> {
+    Some(match sub {
+        "rules" => &["--store", "--manifest"],
+        "flows" => &["--manifest", "--dst", "--limit"],
+        "verdict" => &["--manifest", "--src"],
+        "block" => &["--alias", "--tracker", "--protect", "--manifest", "--meta", "--deadline", "--allow-subnet", "--arm", "--dry-run"],
+        "confirm" => &["--manifest", "--meta", "--arm", "--dry-run"],
+        "status" => &["--manifest", "--meta"],
+
+        "watch" => &["--manifest", "--meta", "--manifest-pubkey"],
+        "statekill" => &["--alias", "--protect", "--manifest", "--meta", "--allow-subnet", "--arm", "--dry-run"],
+        _ => return None,
+    })
+}
+
+pub(crate) fn check_sub_flags(sub: &str, args: &[String]) -> Result<(), String> {
+    let Some(allowed) = sub_flags(sub) else { return Ok(()) };
+    match args.iter().find(|a| a.starts_with("--") && a.as_str() != "--json" && !allowed.contains(&a.as_str())) {
+        None => Ok(()),
+        Some(a) => Err(format!(
+            "hemostat fw {sub}: {} is not a `fw {sub}` flag, and nothing was run\n  fw {sub} takes: {} --json",
+            h(a),
+            allowed.join(" ")
+        )),
+    }
+}
+
 pub(crate) struct FwReport {
     pub(crate) store: String,
     pub(crate) seal_pub: [u8; 32],
@@ -200,6 +227,11 @@ mod verb {
             .map(|(_, a)| a.as_str())
             .nth(1);
 
+        if let Err(msg) = sub.map_or(Ok(()), |s| check_sub_flags(s, args)) {
+            eprintln!("{msg}");
+            return EXIT_USAGE;
+        }
+
         if matches!(sub, Some("flows" | "verdict")) {
             return crate::freebsd_telemetry::run(args, json);
         }
@@ -237,7 +269,9 @@ mod verb {
             }
         };
         let open_file = |p: &std::path::Path| saferead::open_regular(p, saferead::NOT_REGULAR);
-        let loaded = match crate::vendor_manifest::load_in_place(None, &open_file) {
+
+        let mpath = args.iter().position(|a| a == "--manifest").and_then(|i| args.get(i + 1)).map(String::as_str);
+        let loaded = match crate::vendor_manifest::load_in_place(mpath, &open_file) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("hemostat fw rules: DID NOT RUN — {}", h(&e));

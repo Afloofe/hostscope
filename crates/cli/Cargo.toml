@@ -6,10 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 description = "The single HEMOSTAT binary: composition root, role and verb dispatch."
 
-# One artifact per target. Both runtime roles (agent, sentinel) are subcommands
-# of this binary rather than separate executables (RFC-001 §2).
+# Both runtime roles (agent, sentinel) are subcommands of this binary rather
+# than separate executables (RFC-001 §2). The external handle is `mahoraga`;
+# `hemostat` stays as the internal name (the package and every crate identifier
+# remain hemostat-*), and a `hemostat` → `mahoraga` symlink is dropped at deploy
+# time for anyone who still types the old name.
 [[bin]]
-name = "hemostat"
+name = "mahoraga"
 path = "src/main.rs"
 
 [dependencies]
@@ -88,6 +91,12 @@ hemostat-sensor-freebsd = { path = "../sensor-freebsd" }
 # Containment on the firewall (RFC-002 §1): unconditional, so the revert that
 # arrives with it is in every FreeBSD variant (RFC-001 §7).
 hemostat-enforce-pf = { path = "../enforce-pf" }
+# `getrandom(2)` for every key and seed the firewall agent mints. A
+# `/dev/urandom` opened by name answers with whatever a pre-staged root left
+# there, and the agent has no FFI crate of its own on this target to make the
+# call itself. Already in the lockfile and on the ledger (through rand_core and
+# yara-x); its FreeBSD backend is that one call, with no file behind it.
+getrandom = "0.2"
 
 # `src/freebsd.rs` is compiled into the test build on every host, so its probe
 # rendering is tested where the tests run rather than only on VM 112.

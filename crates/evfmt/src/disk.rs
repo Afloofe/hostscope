@@ -53,6 +53,12 @@ pub const fn stream_dir_name(s: StreamId) -> &'static str {
 
 pub const STORE_HEADER_FILE: &str = "store.hdr";
 
+pub const MAX_STORE_FILE_BYTES: u64 = crate::parcel::MAX_PARCEL_BYTES;
+
+pub const MAX_STREAM_BYTES: u64 = crate::parcel::MAX_PARCEL_BYTES;
+
+pub const MAX_STORE_HEADER_BYTES: u64 = 1024 * 1024;
+
 pub trait Clock {
 
     fn wall_ns(&self) -> i64;
@@ -496,7 +502,7 @@ pub fn parse_segment(bytes: &[u8]) -> StoreResult<Segment> {
 }
 
 pub fn read_store_header(dir: impl AsRef<Path>) -> StoreResult<StoreHeader> {
-    let bytes = read_regular(&dir.as_ref().join(STORE_HEADER_FILE))?;
+    let bytes = read_regular_capped(&dir.as_ref().join(STORE_HEADER_FILE), MAX_STORE_HEADER_BYTES)?;
     let (header, n) = StoreHeader::decode(&bytes)?;
 
     if n != bytes.len() || bytes != header.encode() {
@@ -505,7 +511,7 @@ pub fn read_store_header(dir: impl AsRef<Path>) -> StoreResult<StoreHeader> {
     Ok(header)
 }
 
-pub(crate) fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_regular_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let not_regular = |what: &str| {
         std::io::Error::new(
@@ -521,7 +527,7 @@ pub(crate) fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
     if !ft.is_file() {
         return Err(not_regular("a special file"));
     }
-    let mut f = File::open(path)?;
+    let f = File::open(path)?;
     let after = f.metadata()?;
     #[cfg(unix)]
     {
@@ -533,13 +539,34 @@ pub(crate) fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
     if !after.is_file() {
         return Err(not_regular("a special file"));
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(after.len()).unwrap_or(0));
-    f.read_to_end(&mut bytes)?;
+    let over = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} is larger than {cap} bytes, the most read of it here (a store file is read to at most \
+                 {MAX_STORE_FILE_BYTES} bytes, and one stream's segments to {MAX_STREAM_BYTES} together); \
+                 refusing to read it",
+                path.display()
+            ),
+        )
+    };
+    if after.len() > cap {
+        return Err(over());
+    }
+    let mut bytes = Vec::new();
+    (&f).take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(over());
+    }
     Ok(bytes)
 }
 
 pub fn load_stream(dir: impl AsRef<Path>, stream: StreamId) -> StoreResult<Vec<Segment>> {
-    let sdir = dir.as_ref().join(stream_dir_name(stream));
+    load_stream_within(dir.as_ref(), stream, MAX_STORE_FILE_BYTES, MAX_STREAM_BYTES)
+}
+
+fn load_stream_within(dir: &Path, stream: StreamId, file_cap: u64, stream_cap: u64) -> StoreResult<Vec<Segment>> {
+    let sdir = dir.join(stream_dir_name(stream));
 
     match fs::metadata(&sdir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -556,8 +583,12 @@ pub fn load_stream(dir: impl AsRef<Path>, stream: StreamId) -> StoreResult<Vec<S
 
     let mut segments: Vec<Segment> = Vec::with_capacity(files.len());
     let last = files.len().saturating_sub(1);
+
+    let mut read: u64 = 0;
     for (i, p) in files.into_iter().enumerate() {
-        let bytes = read_regular(&p)?;
+        let left = stream_cap.saturating_sub(read);
+        let bytes = read_regular_capped(&p, file_cap.min(left))?;
+        read = read.saturating_add(bytes.len() as u64);
 
         if i == last
             && matches!(SegmentHeader::decode(&bytes), Err(FormatError::Truncated { .. }))

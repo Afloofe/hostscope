@@ -457,6 +457,16 @@ pub fn judge(c: &Control, value: &str) -> Option<String> {
     }
 }
 
+const KEY_ONLY_ROOT: &[&str] = &["prohibit-password", "without-password", "forced-commands-only"];
+
+pub fn severity_for(c: &Control, value: &str) -> Severity {
+    if c.key == "permitrootlogin" && KEY_ONLY_ROOT.iter().any(|k| value.trim().eq_ignore_ascii_case(k)) {
+        Severity::Warn
+    } else {
+        c.severity
+    }
+}
+
 pub fn wanted_value(c: &Control) -> String {
     match c.want {
         Want::Is(v) => v.to_string(),
@@ -857,7 +867,7 @@ pub fn override_findings(eff: &Effective, overrides: &[Override]) -> Vec<Finding
         }
         let Some(actual) = judge(c, &o.value) else { continue };
         out.push(Finding {
-            severity: c.severity,
+            severity: severity_for(c, &o.value),
             subject: format!("sshd · {}", c.spelling),
             what: format!(
                 "{} is {} for {} (should be {})",
@@ -888,7 +898,7 @@ pub fn from_effective(eff: &Effective) -> Report {
         let Some(value) = eff.one(c.key) else { continue };
         if let Some(actual) = judge(c, value) {
             findings.push(Finding {
-                severity: c.severity,
+                severity: severity_for(c, value),
                 subject: format!("sshd · {}", c.spelling),
                 what: format!("{} is {} (should be {})", c.spelling, actual, wanted_value(c)),
                 why: format!("{}. Applying this costs: {}", c.why, c.breaks),

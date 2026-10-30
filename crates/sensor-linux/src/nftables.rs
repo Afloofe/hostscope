@@ -261,44 +261,122 @@ fn dump_once(sock: &OwnedFd, msg: u16, family: u8, body: &[u8], seq: u32) -> std
     if sent < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    let want = reply_type(msg);
     let mut out = Vec::new();
     let mut buf = vec![0u8; 256 * 1024];
     let mut interrupted = false;
     loop {
 
-        let n = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let mut from: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut from_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+
+        let n = unsafe {
+            libc::recvfrom(
+                sock.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                core::ptr::addr_of_mut!(from).cast(),
+                &mut from_len,
+            )
+        };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let mut data = buf.get(..n as usize).unwrap_or_default();
-        while data.len() >= 16 {
-            let mlen = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) as usize;
-            let mtype = u16::from_ne_bytes([data[4], data[5]]);
-            let flags = u16::from_ne_bytes([data[6], data[7]]);
-            if mlen < 16 || mlen > data.len() {
-                return Err(std::io::Error::other("a truncated netlink message"));
-            }
-            let payload = &data[16..mlen];
-            if flags & NLM_F_DUMP_INTR != 0 {
-                interrupted = true;
-            }
-            match mtype {
-                NLMSG_DONE => return Ok(if interrupted { None } else { Some(out) }),
-                NLMSG_ERROR => {
-                    let code = payload.get(..4).map_or(0, |b| i32::from_ne_bytes([b[0], b[1], b[2], b[3]]));
-                    if code == 0 {
-                        return Ok(if interrupted { None } else { Some(out) });
-                    }
-                    return Err(std::io::Error::from_raw_os_error(-code));
-                }
-                _ => {
-                    if payload.len() >= 4 {
-                        out.push((payload[0], payload[4..].to_vec()));
-                    }
-                }
-            }
-            data = &data[((mlen + 3) & !3).min(data.len())..];
+
+        if !from_kernel(&from, from_len) {
+            continue;
         }
+        let data = buf.get(..usize::try_from(n).unwrap_or(0)).unwrap_or_default();
+        if take_datagram(data, seq, want, &mut out, &mut interrupted)? == Step::Done {
+            return Ok(if interrupted { None } else { Some(out) });
+        }
+    }
+}
+
+fn reply_type(get: u16) -> u16 {
+    (NFNL_SUBSYS_NFTABLES << 8) | get.saturating_sub(1)
+}
+
+fn from_kernel(from: &libc::sockaddr_nl, len: libc::socklen_t) -> bool {
+    usize::try_from(len).is_ok_and(|l| l >= std::mem::size_of::<libc::sockaddr_nl>())
+        && from.nl_family == libc::AF_NETLINK as u16
+        && from.nl_pid == 0
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+
+    More,
+
+    Done,
+}
+
+fn take_datagram(
+    mut data: &[u8],
+    seq: u32,
+    want: u16,
+    out: &mut Vec<(u8, Vec<u8>)>,
+    interrupted: &mut bool,
+) -> std::io::Result<Step> {
+    let word = |b: &[u8], at: usize| -> Option<[u8; 4]> { b.get(at..at + 4)?.try_into().ok() };
+    let half = |b: &[u8], at: usize| -> Option<[u8; 2]> { b.get(at..at + 2)?.try_into().ok() };
+    while data.len() >= 16 {
+        let (Some(len), Some(mtype), Some(flags), Some(mseq)) = (
+            word(data, 0).map(u32::from_ne_bytes),
+            half(data, 4).map(u16::from_ne_bytes),
+            half(data, 6).map(u16::from_ne_bytes),
+            word(data, 8).map(u32::from_ne_bytes),
+        ) else {
+            return Err(std::io::Error::other("a truncated netlink header"));
+        };
+        let mlen = usize::try_from(len).unwrap_or(usize::MAX);
+        if mlen < 16 || mlen > data.len() {
+            return Err(std::io::Error::other("a truncated netlink message"));
+        }
+        let payload = data.get(16..mlen).unwrap_or_default();
+        data = data.get(mlen.saturating_add(3) & !3..).unwrap_or_default();
+        if mseq != seq {
+            continue;
+        }
+        if flags & NLM_F_DUMP_INTR != 0 {
+            *interrupted = true;
+        }
+        match mtype {
+            NLMSG_DONE => {
+                return match word(payload, 0).map(i32::from_ne_bytes) {
+                    None | Some(0) => Ok(Step::Done),
+                    Some(code) => Err(errno_error(code)),
+                };
+            }
+            NLMSG_ERROR => {
+                let code = word(payload, 0)
+                    .map(i32::from_ne_bytes)
+                    .ok_or_else(|| std::io::Error::other("a netlink error with no error code"))?;
+                if code == 0 {
+                    return Ok(Step::Done);
+                }
+                return Err(errno_error(code));
+            }
+            t if t == want => {
+                if let (Some(&family), Some(attrs)) = (payload.first(), payload.get(4..)) {
+                    out.push((family, attrs.to_vec()));
+                }
+            }
+            t => {
+                return Err(std::io::Error::other(format!(
+                    "a netlink message of type {t:#06x} in a dump answered with {want:#06x}"
+                )))
+            }
+        }
+    }
+    Ok(Step::More)
+}
+
+fn errno_error(code: i32) -> std::io::Error {
+    match code.checked_neg() {
+        Some(errno) if errno > 0 => std::io::Error::from_raw_os_error(errno),
+        _ => std::io::Error::other(format!("a netlink error code out of range ({code})")),
     }
 }
 
@@ -341,16 +419,31 @@ pub fn read() -> std::io::Result<Ruleset> {
         return Err(std::io::Error::last_os_error());
     }
 
+    let rc = unsafe {
+        libc::connect(
+            sock.as_raw_fd(),
+            core::ptr::addr_of!(sa).cast(),
+            std::mem::size_of::<libc::sockaddr_nl>() as u32,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
     let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
 
-    unsafe {
+    let rc = unsafe {
         libc::setsockopt(
             sock.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_RCVTIMEO,
             core::ptr::addr_of!(tv).cast(),
             std::mem::size_of::<libc::timeval>() as u32,
-        );
+        )
+    };
+
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
     }
 
     let mut rs = Ruleset::default();
@@ -361,7 +454,8 @@ pub fn read() -> std::io::Result<Ruleset> {
         let table = attr(&a, NFTA_SET_TABLE).map(string).unwrap_or_default();
         let name = attr(&a, NFTA_SET_NAME).map(string).unwrap_or_default();
         let body = [nla(NFTA_SET_ELEM_LIST_TABLE, &cstr(&table)), nla(NFTA_SET_ELEM_LIST_SET, &cstr(&name))].concat();
-        let elems = match dump(&sock, NFT_MSG_GETSETELEM, fam, &body, 100 + i as u32) {
+
+        let elems = match dump(&sock, NFT_MSG_GETSETELEM, fam, &body, 100u32.wrapping_add(i as u32)) {
             Ok(v) => v.into_iter().map(|(_, b)| b).collect::<Vec<_>>(),
             Err(e) => {
                 rs.gaps.push(format!("set {table}/{name}: elements not read ({e})"));

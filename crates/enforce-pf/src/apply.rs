@@ -23,6 +23,19 @@ fn in_table(r: &mut dyn Runner, alias: Alias, cidr: &Cidr) -> Result<bool, Strin
     Ok(journal::table_entries(&show(r, alias)?).contains(cidr))
 }
 
+const NO_TABLE: &str = "Table does not exist";
+
+fn listed(r: &mut dyn Runner, alias: Alias, cidr: &Cidr) -> Result<bool, String> {
+    let inv = Invocation::new(Tool::Pfctl, &["-t", alias.name(), "-T", "show"]);
+    let what = format!("{} {}", inv.tool(), inv.args().join(" "));
+    match r.run(&inv) {
+        Ok(o) if o.success() => Ok(journal::table_entries(&o.text()).contains(cidr)),
+        Ok(o) if String::from_utf8_lossy(&o.stderr).contains(NO_TABLE) => Ok(false),
+        Ok(o) => Err(format!("{what} exited {:?}: {}", o.status, String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Err(format!("{what}: {e}")),
+    }
+}
+
 fn ran(what: &str, out: Result<Output, hemostat_sensor_freebsd::tools::RunError>) -> Result<Output, String> {
     match out {
         Ok(o) if o.success() => Ok(o),
@@ -98,8 +111,8 @@ pub fn refuse_duplicate(j: &Journals, alias: Alias, cidr: &Cidr) -> Result<(), S
         let id = &e.intent.id;
         return Err(format!(
             "{cidr} in {} already has HEMOSTAT block {id} ({}). One HEMOSTAT block per CIDR, so replay \
-             can always tell whose entry it is: `hemostat fw confirm {id}` keeps that one, `hemostat undo \
-             {id}` lifts it",
+             can always tell whose entry it is: `hemostat fw confirm {id} --arm` keeps that one, `hemostat \
+             undo {id}` lifts it",
             alias.name(),
             e.state().token()
         ));
@@ -170,12 +183,36 @@ pub fn apply(
 
 pub fn facts(r: &mut dyn Runner, alias: Alias, cidr: &Cidr, config: &Result<Config, String>) -> Result<Facts, String> {
     Ok(Facts {
-        in_table: in_table(r, alias, cidr)?,
+        in_table: listed(r, alias, cidr)?,
         config: match config {
             Ok(c) => journal::in_config(c, alias, cidr),
             Err(why) => InConfig::Unknown(why.clone()),
         },
     })
+}
+
+pub fn held(config: &Result<Config, String>, e: &journal::Entry) -> Option<String> {
+    let (alias, cidr, id) = (e.intent.alias.name(), e.intent.cidr, &e.intent.id);
+    let found = match config {
+        Ok(c) => journal::in_config(c, e.intent.alias, &cidr),
+        Err(why) => InConfig::Unknown(why.clone()),
+    };
+    match found {
+        InConfig::Absent => None,
+        InConfig::Present(d) if d == e.marker() => Some(format!(
+            "config.xml holds {cidr} in {alias} under {d:?}, so the block is persistent: it outlives filter \
+             reloads, reboots and its deadline, and the watcher does not lift it. `hemostat undo {id}` lifts it"
+        )),
+        InConfig::Present(d) => Some(format!(
+            "config.xml lists {cidr} in {alias} under {d:?}, not HEMOSTAT's marker, so neither the watcher nor \
+             `undo` lifts it: whoever wrote it there holds it"
+        )),
+        InConfig::Unknown(why) => Some(format!(
+            "config.xml could not be read to show it does not hold {cidr} ({why}), and until it can the watcher \
+             does not lift the block. `hemostat fw status` shows pf's table; `hemostat undo {id}` lifts it once \
+             config.xml reads"
+        )),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +228,55 @@ pub enum Confirmed {
     Already(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unconfirmed {
+
+    Live(String),
+
+    Held(String),
+}
+
+impl Unconfirmed {
+
+    pub fn why(&self) -> &str {
+        match self {
+            Unconfirmed::Live(w) | Unconfirmed::Held(w) => w,
+        }
+    }
+}
+
+fn left(j: &Journals, e: &journal::Entry, step: &str, why: String, config: &Result<Config, String>) -> Unconfirmed {
+    match held(config, e) {
+        None => Unconfirmed::Live(why),
+        Some(h) => {
+            let _ = j.append(&e.intent.id, "note", &[("what", format!("confirm stopped at {step}: {h}"))]);
+            Unconfirmed::Held(format!("{why}. {h}"))
+        }
+    }
+}
+
+pub fn would_confirm(
+    r: &mut dyn Runner,
+    j: &Journals,
+    id: &str,
+    now: u64,
+    read_config: &dyn Fn() -> Result<Config, String>,
+) -> Result<Option<String>, Unconfirmed> {
+    let mut ro = crate::cmd::ReadOnly::new(r);
+    let e = j.read(id).map_err(Unconfirmed::Held)?;
+    let config = read_config();
+    let refused = |why: String| match held(&config, &e) {
+        None => Unconfirmed::Live(why),
+        Some(h) => Unconfirmed::Held(format!("{why}. {h}")),
+    };
+    let f = facts(&mut ro, e.intent.alias, &e.intent.cidr, &config).map_err(&refused)?;
+    match journal::judge_confirm(&e, &f, now) {
+        Confirm::Go(_) => Ok(None),
+        Confirm::Already(rev) => Ok(Some(rev)),
+        Confirm::Refused(why) => Err(refused(why)),
+    }
+}
+
 pub fn confirm(
     r: &mut dyn Runner,
     j: &Journals,
@@ -199,19 +285,26 @@ pub fn confirm(
     read_config: &dyn Fn() -> Result<Config, String>,
     seal: &mut dyn FnMut() -> Result<(), String>,
     verified: &[String],
-) -> Result<Confirmed, String> {
-    let e = j.read(id)?;
+) -> Result<Confirmed, Unconfirmed> {
+    let e = j.read(id).map_err(|why| {
+        Unconfirmed::Held(format!(
+            "{why}. The journal did not read, so neither the watcher nor `undo` can act on this block from it: \
+             `hemostat fw status` shows what pf's table holds"
+        ))
+    })?;
     let (alias, cidr) = (e.intent.alias, e.intent.cidr);
 
-    let f = facts(r, alias, &cidr, &read_config())?;
+    let config = read_config();
+    let f = facts(r, alias, &cidr, &config).map_err(|why| left(j, &e, "facts", why, &config))?;
     let k = match journal::judge_confirm(&e, &f, now) {
         Confirm::Go(k) => k,
         Confirm::Already(rev) => return Ok(Confirmed::Already(rev)),
-        Confirm::Refused(why) => return Err(why),
+        Confirm::Refused(why) => return Err(left(j, &e, "judge", why, &config)),
     };
-    let fail = |step: &str, why: String| -> String {
+
+    let fail = |step: &str, why: String| -> Unconfirmed {
         let _ = j.append(id, "failed", &[("step", step.to_string()), ("why", why.clone())]);
-        why
+        left(j, &e, step, why, &read_config())
     };
     seal().map_err(|why| fail("seal", format!("the evidence could not be sealed, so nothing was written: {why}")))?;
     let w = WriteCommand::confirm(&k);
@@ -241,7 +334,9 @@ pub fn confirm(
     if !done.already && !rev.description.ends_with(&want) {
         return Err(fail("prove", format!("config.xml's revision is {:?}, not HEMOSTAT's {want:?}", rev.description)));
     }
-    j.append(id, "confirmed", &[("rev", rev.time.clone())])?;
+
+    j.append(id, "confirmed", &[("rev", rev.time.clone())])
+        .map_err(|why| fail("journal", format!("config.xml was written and proven, and the journal's confirmed line was not: {why}")))?;
     Ok(Confirmed::Done { rev: rev.time, unverified })
 }
 
@@ -271,7 +366,12 @@ pub fn lift(
 ) -> Result<Lifted, String> {
     let e = j.read(id)?;
     let (alias, cidr) = (e.intent.alias, e.intent.cidr);
-    let f = facts(r, alias, &cidr, &read_config())?;
+    let fail = |step: &str, why: String| -> String {
+        let _ = j.append(id, "failed", &[("step", step.to_string()), ("why", why.clone())]);
+        why
+    };
+
+    let f = facts(r, alias, &cidr, &read_config()).map_err(|why| fail("facts", why))?;
     let rep = match journal::judge_lift(&e, &f) {
         Judged::Lift(rep) => rep,
         Judged::Leave(why) => return Ok(Lifted::Left(why)),
@@ -283,10 +383,6 @@ pub fn lift(
             }
             return Ok(Lifted::Nothing(why));
         }
-    };
-    let fail = |step: &str, why: String| -> String {
-        let _ = j.append(id, "failed", &[("step", step.to_string()), ("why", why.clone())]);
-        why
     };
     if let Some(w) = WriteCommand::unconfig(&rep) {
         if !config_writes {
@@ -305,12 +401,13 @@ pub fn lift(
             return Err(fail("unconfig", format!("config.xml on disk still lists {cidr} in {}", alias.name())));
         }
     }
-    if in_table(r, alias, &cidr).map_err(|why| fail("delete", why))? {
+
+    if listed(r, alias, &cidr).map_err(|why| fail("delete", why))? {
         let w = WriteCommand::lift(&rep);
         let what = w.describe().to_string();
         ran(&what, w.run(r)).map_err(|why| fail("delete", why))?;
     }
-    if in_table(r, alias, &cidr).map_err(|why| fail("prove", why))? {
+    if listed(r, alias, &cidr).map_err(|why| fail("prove", why))? {
         return Err(fail("prove", format!("-T show still lists {cidr} after the delete")));
     }
     let covered = tests(r, alias, &cidr).map_err(|why| fail("prove", why))?;
@@ -330,6 +427,12 @@ pub enum WatchStep {
     Due,
 
     Stop(String),
+}
+
+pub const LIFT_TRIES: u32 = 15;
+
+pub fn lift_retry_after(failed: u32) -> Option<u64> {
+    (failed > 0 && failed < LIFT_TRIES).then(|| 2u64.saturating_pow(failed).min(60))
 }
 
 pub fn watch_step(e: &journal::Entry, now: u64) -> WatchStep {

@@ -33,6 +33,9 @@ impl RemovalAction {
             },
             RemovalAction::MaskService { unit } => format!("mask unit `{unit}`"),
             RemovalAction::StartService { unit } => format!("enable and start unit `{unit}`"),
+            RemovalAction::AllowInboundPort { port } => {
+                format!("allow inbound tcp/{port} through the firewall")
+            }
             RemovalAction::StopAndRemoveUnit { unit, path } => {
                 format!("stop `{unit}` and remove {}", path.display())
             }
@@ -51,6 +54,9 @@ impl RemovalAction {
             }
             RemovalAction::RemoveAnchor { path, anchor } => {
                 format!("remove trust anchor {} from {}", crate::strip::hex(&anchor.cert_sha256), path.display())
+            }
+            RemovalAction::RestoreKnownGood { path, label, .. } => {
+                format!("restore {} to known-good ({label})", path.display())
             }
         }
     }
@@ -141,6 +147,21 @@ impl RemovalAction {
                 reversible: true,
                 prefer_instead: None,
             },
+            RemovalAction::AllowInboundPort { port } => Plan {
+                summary: self.summary(),
+                detail: format!(
+                    "Insert `tcp dport {port} accept` at the top of the firewall's input-hook \
+                     chain (comment `{}`), so the scorer can reach a scored service that is \
+                     listening but blocked. Additive — it cannot lock anyone out; nftables only.",
+                    crate::fwallow::marker(*port)
+                ),
+                undo: format!(
+                    "Delete the firewall rule carrying comment `{}`.",
+                    crate::fwallow::marker(*port)
+                ),
+                reversible: true,
+                prefer_instead: None,
+            },
             RemovalAction::StopAndRemoveUnit { unit, path } => Plan {
                 summary: self.summary(),
                 detail: format!(
@@ -210,6 +231,19 @@ impl RemovalAction {
             RemovalAction::RemoveAnchor { path, anchor } => {
                 crate::anchor::plan(path, anchor, self.summary())
             }
+            RemovalAction::RestoreKnownGood { path, want_sha256, label, .. } => Plan {
+                summary: self.summary(),
+                detail: format!(
+                    "Write the known-good {label} (sha256 {want_sha256}) over {}, atomically: a new \
+                     file beside it with the same owner, mode, SELinux label and ACL, synced and \
+                     renamed into place, so no login ever loads a partial module. The current file \
+                     is snapshotted into the vault first.",
+                    path.display()
+                ),
+                undo: format!("Restore {} from the vault snapshot (puts the current file back).", path.display()),
+                reversible: true,
+                prefer_instead: None,
+            },
         }
     }
 
@@ -226,6 +260,7 @@ impl RemovalAction {
             }
             RemovalAction::MaskService { unit } => self.apply_mask(unit, opts, protect),
             RemovalAction::StartService { unit } => self.apply_start(unit, opts, protect),
+            RemovalAction::AllowInboundPort { port } => self.apply_allow_inbound(*port, opts, protect),
             RemovalAction::StopAndRemoveUnit { unit, path } => {
                 self.apply_stop_and_remove(unit, path, opts, protect)
             }
@@ -241,6 +276,9 @@ impl RemovalAction {
             }
             RemovalAction::RemoveAnchor { path, anchor } => {
                 crate::anchor::apply(self.summary(), path, anchor, opts, protect)
+            }
+            RemovalAction::RestoreKnownGood { path, content, want_sha256, label } => {
+                self.apply_restore_known_good(path, content, want_sha256, label, opts, protect)
             }
         }
     }
@@ -287,6 +325,38 @@ impl RemovalAction {
                 cause: RefuseCause::Protected(reason),
                 suggested_alternative: None,
             });
+        }
+
+        match crate::account::owners_of(pid) {
+            Ok(owners) => {
+                if let Some((owner, reason)) = protect.owner_reason(&owners) {
+                    return Outcome::Refused(Refusal {
+                        action: self.summary(),
+                        message: format!(
+                            "refused to {} pid {pid}: it belongs to `{owner}` — {}",
+                            verb_word(verb),
+                            reason.describe()
+                        ),
+                        cause: RefuseCause::Protected(reason),
+                        suggested_alternative: None,
+                    });
+                }
+            }
+            Err(why) => {
+                return Outcome::Refused(Refusal {
+                    action: self.summary(),
+                    message: format!(
+                        "refused to {} pid {pid}: the account it belongs to could not be \
+                         established ({why}), so it cannot be shown not to be one HEMOSTAT \
+                         never changes (the white team's, the DataDog agent's) or one declared \
+                         off-limits — an account a directory serves looks exactly like this. \
+                         Check `ps -o user,ruser -p {pid}` and act by hand if it is none of those",
+                        verb_word(verb)
+                    ),
+                    cause: RefuseCause::UnverifiedProtectSet,
+                    suggested_alternative: None,
+                });
+            }
         }
 
         if matches!(verb, ProcVerb::Kill) {
@@ -616,17 +686,132 @@ impl RemovalAction {
             .ok()
             .map(|s| s.success());
         match run_tool(&systemctl, &["enable", "--now", unit]) {
-            Ok(()) => Outcome::Applied(UndoRecord {
-                did: format!("enabled and started unit `{unit}`"),
-                undo: UndoKind::RestoreServiceState {
-                    unit: unit.to_string(),
-                    was_enabled,
-                    was_active,
-                },
-                reversible: true,
-            }),
+            Ok(()) => {
+
+                let active = std::process::Command::new(&systemctl)
+                    .args(["is-active", "--quiet", unit])
+                    .env_clear()
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if active {
+                    Outcome::Applied(UndoRecord {
+                        did: format!("enabled and started unit `{unit}`"),
+                        undo: UndoKind::RestoreServiceState {
+                            unit: unit.to_string(),
+                            was_enabled,
+                            was_active,
+                        },
+                        reversible: true,
+                    })
+                } else {
+                    Outcome::Failed(Failure {
+                        action: self.summary(),
+                        reason: format!(
+                            "`systemctl enable --now {unit}` returned success but the unit is not \
+                             active — it failed to start (see `journalctl -xeu {unit}`)"
+                        ),
+                    })
+                }
+            }
             Err(reason) => Outcome::Failed(Failure { action: self.summary(), reason }),
         }
+    }
+
+    fn apply_allow_inbound(&self, port: u16, opts: &ApplyOptions, _protect: &ProtectSet) -> Outcome {
+        use crate::fwallow;
+
+        let Some(nft) = fwallow::nft_path() else {
+            return Outcome::Failed(Failure {
+                action: self.summary(),
+                reason: "nft not found at /usr/sbin, /sbin, /usr/bin or /bin — this opens a port \
+                         on nftables (every IRSeC Linux box runs it). A pure iptables-legacy host \
+                         is not supported here; add the accept by hand."
+                    .into(),
+            });
+        };
+
+        let ruleset = match fwallow::nft_capture(&nft, &["list", "ruleset"]) {
+            Ok(t) => t,
+            Err(e) => {
+                return Outcome::Failed(Failure {
+                    action: self.summary(),
+                    reason: format!("could not read the firewall ruleset: {e}"),
+                });
+            }
+        };
+        let comment = fwallow::marker(port);
+
+        if ruleset.lines().any(|l| fwallow::is_allow_rule(l, port)) {
+            return Outcome::Refused(Refusal {
+                action: self.summary(),
+                cause: RefuseCause::InvalidTarget(format!("tcp/{port} is already allowed by mahoraga")),
+                message: format!(
+                    "tcp/{port} is already allowed by a mahoraga rule (comment `{comment}`); nothing to do"
+                ),
+                suggested_alternative: None,
+            });
+        }
+        let Some(chain) = fwallow::input_hook_chain(&ruleset) else {
+            return Outcome::Failed(Failure {
+                action: self.summary(),
+                reason: "could not find an input-hook base chain in `nft list ruleset` — the host \
+                         may use iptables-legacy, or the ruleset could not be read (needs root). \
+                         Add the accept by hand."
+                    .into(),
+            });
+        };
+
+        if let Some(why) = fwallow::chain_refusal(&chain.family, &chain.table, &chain.chain) {
+            return Outcome::Failed(Failure {
+                action: self.summary(),
+                reason: format!(
+                    "the input-hook chain in `nft list ruleset` is not one this tool hands to nft \
+                     ({why}). Add the accept by hand."
+                ),
+            });
+        }
+        if !opts.armed {
+            return Outcome::Planned(self.plan());
+        }
+
+        let dport = port.to_string();
+        let quoted = format!("\"{comment}\"");
+        let args = [
+            "insert", "rule", chain.family.as_str(), chain.table.as_str(), chain.chain.as_str(),
+            "tcp", "dport", dport.as_str(), "accept", "comment", quoted.as_str(),
+        ];
+        if let Err(e) = run_tool(&nft, &args) {
+            return Outcome::Failed(Failure {
+                action: self.summary(),
+                reason: format!("nft insert failed: {e}"),
+            });
+        }
+
+        let listing = fwallow::nft_capture(
+            &nft,
+            &["-a", "list", "chain", chain.family.as_str(), chain.table.as_str(), chain.chain.as_str()],
+        )
+        .unwrap_or_default();
+        if !listing.lines().any(|l| fwallow::is_allow_rule(l, port)) {
+            return Outcome::Failed(Failure {
+                action: self.summary(),
+                reason: format!(
+                    "inserted the accept for tcp/{port} but could not find it afterward — the \
+                     firewall did not take the change"
+                ),
+            });
+        }
+        Outcome::Applied(UndoRecord {
+            did: format!("allowed inbound tcp/{port} through the firewall (comment `{comment}`)"),
+            undo: UndoKind::RemoveNftAllow {
+                family: chain.family,
+                table: chain.table,
+                chain: chain.chain,
+                comment,
+            },
+            reversible: true,
+        })
     }
 
     fn apply_stop_and_remove(
@@ -673,6 +858,15 @@ impl RemovalAction {
                      into the vault. Quarantine {target} and disable the unit by hand.",
                     path.display()
                 ),
+                suggested_alternative: None,
+            });
+        }
+
+        if let Some(why) = crate::persistence::unit_file_refusal(unit, path) {
+            return Outcome::Refused(Refusal {
+                action: self.summary(),
+                cause: RefuseCause::InvalidTarget("the file is not the unit's own definition".into()),
+                message: format!("refused to stop `{unit}`: {why}. Nothing was stopped."),
                 suggested_alternative: None,
             });
         }
@@ -933,6 +1127,92 @@ impl RemovalAction {
                 reason: format!("editing {} failed: {e} (a snapshot is in the vault)", path.display()),
             }),
         }
+    }
+
+    fn apply_restore_known_good(
+        &self,
+        path: &Path,
+        content: &[u8],
+        want_sha256: &str,
+        label: &str,
+        opts: &ApplyOptions,
+        protect: &ProtectSet,
+    ) -> Outcome {
+        use std::os::unix::fs::MetadataExt as _;
+        if let Some(reason) = protect.path_reason(path) {
+            return Outcome::Refused(Refusal {
+                action: self.summary(),
+                message: format!("refused to restore {}: {}", path.display(), reason.describe()),
+                cause: RefuseCause::Protected(reason),
+                suggested_alternative: None,
+            });
+        }
+        if let Some(reason) = path_refusal(path) {
+            return Outcome::Refused(Refusal {
+                action: self.summary(),
+                cause: RefuseCause::InvalidTarget(reason.clone()),
+                message: format!("refused to restore {}: {reason}", path.display()),
+                suggested_alternative: None,
+            });
+        }
+
+        let have = crate::strip::hex(&crate::strip::sha256(content));
+        if !have.eq_ignore_ascii_case(want_sha256) {
+            return Outcome::Refused(Refusal {
+                action: self.summary(),
+                cause: RefuseCause::InvalidTarget("the known-good bytes do not match their recorded digest".into()),
+                message: format!(
+                    "refused to restore {}: the supplied {label} bytes hash to {have}, not the \
+                     expected {want_sha256}. Nothing was written",
+                    path.display()
+                ),
+                suggested_alternative: None,
+            });
+        }
+
+        let r = match crate::strip::read_for_edit(path) {
+            Ok(r) => r,
+            Err(why) => {
+                return Outcome::Refused(Refusal {
+                    action: self.summary(),
+                    cause: RefuseCause::InvalidTarget(format!("{} cannot be restored: {why}", path.display())),
+                    message: format!("refused to restore {}: {why}", path.display()),
+                    suggested_alternative: None,
+                })
+            }
+        };
+        let current_sha = crate::strip::sha256(&r.bytes);
+
+        if crate::strip::hex(&current_sha).eq_ignore_ascii_case(want_sha256) {
+            return Outcome::Refused(Refusal {
+                action: self.summary(),
+                cause: RefuseCause::InvalidTarget("already the known-good bytes".into()),
+                message: format!("{} already matches the known-good {label}; nothing to restore", path.display()),
+                suggested_alternative: None,
+            });
+        }
+        if !opts.armed {
+            return Outcome::Planned(self.plan());
+        }
+        let meta = crate::strip::Meta { mode: r.md.mode(), uid: r.md.uid(), gid: r.md.gid() };
+
+        let vault = match crate::strip::snapshot(path, &r.bytes, &opts.vault_dir) {
+            Ok(v) => v,
+            Err(why) => return Outcome::Failed(Failure { action: self.summary(), reason: why }),
+        };
+
+        if let Err(why) = crate::strip::replace(&r, content, meta, None, &current_sha) {
+            let _ = fs::remove_file(&vault);
+            return Outcome::Failed(Failure {
+                action: self.summary(),
+                reason: format!("{why}; {} is unchanged", path.display()),
+            });
+        }
+        Outcome::Applied(UndoRecord {
+            did: format!("restored {} to known-good ({label})", path.display()),
+            undo: UndoKind::RestoreFile { vault, original: path.to_path_buf(), moved: false },
+            reversible: true,
+        })
     }
 }
 

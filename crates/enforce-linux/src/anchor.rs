@@ -277,6 +277,95 @@ pub fn rebuild_impact(anchors: &[trust::Anchor], bundle: &Path, store: Store, ta
     Some(why.join(", and "))
 }
 
+pub fn unjudged(sweep: &trust::Report, bundles: &[&Path]) -> Vec<String> {
+
+    let names = |line: &str, p: &str| line.strip_prefix(p).is_some_and(|rest| rest.starts_with('/') || rest.starts_with(':'));
+    let source = |line: &str| trust::PLACES.iter().any(|(d, _)| names(line, d)) || names(line, trust::DEBIAN_CONF);
+    let bundle = |line: &str| bundles.iter().any(|b| names(line, &b.to_string_lossy()));
+    let mut out: Vec<String> = sweep.unread.iter().filter(|u| source(u) || bundle(u)).cloned().collect();
+
+    for f in &sweep.findings {
+        let cut = f.subject == "trust store"
+            && f.severity >= hemostat_sensor_linux::triage::Severity::Warn
+            && f.locus.split(", ").any(|d| source(&format!("{d}:")));
+        if cut {
+            out.push(format!("{}: {}", f.locus, f.what));
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Held {
+
+    fps: Vec<[u8; 32]>,
+
+    undecoded: usize,
+}
+
+impl Held {
+
+    fn of(bytes: &[u8]) -> Held {
+        let (certs, bad) = x509::certs_in(bytes);
+        let mut held = Held { fps: Vec::new(), undecoded: bad };
+        for (_, c) in certs {
+            match c {
+                Ok(c) => held.fps.push(c.sha256),
+                Err(_) => held.undecoded += 1,
+            }
+        }
+        held
+    }
+}
+
+fn held(path: &Path) -> Option<Held> {
+    hemostat_sensor_linux::saferead::read_bytes(path, MAX_BYTES).ok().map(|b| Held::of(&b))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Rebuilt {
+
+    AsJudged(usize),
+
+    StillHolds,
+
+    Otherwise(String),
+}
+
+fn rebuilt(before: Option<&Held>, after: Option<&Held>, target: &[u8; 32]) -> Rebuilt {
+    let Some(after) = after else {
+        return Rebuilt::Otherwise("it could not be read back, so what it holds now is not known".into());
+    };
+    if after.fps.contains(target) {
+        return Rebuilt::StillHolds;
+    }
+    let Some(before) = before else {
+        return Rebuilt::Otherwise("it was not read before the rebuild, so there is nothing to compare it with".into());
+    };
+    let mut want: Vec<[u8; 32]> = before.fps.iter().copied().filter(|d| d != target).collect();
+    let mut now = after.fps.clone();
+    want.sort_unstable();
+    now.sort_unstable();
+    let mut why: Vec<String> = Vec::new();
+    if want != now {
+        let gone = want.iter().filter(|d| !now.contains(d)).count();
+        let new = now.iter().filter(|d| !want.contains(d)).count();
+        why.push(format!("beyond this certificate it now holds {new} it did not and lacks {gone} it had"));
+    }
+    if after.undecoded > 0 || before.undecoded > 0 {
+        why.push(format!(
+            "it holds {} block(s) this cannot decode ({} before), any of which may be a certificate the rebuild \
+             compiled in",
+            after.undecoded, before.undecoded
+        ));
+    }
+    if why.is_empty() {
+        Rebuilt::AsJudged(now.len())
+    } else {
+        Rebuilt::Otherwise(why.join(", and "))
+    }
+}
+
 fn refused(summary: &str, path: &Path, why: impl Into<String>) -> Outcome {
     let why = why.into();
     Outcome::Refused(Refusal {
@@ -375,6 +464,32 @@ pub(crate) fn apply(summary: String, path: &Path, want: &AnchorRef, opts: &Apply
     };
     let sweep = trust::report();
     if let Some(rb) = &rebuild {
+        if !sweep.available {
+            return refused(
+                &summary,
+                path,
+                format!(
+                    "the sweep of the store did not run ({}), so what the rebuild would change cannot be judged",
+                    sweep.reason.as_deref().unwrap_or("no reason given")
+                ),
+            );
+        }
+
+        let real = fs::canonicalize(rb.bundle).ok();
+        let bundles: Vec<&Path> = std::iter::once(Path::new(rb.bundle)).chain(real.as_deref()).collect();
+        let unseen = unjudged(&sweep, &bundles);
+        if !unseen.is_empty() {
+            return refused(
+                &summary,
+                path,
+                format!(
+                    "the sweep could not read all of what the rebuild compiles from and rewrites, so what it would \
+                     add or drop cannot be judged, and a certificate this cannot read is one the rebuild compiles in \
+                     all the same: {}. Deal with those first (`hemostat trust` lists them as NOT READ)",
+                    unseen.join("; ")
+                ),
+            );
+        }
         if let Some(why) = rebuild_impact(&sweep.anchors, Path::new(rb.bundle), store, &want.cert_sha256) {
             return refused(&summary, path, format!("the rebuild {why}"));
         }
@@ -400,7 +515,20 @@ pub(crate) fn apply(summary: String, path: &Path, want: &AnchorRef, opts: &Apply
         format!("take lines {}–{} (certificate {} of {}) out of {}", loc.lines.0, loc.lines.1, want.block + 1, loc.blocks, path.display())
     };
     let bundle_before = rebuild.as_ref().and_then(|rb| digest_of(Path::new(rb.bundle)));
-    let set_before = rebuild.as_ref().map(|rb| fingerprints(Path::new(rb.bundle)));
+
+    let held_before = match &rebuild {
+        Some(rb) => match held(Path::new(rb.bundle)) {
+            Some(h) => Some(h),
+            None => {
+                return refused(
+                    &summary,
+                    path,
+                    format!("{} cannot be read now, so what the rebuild does to it could not be checked", rb.bundle),
+                )
+            }
+        },
+        None => None,
+    };
 
     if !opts.armed {
         let mut detail = format!(
@@ -415,8 +543,9 @@ pub(crate) fn apply(summary: String, path: &Path, want: &AnchorRef, opts: &Apply
             Some(rb) => detail.push_str(&format!(
                 " Then rebuild the store with `{}`, which rewrites {} (and the hashed links); that is a \
                  configuration change and part of this action. The rebuilt bundle must be the bundle as it \
-                 is now without this certificate, and the sweep's reading says it will be: no other source \
-                 is waiting to be compiled in and the bundle holds nothing a rebuild would drop.",
+                 is now without this certificate, block for block, and the sweep — which read every source \
+                 and the bundle whole — says it will be: no other source is waiting to be compiled in and \
+                 the bundle holds nothing a rebuild would drop.",
                 rb.command(),
                 rb.bundle
             )),
@@ -449,43 +578,28 @@ pub(crate) fn apply(summary: String, path: &Path, want: &AnchorRef, opts: &Apply
     }
     let after_digest = if whole { None } else { Some(sha256(&after)) };
     let mut note = String::new();
-    let want_cert = want.cert_sha256;
     if let Some(rb) = &rebuild {
         match rb.run() {
             Ok(said) => {
-                let now = fingerprints(Path::new(rb.bundle));
-                if now.contains(&want.cert_sha256) {
-                    note = format!(
+
+                note = match rebuilt(held_before.as_ref(), held(Path::new(rb.bundle)).as_ref(), &want.cert_sha256) {
+                    Rebuilt::AsJudged(n) => format!(
+                        " `{}` rebuilt {} ({n} certificates; {said}): the bundle before, less this one and nothing else.",
+                        rb.command(),
+                        rb.bundle
+                    ),
+                    Rebuilt::StillHolds => format!(
                         " WARNING: {} ran and {} STILL holds the certificate — something else puts it there; \
                          the source is in the vault and the bundle needs a look by hand",
                         rb.command(),
                         rb.bundle
-                    );
-                } else {
-
-                    let mut want = set_before.clone().unwrap_or_default();
-                    want.retain(|d| *d != want_cert);
-                    let (mut a, mut b) = (want, now.clone());
-                    a.sort_unstable();
-                    b.sort_unstable();
-                    note = if a == b {
-                        format!(
-                            " `{}` rebuilt {} ({} certificates; {said}): the bundle before, less this one and nothing else.",
-                            rb.command(),
-                            rb.bundle,
-                            now.len()
-                        )
-                    } else {
-                        let gone = a.iter().filter(|d| !b.contains(d)).count();
-                        let new = b.iter().filter(|d| !a.contains(d)).count();
-                        format!(
-                            " WARNING: `{}` rebuilt {}, and beyond this certificate it now holds {new} it did not and \
-                             lacks {gone} it had. Read `hemostat trust` before trusting the store",
-                            rb.command(),
-                            rb.bundle
-                        )
-                    };
-                }
+                    ),
+                    Rebuilt::Otherwise(why) => format!(
+                        " WARNING: `{}` rebuilt {}, and {why}. Read `hemostat trust` before trusting the store",
+                        rb.command(),
+                        rb.bundle
+                    ),
+                };
             }
             Err(e) => {
 
@@ -754,25 +868,50 @@ impl Offer {
     }
 }
 
-pub fn offer_for(path: &Path, fp: &str) -> Result<Offer, String> {
+pub fn offer_for_anchor(a: &trust::Anchor) -> Result<Offer, String> {
+    let seen = a
+        .at_locus()
+        .ok_or_else(|| format!("the sweep did not read this certificate at {}", a.locus.display()))?;
+    offer_for(&a.locus, &a.cert.sha256, seen.block, &a.cert.subject)
+}
+
+pub fn offer_for(path: &Path, fp: &[u8; 32], block: usize, subject: &str) -> Result<Offer, String> {
     let store = Store::of(path)?;
-    let want = unhex32(fp).ok_or("not a SHA-256 fingerprint")?;
     let r = read_for_edit(path)?;
-    let (certs, _) = x509::certs_in(&r.bytes);
+    let (at, blocks) = choose(&r.bytes, fp, block, subject).map_err(|why| format!("{}: {why}", path.display()))?;
+    Ok(Offer {
+        path: path.to_path_buf(),
+        anchor: AnchorRef { block: at, cert_sha256: *fp, file_sha256: sha256(&r.bytes) },
+        subject: subject.to_string(),
+        store,
+        blocks,
+    })
+}
+
+pub fn choose(bytes: &[u8], fp: &[u8; 32], block: usize, subject: &str) -> Result<(usize, usize), String> {
+    let (certs, _) = x509::certs_in(bytes);
     let blocks = certs.len();
     let hits: Vec<(usize, String)> = certs
         .into_iter()
         .enumerate()
-        .filter_map(|(i, (_, c))| c.ok().filter(|c| c.sha256 == want).map(|c| (i, c.subject)))
+        .filter_map(|(i, (_, c))| c.ok().filter(|c| c.sha256 == *fp).map(|c| (i, c.subject)))
         .collect();
-    let [(block, subject)] = hits.as_slice() else {
-        return Err(format!("the certificate is in {} {} times", path.display(), hits.len()));
+    let [(at, found)] = hits.as_slice() else {
+        return Err(format!("the certificate is in the file {} times", hits.len()));
     };
-    Ok(Offer {
-        path: path.to_path_buf(),
-        anchor: AnchorRef { block: *block, cert_sha256: want, file_sha256: sha256(&r.bytes) },
-        subject: subject.clone(),
-        store,
-        blocks,
-    })
+    if found != subject {
+        return Err(format!(
+            "the certificate with that fingerprint is {found:?}, and the finding is about {subject:?}: the \
+             fingerprint does not belong to the finding's certificate"
+        ));
+    }
+    if *at != block {
+        return Err(format!(
+            "the certificate is number {} in the file and the sweep read it as number {}: the file is not \
+             the one the finding was made from. Run the sweep again",
+            at + 1,
+            block + 1
+        ));
+    }
+    Ok((*at, blocks))
 }

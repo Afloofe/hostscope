@@ -34,6 +34,13 @@ pub(crate) struct LinkCreateAttr {
     pub(crate) flags: u32,
 }
 
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct IterCreateAttr {
+    pub(crate) link_fd: u32,
+    pub(crate) flags: u32,
+}
+
 const _: () = {
     assert!(core::mem::size_of::<ProgLoadAttr>() == 120);
     assert!(core::mem::offset_of!(ProgLoadAttr, insns) == 8);
@@ -42,4 +49,6 @@ const _: () = {
     assert!(core::mem::offset_of!(ProgLoadAttr, expected_attach_type) == 68);
     assert!(core::mem::offset_of!(ProgLoadAttr, attach_btf_id) == 108);
     assert!(core::mem::size_of::<LinkCreateAttr>() == 16);
+    assert!(core::mem::size_of::<IterCreateAttr>() == 8);
+    assert!(core::mem::offset_of!(IterCreateAttr, flags) == 4);
 };

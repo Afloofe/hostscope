@@ -142,6 +142,11 @@ pub(crate) fn lost_findings(entries: &[Entry], c: &pfrules::Collected) -> (Vec<p
     (findings, Vec::new())
 }
 
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+pub(crate) fn confirm_armed(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--arm") && !args.iter().any(|a| a == "--dry-run")
+}
+
 pub(crate) fn clock(secs: u64) -> String {
     format!("{:02}:{:02}:{:02} UTC", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
 }
@@ -194,21 +199,38 @@ pub(crate) struct Armed<'a> {
     pub(crate) meta: Option<String>,
 }
 
+pub(crate) fn follow_flags(manifest: &str, meta: Option<&str>) -> String {
+    let mut s = String::new();
+    if !manifest.is_empty() {
+        s.push_str(" --manifest ");
+        s.push_str(&sh_quote(manifest));
+    }
+    if let Some(m) = meta.filter(|m| !m.is_empty()) {
+        s.push_str(" --meta ");
+        s.push_str(&sh_quote(m));
+    }
+    s
+}
+
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 #[cfg(target_os = "freebsd")]
 mod verb {
     use std::path::Path;
 
     use hemostat_broker::perimeter::{Decision, Evidence};
-    use hemostat_enforce_pf::apply::{self, Applied, Confirmed, Lifted, WatchStep};
+    use hemostat_enforce_pf::apply::{self, Applied, Confirmed, Lifted, Unconfirmed, WatchStep};
     use hemostat_enforce_pf::journal::{Class, Intent, Journals, UndoKind};
     use hemostat_enforce_pf::DryRun;
     use hemostat_sensor_freebsd::configxml::{self, Config};
     use hemostat_sensor_freebsd::{saferead, tools};
 
     use super::*;
-    use crate::freebsd_block::{exit_code, load_policy, load_ticket_as, now_secs, render_stages, spent};
+    use crate::freebsd_block::{exit_code, golden_refusal, load_policy, load_ticket_as, now_secs, render_stages, spent, width_asked};
     use crate::render::{hex32, jesc};
-    use crate::{EXIT_AUTHZ, EXIT_FAILED, EXIT_NOT_BUILT, EXIT_OK, EXIT_PARTIAL, EXIT_USAGE};
+    use crate::{EXIT_AUTHZ, EXIT_DRYRUN, EXIT_FAILED, EXIT_NOT_BUILT, EXIT_OK, EXIT_PARTIAL, EXIT_POLICY, EXIT_USAGE};
 
     fn booting() -> bool {
         std::fs::symlink_metadata(apply::BOOTING).is_ok()
@@ -320,6 +342,7 @@ mod verb {
     pub(crate) fn arm(sys: &mut tools::System<'_>, ctx: &Armed<'_>, d: &DryRun, auth: &hemostat_enforce_pf::Authority, json: bool) -> u8 {
         use std::fmt::Write as _;
         let a = ctx.asked;
+        let f = h(&follow_flags(&ctx.manifest, ctx.meta.as_deref()));
         let mut o = render_stages(d, &ctx.host, "fw block", "ARMED");
         let doc = |outcome: &str, id: &str, detail: &str| {
             format!(
@@ -417,7 +440,7 @@ mod verb {
                 return EXIT_OK;
             }
             Err(why) => {
-                let _ = writeln!(o, "\n  FAILED: {}. The journal says how far it got: `hemostat undo {id}` lifts whatever of it is live.", h(&why));
+                let _ = writeln!(o, "\n  FAILED: {}. The journal says how far it got: `hemostat undo {id}{f}` lifts whatever of it is live.", h(&why));
                 print_doc(json, &o, &doc("failed", &id, &why));
                 return EXIT_FAILED;
             }
@@ -429,8 +452,8 @@ mod verb {
                 let _ = j.append(&id, "watch", &[("pid", pid.to_string())]);
                 let _ = writeln!(
                     o,
-                    "  WATCHER  pid {pid} lifts it at {} (in {} s) unless it is confirmed:\n\n      hemostat fw confirm {id}\n\n  \
-                     Not in config.xml yet, so a filter reload or a reboot drops it too. `hemostat undo {id}` lifts it now.",
+                    "  WATCHER  pid {pid} lifts it at {} (in {} s) unless it is confirmed:\n\n      hemostat fw confirm {id} --arm{f}\n\n  \
+                     Not in config.xml yet, so a filter reload or a reboot drops it too. `hemostat undo {id}{f}` lifts it now.",
                     clock(t + a.deadline),
                     a.deadline
                 );
@@ -447,7 +470,7 @@ mod verb {
                             let _ = writeln!(o, "  LIFTED   {l:?}");
                         }
                         Err(e) => {
-                            let _ = writeln!(o, "  LIFT FAILED: {} — run `hemostat undo {id}`", h(&e));
+                            let _ = writeln!(o, "  LIFT FAILED: {} — run `hemostat undo {id}{f}`", h(&e));
                         }
                     }
                 });
@@ -476,34 +499,53 @@ mod verb {
         let mut sys = tools::System::new(l.manifest.as_ref()).with_meta(l.meta.as_ref());
         let _ = tools::renice_self(&mut sys, 10);
         let j = Journals::at(journal::DIR);
+
+        let mut failed = 0u32;
         loop {
-            let e = match j.read(&id) {
-                Ok(e) => e,
-                Err(why) => {
+            let why = match j.read(&id).map(|e| apply::watch_step(&e, now())) {
+                Ok(WatchStep::Wait(s)) => {
+                    failed = 0;
+                    std::thread::sleep(std::time::Duration::from_secs(s.max(1)));
+                    continue;
+                }
+                Ok(WatchStep::Stop(_)) => return EXIT_OK,
+                Ok(WatchStep::Due) => match lift_due(&mut sys, &j, &id) {
+                    Ok(code) => return code,
+                    Err(why) => why,
+                },
+                Err(why) => why,
+            };
+            failed = failed.saturating_add(1);
+            match apply::lift_retry_after(failed) {
+                Some(s) => std::thread::sleep(std::time::Duration::from_secs(s)),
+                None => {
+                    let f = follow_flags(&l.mpath, l.given_meta.as_deref());
+                    let what = format!(
+                        "watcher: gave up after {failed} failed tries at the deadline, the last: {why}. The block may \
+                         still be live: `hemostat undo {id}{f}` lifts it"
+                    );
+                    let _ = j.append(&id, "note", &[("what", what)]);
                     eprintln!("hemostat fw watch: {}", h(&why));
                     return EXIT_FAILED;
                 }
-            };
-            match apply::watch_step(&e, now()) {
-                WatchStep::Wait(s) => std::thread::sleep(std::time::Duration::from_secs(s.max(1))),
-                WatchStep::Stop(_) => return EXIT_OK,
-                WatchStep::Due => break,
             }
         }
-        let Ok(_held) = j.hold(&id) else { return EXIT_FAILED };
+    }
 
-        match j.read(&id).map(|e| apply::watch_step(&e, now())) {
-            Ok(WatchStep::Due) => {}
-            _ => return EXIT_OK,
+    fn lift_due(sys: &mut tools::System<'_>, j: &Journals, id: &str) -> Result<u8, String> {
+        let _held = j.hold(id)?;
+        match apply::watch_step(&j.read(id)?, now()) {
+            WatchStep::Due => {}
+            WatchStep::Stop(_) => return Ok(EXIT_OK),
+            WatchStep::Wait(_) => return Err("the deadline is not due yet by this box's clock".into()),
         }
         let mut no_seal = || Err("the watcher's lift writes no config".to_string());
-        match apply::lift(&mut sys, &j, &id, "watch", false, &read_config, &mut no_seal) {
-            Ok(Lifted::Left(why)) => {
-                let _ = j.append(&id, "note", &[("what", format!("watcher at the deadline: {why}"))]);
-                EXIT_PARTIAL
+        match apply::lift(sys, j, id, "watch", false, &read_config, &mut no_seal)? {
+            Lifted::Left(why) => {
+                let _ = j.append(id, "note", &[("what", format!("watcher at the deadline: {why}"))]);
+                Ok(EXIT_PARTIAL)
             }
-            Ok(_) => EXIT_OK,
-            Err(_) => EXIT_FAILED,
+            _ => Ok(EXIT_OK),
         }
     }
 
@@ -519,6 +561,7 @@ mod verb {
             eprintln!("hemostat fw confirm: needs the id `fw block` printed (eight hex digits)");
             return EXIT_USAGE;
         };
+        let armed = confirm_armed(args);
         if let Err(why) = apply::refuse_while_booting(booting()) {
             eprintln!("hemostat fw confirm: REFUSED — {}. The block stays live until its deadline", h(&why));
             return crate::EXIT_POLICY;
@@ -530,6 +573,16 @@ mod verb {
                 return EXIT_FAILED;
             }
         };
+
+        if l.manifest.is_none() {
+            eprintln!(
+                "hemostat fw confirm: DID NOT RUN — no signed manifest is loaded. Give it the one `fw block` was given \
+                 (--manifest PATH, or HEMOSTAT_MANIFEST): without it this run cannot read the host id the block's \
+                 journal names, and nothing it runs can be checked. Nothing was written; an unconfirmed block still \
+                 lifts at its deadline"
+            );
+            return EXIT_FAILED;
+        }
         let mut sys = tools::System::new(l.manifest.as_ref()).with_meta(l.meta.as_ref());
         let _ = tools::renice_self(&mut sys, 10);
         let (idn, _) = match crate::identity::gather_identity_with(&mut sys) {
@@ -559,7 +612,24 @@ mod verb {
             return EXIT_FAILED;
         }
 
-        let enrolled = hemostat_enforce_pf::Enrolled { alias: e.intent.alias, tracker: e.intent.tracker, protect: e.intent.protect.clone() };
+        let width = hemostat_enforce_pf::protect::Width::of(&e.intent.cidr);
+        if let Some(why) = golden_refusal(width, crate::golden::active()) {
+            let left = apply::held(&read_config(), &e).unwrap_or_else(|| format!("The block lifts at its deadline ({})", clock(e.intent.deadline)));
+            eprintln!("hemostat fw confirm: REFUSED — {why}. Nothing written. {}", h(&left));
+            return EXIT_POLICY;
+        }
+        let own = read_config().as_ref().map(crate::golden::own_addrs_of).unwrap_or_default();
+        if let Some(why) = crate::golden::block_scope_here(&e.intent.cidr, &own) {
+            let left = apply::held(&read_config(), &e).unwrap_or_else(|| format!("The block lifts at its deadline ({})", clock(e.intent.deadline)));
+            eprintln!("hemostat fw confirm: REFUSED — {}. Nothing written. {}", h(&why), h(&left));
+            return EXIT_POLICY;
+        }
+        let enrolled = hemostat_enforce_pf::Enrolled {
+            alias: e.intent.alias,
+            tracker: e.intent.tracker,
+            protect: e.intent.protect.clone(),
+            width,
+        };
         let engagement = std::env::var("HEMOSTAT_ENGAGEMENT_ID").ok().and_then(|x| crate::identity::parse_hex16(&x));
         let operand = hemostat_enforce_pf::operand(hemostat_buildinfo::ActionClass::PerimeterBlock, &idn.host, e.intent.alias, &e.intent.cidr);
         let t = now();
@@ -590,7 +660,7 @@ mod verb {
             ssh.as_deref(),
             &auth,
         );
-        let mut o = render_stages(&d, &idn.host, "fw confirm", &id);
+        let mut o = render_stages(&d, &idn.host, "fw confirm", &if armed { id.clone() } else { format!("{id}, DRY RUN") });
         let doc = |outcome: &str, detail: &str| {
             format!(
                 "{{\"id\":\"{id}\",\"cidr\":\"{}\",\"alias\":\"{}\",\"outcome\":\"{outcome}\",\"detail\":\"{}\"}}",
@@ -599,12 +669,48 @@ mod verb {
                 jesc(detail)
             )
         };
+
+        let lifts = format!("The block lifts at its deadline ({}) unless it is confirmed.", clock(e.intent.deadline));
         use std::fmt::Write as _;
 
-        if !d.passed() || !matches!(d.armed(&auth, Evidence::Sealed), Decision::Allow(_)) {
-            let _ = writeln!(o, "  Nothing written. The block stays live until its deadline.");
+        if !d.passed() || (armed && !matches!(d.armed(&auth, Evidence::Sealed), Decision::Allow(_))) {
+            let left = apply::held(&read_config(), &e).unwrap_or_else(|| lifts.clone());
+            let _ = writeln!(o, "  Nothing written. {}", h(&left));
             print_doc(json, &o, &doc("refused", "a stage refused"));
             return exit_code(&d);
+        }
+        if !armed {
+
+            let (outcome, detail, code) = match apply::would_confirm(&mut sys, &j, &id, t, &read_config) {
+                Ok(None) => {
+                    let _ = writeln!(
+                        o,
+                        "\n  would write  {} into {} in config.xml under \"HEMOSTAT {id}\" through pfSense's own PHP (one \
+                         revision, \"HEMOSTAT block {} {id}\"), reload the filter, re-add and re-test it, and prove it from \
+                         disk — after sealing config.xml and the backup digests",
+                        e.intent.cidr,
+                        e.intent.alias.name(),
+                        e.intent.cidr
+                    );
+                    let f = h(&follow_flags(&l.mpath, l.given_meta.as_deref()));
+                    let _ = writeln!(
+                        o,
+                        "\n  DRY RUN: nothing was sealed or written. {lifts} To confirm it:\n\n      hemostat fw confirm {id} --arm{f}"
+                    );
+                    ("dry-run", String::new(), EXIT_DRYRUN)
+                }
+                Ok(Some(rev)) => {
+                    let _ = writeln!(o, "\n  ALREADY CONFIRMED at revision {rev}; there is nothing to write.");
+                    ("already", rev, EXIT_OK)
+                }
+                Err(u) => {
+                    let _ = writeln!(o, "\n  REFUSED  journal       {}. Nothing written.", h(u.why()));
+                    let outcome = if matches!(u, Unconfirmed::Held(_)) { "held" } else { "refused" };
+                    (outcome, u.why().to_string(), EXIT_POLICY)
+                }
+            };
+            print_doc(json, &o, &doc(outcome, &detail));
+            return code;
         }
         let verified: Vec<String> = inc.as_ref().map(|v| v.iter().filter(|f| f.sha256.is_ok()).map(|f| f.path.clone()).collect()).unwrap_or_default();
         let mut seal_sys = tools::System::new(l.manifest.as_ref()).with_meta(l.meta.as_ref());
@@ -644,9 +750,15 @@ mod verb {
                 print_doc(json, &o, &doc("already", &rev));
                 EXIT_OK
             }
-            Err(why) => {
-                let _ = writeln!(o, "\n  NOT CONFIRMED: {}", h(&why));
+            Err(Unconfirmed::Live(why)) => {
+                let _ = writeln!(o, "\n  NOT CONFIRMED: {}. config.xml does not list it: {lifts}", h(&why));
                 print_doc(json, &o, &doc("refused", &why));
+                EXIT_FAILED
+            }
+
+            Err(Unconfirmed::Held(why)) => {
+                let _ = writeln!(o, "\n  NOT CONFIRMED, AND THE WATCHER WILL NOT LIFT IT AT ITS DEADLINE: {}", h(&why));
+                print_doc(json, &o, &doc("held", &why));
                 EXIT_FAILED
             }
         }
@@ -684,6 +796,13 @@ mod verb {
         let mut o = String::new();
         let _ = writeln!(o, "undo — replaying HEMOSTAT's containment journal ({}); only HEMOSTAT's own entries are lifted", journal::DIR);
         let _ = writeln!(o, "  (no ticket: undo only lifts, and what it lifts is judged from the journal and the box)");
+        if l.manifest.is_none() {
+            let _ = writeln!(
+                o,
+                "  no signed manifest is loaded, so no lift can run: pfctl and config.xml are reached only through tools \
+                 it verifies. Give undo the one `fw block` was given (--manifest PATH, or HEMOSTAT_MANIFEST)"
+            );
+        }
         let mut rows = Vec::new();
         let mut code = EXIT_OK;
         for id in &ids {
@@ -767,6 +886,18 @@ mod verb {
                 }
             }
         }
+
+        let width = width_asked(args);
+        if let Some(why) = golden_refusal(width, crate::golden::active()) {
+            eprintln!("hemostat fw statekill: REFUSED — {why}. Nothing was read or killed");
+            return EXIT_POLICY;
+        }
+
+        let own = read_config().as_ref().map(crate::golden::own_addrs_of).unwrap_or_default();
+        if let Some(why) = crate::golden::block_scope_here(&cidr, &own) {
+            eprintln!("hemostat fw statekill: REFUSED — {}. Nothing was read or killed", h(&why));
+            return EXIT_POLICY;
+        }
         let l = match load(args) {
             Ok(l) => l,
             Err(e) => {
@@ -790,7 +921,7 @@ mod verb {
         let policy = load_policy(engagement, &idn.host, ti);
         let (ticket, nonce) = load_ticket_as(ActionClass::PerimeterStateKill, engagement, &idn.host, &operand, ti, |n| !spent(n));
         let auth = hemostat_enforce_pf::Authority { profile: crate::authz::current_profile(), built: true, policy, ticket };
-        let enrolled = hemostat_enforce_pf::Enrolled { alias, tracker: 0, protect };
+        let enrolled = hemostat_enforce_pf::Enrolled { alias, tracker: 0, protect, width };
         let config = read_config();
         let resolv = saferead::read_text(Path::new("/etc/resolv.conf")).map_err(|e| e.to_string());
         let ssh = std::env::var("SSH_CONNECTION").ok();

@@ -799,6 +799,1175 @@ pub(crate) fn start_service(unit: &str, args: &[String]) -> u8 {
 }
 
 #[cfg(target_os = "linux")]
+fn apply_one_restart(
+    unit: &str,
+    opts: &hemostat_enforce_linux::ApplyOptions,
+    protect: &hemostat_enforce_linux::ProtectSet,
+) -> (&'static str, bool, String) {
+    use hemostat_enforce_linux::{Outcome, RemovalAction};
+    match (RemovalAction::StartService { unit: unit.to_string() }).apply(opts, protect) {
+        Outcome::Planned(p) => ("planned", false, p.detail),
+        Outcome::Applied(rec) => {
+            let journalled = journal_or_fail(&rec) == EXIT_OK;
+            (if journalled { "applied" } else { "failed" }, true, rec.did)
+        }
+        Outcome::Refused(r) => ("refused", false, r.message),
+        Outcome::Failed(f) => ("failed", false, f.reason),
+    }
+}
+
+#[cfg(target_os = "linux")]
+const FIXES_DIR: &str = "/var/log/hemostat";
+
+#[cfg(target_os = "linux")]
+pub(crate) fn audit_fix(what: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dir = std::path::Path::new(FIXES_DIR);
+    if let Err(why) = append_fixes_line(dir, 0, &fixes_log_line(now, what)) {
+        eprintln!("hemostat: the fix stands, but {FIXES_DIR}/fixes.log was not written: {}", h(&why));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fixes_log_line(epoch: u64, what: &str) -> String {
+    format!("{}  {}\n", crate::remediate_verb::epoch_to_utc(epoch), what.replace(['\n', '\r'], " "))
+}
+
+#[cfg(target_os = "linux")]
+fn append_fixes_line(dir: &std::path::Path, owner: u32, line: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("{} could not be created ({e})", dir.display())),
+    }
+    let dmd = std::fs::symlink_metadata(dir)
+        .map_err(|e| format!("{} could not be examined ({e})", dir.display()))?;
+    if let Some(why) = dir_refusal(dmd.file_type().is_symlink(), dmd.is_dir(), dmd.uid(), dmd.mode(), owner) {
+        return Err(format!("{}: {why}", dir.display()));
+    }
+    let path = dir.join("fixes.log");
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .map_err(|e| format!("{} could not be opened without following a link ({e})", path.display()))?;
+    let md = f.metadata().map_err(|e| format!("{} could not be examined ({e})", path.display()))?;
+    if let Some(why) = file_refusal(md.file_type().is_symlink(), md.is_file(), md.uid(), md.nlink(), owner) {
+        return Err(format!("{}: {why}", path.display()));
+    }
+    f.write_all(line.as_bytes()).map_err(|e| format!("{} could not be appended to ({e})", path.display()))
+}
+
+#[cfg(target_os = "linux")]
+fn dir_refusal(is_link: bool, is_dir: bool, uid: u32, mode: u32, owner: u32) -> Option<String> {
+    if is_link {
+        return Some("it is a symbolic link, and what is written through one lands wherever it points".into());
+    }
+    if !is_dir {
+        return Some("it is not a directory".into());
+    }
+    if uid != owner {
+        return Some(format!("it is owned by uid {uid}, not {owner}"));
+    }
+    if mode & 0o022 != 0 {
+        return Some(format!(
+            "its group or everyone can write it (mode {:o}), so anyone could put a link at the name",
+            mode & 0o7777
+        ));
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn file_refusal(is_link: bool, is_file: bool, uid: u32, nlink: u64, owner: u32) -> Option<String> {
+    if is_link {
+        return Some("it is a symbolic link, and what is written through one lands wherever it points".into());
+    }
+    if !is_file {
+        return Some("it is not a regular file".into());
+    }
+    if uid != owner {
+        return Some(format!("it is owned by uid {uid}, not {owner}"));
+    }
+    if nlink > 1 {
+        return Some(format!(
+            "it is one of {nlink} hard links to the same file, and a write here lands in every one"
+        ));
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn restore_scored(args: &[String], json: bool) -> u8 {
+    use hemostat_enforce_linux::{ApplyOptions, ProtectSet};
+
+    if let Err(msg) = require_built(hemostat_buildinfo::ActionClass::ServiceStart) {
+        eprintln!("hemostat services: {msg}");
+        return EXIT_NOT_BUILT;
+    }
+    if !crate::golden::active() {
+        eprintln!(
+            "hemostat services --restore: the IRSeC golden baseline is off, so there is no \
+             scored-service roster to restore. Set HEMOSTAT_GOLDEN=1 on a competition box."
+        );
+        return EXIT_POLICY;
+    }
+
+    let ov = hemostat_sensor_linux::overview::report();
+    let report = crate::service_health::from_overview(&ov);
+    let armed = args.iter().any(|a| a == "--arm");
+
+    if let Some(why) = &report.not_checked {
+        if json {
+            jprintln!("{{\"restore\":{{\"golden\":true,\"armed\":{armed},\"not_checked\":{}}}}}", json_str(why));
+        } else {
+            println!("scored services — NOT CHECKED: {}\n  nothing was checked or restarted", h(why));
+        }
+        return EXIT_PARTIAL;
+    }
+
+    let role_json = crate::golden::role_json(report.role.as_ref());
+    if let Some(r) = report.role.filter(|r| r.from_override) {
+        if !json {
+            println!("scored services — {}, not the hostname `{}`", crate::golden::role_said(&r), h(&ov.identity.hostname));
+        }
+    }
+    let health = &report.services;
+    let known = crate::uptime::known_service_units();
+
+    let mut plan = Vec::new();
+    let mut stuck: Vec<(crate::uptime::Restart, &'static str)> = Vec::new();
+    for r in crate::uptime::plan_restarts(health, &known) {
+        match crate::uptime::already_running(crate::uptime::unit_state(&r.unit)) {
+            Some(why) => stuck.push((r, why)),
+            None => plan.push(r),
+        }
+    }
+
+    let unresolved: Vec<&'static crate::golden::ScoredService> = health
+        .iter()
+        .filter(|hh| hh.up == Some(false))
+        .filter(|hh| crate::golden::pick_unit(crate::golden::units_for(hh.svc.probe), &known).is_none())
+        .map(|hh| hh.svc)
+        .collect();
+
+    let port_json =
+        |s: &crate::golden::ScoredService| s.port.map_or("null".to_string(), |p| p.to_string());
+    let port_text = |s: &crate::golden::ScoredService| s.port.map_or_else(|| "its port".to_string(), |p| p.to_string());
+    let stuck_json = || -> Vec<String> {
+        stuck
+            .iter()
+            .map(|(r, why)| {
+                format!(
+                    "{{\"service\":{},\"host\":{},\"unit\":{},\"port\":{},\"outcome\":\"running-port-closed\",\"why\":{}}}",
+                    json_str(r.svc.service), json_str(r.svc.host), json_str(&r.unit), port_json(r.svc), json_str(why)
+                )
+            })
+            .collect()
+    };
+    let print_stuck = || {
+        for (r, why) in &stuck {
+            println!(
+                "  [RUNNING, PORT CLOSED] {} → {}: {why}, but port {} is not listening where the scorer reaches it — a restart will not help; needs a human ({})",
+                h(r.svc.service), h(&r.unit), port_text(r.svc), crate::uptime::port_closed_hint(r.svc.probe)
+            );
+        }
+    };
+
+    if plan.is_empty() {
+        if json {
+            let un: Vec<String> = unresolved
+                .iter()
+                .map(|s| format!("{{\"service\":{},\"host\":{},\"port\":{}}}", json_str(s.service), json_str(s.host), port_json(s)))
+                .collect();
+            jprintln!(
+                "{{\"restore\":{{\"golden\":true,\"armed\":{armed}{role_json},\"planned\":[],\"needs_human\":[{}],\"unresolved\":[{}]}}}}",
+                stuck_json().join(","), un.join(",")
+            );
+        } else if unresolved.is_empty() && stuck.is_empty() {
+            println!("scored services — every service this box owns is up (nothing to restore)");
+        } else {
+            println!("scored services — down, and nothing here to start:");
+            print_stuck();
+            for s in &unresolved {
+                println!("  [DOWN] {} — no recognised unit among {:?}; declare it and use `services --start`", h(s.service), crate::golden::units_for(s.probe));
+            }
+        }
+        return if unresolved.is_empty() && stuck.is_empty() { EXIT_OK } else { EXIT_POLICY };
+    }
+
+    let ticket = match crate::authz::armed_gate("services", hemostat_buildinfo::ActionClass::ServiceStart, armed, plan.len()) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    if let Err(code) = crate::authz::spend_armed("services", armed, ticket) {
+        return code;
+    }
+
+    let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
+    let protect = ProtectSet::gather();
+
+    let (mut any_failed, mut any_refused, mut any_planned) = (false, false, false);
+    if !json {
+        println!(
+            "scored services — {} down service(s){}\n",
+            plan.len(),
+            if armed { "" } else { " (dry run — add --arm to apply)" }
+        );
+    }
+    let mut rows: Vec<String> = Vec::new();
+    for r in &plan {
+        let (status, _applied, detail) = apply_one_restart(&r.unit, &opts, &protect);
+
+        let status = match status {
+            "applied" if crate::uptime::await_port(r.svc) != Some(true) => "started-port-closed",
+            other => other,
+        };
+        match status {
+            "planned" => {
+                any_planned = true;
+                if !json {
+                    println!("  [plan] {} → {}\n         {}", h(r.svc.service), h(&r.unit), h(&detail));
+                }
+            }
+            "applied" => {
+                if !json {
+                    println!("  [done] {} → {} enabled and started; port {} answers", h(r.svc.service), h(&r.unit), port_text(r.svc));
+                }
+            }
+            "started-port-closed" => {
+                any_failed = true;
+                if !json {
+                    eprintln!(
+                        "  [not fixed] {} → {} started, but port {} did not answer within {}s — needs a human ({})",
+                        h(r.svc.service), h(&r.unit), port_text(r.svc), crate::uptime::PORT_WAIT_SECS,
+                        crate::uptime::port_closed_hint(r.svc.probe)
+                    );
+                }
+            }
+            "refused" => {
+                any_refused = true;
+                if !json {
+                    eprintln!("  [refused] {} → {}: {}", h(r.svc.service), h(&r.unit), h(&detail));
+                }
+            }
+            _ => {
+                any_failed = true;
+                if !json {
+                    eprintln!("  [failed] {} → {}: {}", h(r.svc.service), h(&r.unit), h(&detail));
+                }
+            }
+        }
+        if json {
+            rows.push(format!(
+                "{{\"service\":{},\"host\":{},\"unit\":{},\"armed\":{armed},\"outcome\":\"{status}\"}}",
+                json_str(r.svc.service), json_str(r.svc.host), json_str(&r.unit)
+            ));
+        }
+    }
+    if json {
+        let un: Vec<String> = unresolved
+            .iter()
+            .map(|s| format!("{{\"service\":{},\"host\":{},\"port\":{}}}", json_str(s.service), json_str(s.host), port_json(s)))
+            .collect();
+        jprintln!(
+            "{{\"restore\":{{\"golden\":true,\"armed\":{armed}{role_json},\"planned\":[{}],\"needs_human\":[{}],\"unresolved\":[{}]}}}}",
+            rows.join(","), stuck_json().join(","), un.join(",")
+        );
+    } else {
+        if !stuck.is_empty() {
+            println!();
+            print_stuck();
+        }
+        if !unresolved.is_empty() {
+            println!("\n  down with no recognised unit (declare and `services --start`):");
+            for s in &unresolved {
+                println!("    [DOWN] {}", h(s.service));
+            }
+        }
+    }
+
+    if any_failed {
+        EXIT_ENFORCER
+    } else if any_refused {
+        EXIT_POLICY
+    } else if any_planned {
+        EXIT_DRYRUN
+    } else if !stuck.is_empty() || !unresolved.is_empty() {
+        EXIT_POLICY
+    } else {
+        EXIT_OK
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn watch_restore(args: &[String], json: bool, every_secs: u64) -> u8 {
+    use hemostat_enforce_linux::{ApplyOptions, ProtectSet};
+    use hemostat_sensor_linux::firewall::Reach;
+
+    if let Err(msg) = require_built(hemostat_buildinfo::ActionClass::ServiceStart) {
+        eprintln!("hemostat services: {msg}");
+        return EXIT_NOT_BUILT;
+    }
+    if !crate::golden::active() {
+        eprintln!(
+            "hemostat services --restore --every: the IRSeC golden baseline is off (set \
+             HEMOSTAT_GOLDEN=1 on a competition box); there is no scored roster to watch."
+        );
+        return EXIT_POLICY;
+    }
+
+    let armed = args.iter().any(|a| a == "--arm");
+    let every = every_secs.max(1);
+
+    let ticket = match crate::authz::armed_gate(
+        "services",
+        hemostat_buildinfo::ActionClass::ServiceStart,
+        armed,
+        1,
+    ) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    if let Err(code) = crate::authz::spend_armed("services", armed, ticket) {
+        return code;
+    }
+
+    let mut gov = crate::uptime::Governor::default();
+    let protect = ProtectSet::gather();
+    let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
+
+    if !json {
+        println!(
+            "mahoraga watchdog — scored-service uptime, every {every}s {}\n  {}\n  Ctrl-C to stop.\n",
+            if armed { "(ARMED: auto-fix)" } else { "(dry run: reporting only — add --arm to auto-fix)" },
+            if armed {
+                "each fix is journalled and appended to /var/log/hemostat/fixes.log"
+            } else {
+                "nothing will be changed"
+            },
+        );
+
+        if let Ok(r) = crate::golden::resolve_role(None, crate::golden::role_override().as_deref()) {
+            println!("  {}: the hostname is not used\n", crate::golden::role_said(&r));
+        }
+    }
+
+    let pause = |tick: std::time::Instant| {
+        let remaining = every.saturating_sub(tick.elapsed().as_secs());
+        if remaining > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(remaining));
+        }
+    };
+
+    loop {
+        let tick = std::time::Instant::now();
+        let now = crate::remediate_verb::epoch_to_utc(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+
+        let ov = hemostat_sensor_linux::overview::report();
+        let report = crate::service_health::from_overview(&ov);
+
+        if let Some(why) = &report.not_checked {
+            if json {
+                jprintln!("{{\"tick\":{},\"armed\":{armed},\"not_checked\":{}}}", json_str(&now), json_str(why));
+            } else {
+                println!("[{now}] NOT CHECKED  {} — nothing was checked or changed this tick", h(why));
+            }
+            pause(tick);
+            continue;
+        }
+        let health = &report.services;
+        let known = crate::uptime::known_service_units();
+
+        for hh in health.iter().filter(|hh| hh.up == Some(true)) {
+            if let Some(u) = crate::golden::pick_unit(crate::golden::units_for(hh.svc.probe), &known) {
+                gov.seen_up(u);
+            }
+        }
+        let (attempt, backed): (Vec<_>, Vec<_>) = crate::uptime::plan_restarts(health, &known)
+            .into_iter()
+            .partition(|r| gov.should_attempt(&r.unit));
+
+        let (mut fixed, mut still_down, mut backed_names): (Vec<String>, Vec<String>, Vec<String>) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let mut needs_human: Vec<String> = Vec::new();
+        let port_of = |s: &crate::golden::ScoredService| s.port.map_or_else(|| "its port".to_string(), |p| p.to_string());
+
+        for r in &backed {
+            backed_names.push(r.unit.clone());
+            if !json {
+                println!("[{now}] BACKED-OFF {} → {} (restart keeps failing — needs a human)", h(r.svc.service), h(&r.unit));
+            }
+        }
+        for r in &attempt {
+
+            if let Some(why) = crate::uptime::already_running(crate::uptime::unit_state(&r.unit)) {
+                if armed {
+                    gov.record(&r.unit, false);
+                }
+                needs_human.push(r.unit.clone());
+                if !json {
+                    println!(
+                        "[{now}] RUNNING, PORT CLOSED {} → {} ({why}, but port {} is not listening where the scorer reaches it — a restart will not help; needs a human: {})",
+                        h(r.svc.service), h(&r.unit), port_of(r.svc), crate::uptime::port_closed_hint(r.svc.probe)
+                    );
+                }
+                continue;
+            }
+            let (status, applied, detail) = apply_one_restart(&r.unit, &opts, &protect);
+
+            let answering = applied && crate::uptime::await_port(r.svc) == Some(true);
+            if armed {
+                gov.record(&r.unit, answering);
+                if applied {
+                    audit_fix(&format!("restore {} → {} [{status}]", r.svc.service, r.unit));
+                }
+            }
+            match status {
+                "applied" if answering => fixed.push(r.unit.clone()),
+                _ => still_down.push(r.unit.clone()),
+            }
+            if !json {
+                let tag = match status {
+                    "applied" if answering => "FIXED  ",
+                    "applied" => "NOT FIXED",
+                    "planned" => "DOWN   ",
+                    "refused" => "REFUSED",
+                    _ => "FAILED ",
+                };
+                let detail = if status == "applied" && !answering {
+                    format!(
+                        "{detail}, but port {} did not answer within {}s — needs a human: {}",
+                        port_of(r.svc), crate::uptime::PORT_WAIT_SECS, crate::uptime::port_closed_hint(r.svc.probe)
+                    )
+                } else {
+                    detail
+                };
+                println!("[{now}] {tag} {} → {}  {}", h(r.svc.service), h(&r.unit), h(&detail));
+            }
+        }
+
+        let fw = hemostat_sensor_linux::firewall_report();
+        let mut unreachable: Vec<String> = Vec::new();
+        let mut reach_unknown: Vec<String> = Vec::new();
+        for (s, reach) in crate::service_health::firewall_reach(&report, &fw) {
+            let port = port_of(s);
+            match reach {
+                Reach::Blocked(by) => {
+                    unreachable.push(s.service.to_string());
+                    if !json {
+                        println!("[{now}] UNREACH  {} → :{port} (the firewall drops it: {} — a restart will not help; remove the rule or open the port)", h(s.service), h(&by));
+                    }
+                }
+                Reach::Unknown(why) => {
+                    reach_unknown.push(s.service.to_string());
+                    if !json {
+                        println!("[{now}] UNKNOWN  {} → :{port} (listening, but whether the firewall lets the scorer through is not known: {})", h(s.service), h(&why));
+                    }
+                }
+                Reach::Open => {}
+            }
+        }
+
+        let unprobed: Vec<String> = health.iter().filter(|hh| hh.up.is_none()).map(|hh| hh.svc.service.to_string()).collect();
+        if !unprobed.is_empty() && !json {
+            println!("[{now}] NOT CHECKED  {} (no scored port to probe)", h(&unprobed.join(", ")));
+        }
+
+        let no_unit: Vec<&'static crate::golden::ScoredService> = health
+            .iter()
+            .filter(|hh| hh.up == Some(false))
+            .filter(|hh| crate::golden::pick_unit(crate::golden::units_for(hh.svc.probe), &known).is_none())
+            .map(|hh| hh.svc)
+            .collect();
+        if !json {
+            for s in &no_unit {
+                let why = if known.is_empty() {
+                    "the installed units could not be listed (systemctl list-unit-files), so none is started".to_string()
+                } else {
+                    format!("no recognised unit among {:?} to start", crate::golden::units_for(s.probe))
+                };
+                println!(
+                    "[{now}] DOWN     {} → :{} ({why} — needs a human: declare it and use `services --start`)",
+                    h(s.service), port_of(s)
+                );
+            }
+        }
+        let unresolved: Vec<String> = no_unit.iter().map(|s| s.service.to_string()).collect();
+
+        let all_seen = attempt.is_empty()
+            && backed.is_empty()
+            && unresolved.is_empty()
+            && unreachable.is_empty()
+            && reach_unknown.is_empty()
+            && unprobed.is_empty();
+        if all_seen && !json {
+            println!("[{now}] all scored services up");
+        }
+        if json {
+            let arr = |v: &[String]| v.iter().map(|s| json_str(s)).collect::<Vec<_>>().join(",");
+            jprintln!(
+                "{{\"tick\":{},\"armed\":{armed}{},\"fixed\":[{}],\"down\":[{}],\"backed_off\":[{}],\"needs_human\":[{}],\"unresolved\":[{}],\"unreachable\":[{}],\"reach_unknown\":[{}],\"unprobed\":[{}]}}",
+                json_str(&now), crate::golden::role_json(report.role.as_ref()), arr(&fixed), arr(&still_down), arr(&backed_names),
+                arr(&needs_human), arr(&unresolved), arr(&unreachable), arr(&reach_unknown), arr(&unprobed)
+            );
+        }
+
+        pause(tick);
+    }
+}
+
+#[cfg(target_os = "linux")]
+const WATCHDOG_UNIT: &str = "/etc/systemd/system/mahoraga-watchdog.service";
+
+#[cfg(target_os = "linux")]
+const WATCHDOG_SERVICE: &str = "mahoraga-watchdog.service";
+
+#[cfg(target_os = "linux")]
+fn systemctl() -> Option<std::path::PathBuf> {
+    ["/usr/bin/systemctl", "/bin/systemctl"].into_iter().map(std::path::PathBuf::from).find(|p| p.exists())
+}
+
+#[cfg(target_os = "linux")]
+fn systemctl_run(sc: &std::path::Path, args: &[&str]) -> Result<(), String> {
+    let o = std::process::Command::new(sc)
+        .args(args)
+        .env_clear()
+        .output()
+        .map_err(|e| format!("`systemctl {}` could not be run ({e})", args.join(" ")))?;
+    if o.status.success() {
+        Ok(())
+    } else {
+        Err(format!("`systemctl {}` failed: {}", args.join(" "), String::from_utf8_lossy(&o.stderr).trim()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn watchdog_active(sc: &std::path::Path) -> Option<bool> {
+    std::process::Command::new(sc)
+        .args(["is-active", "--quiet", WATCHDOG_SERVICE])
+        .env_clear()
+        .status()
+        .ok()
+        .map(|s| s.success())
+}
+
+#[cfg(target_os = "linux")]
+const WATCHDOG_ENV: [&str; 6] = [
+    crate::authz::POLICY_ENV,
+    "HEMOSTAT_ENGAGEMENT_PUBKEY",
+    "HEMOSTAT_ENGAGEMENT_ID",
+    "HEMOSTAT_EPOCH_FLOOR",
+    "HEMOSTAT_PROFILE",
+    "HEMOSTAT_ROLE",
+];
+
+#[cfg(target_os = "linux")]
+const WATCHDOG_ENV_PATHS: [&str; 2] = [crate::authz::POLICY_ENV, "HEMOSTAT_EPOCH_FLOOR"];
+
+#[cfg(target_os = "linux")]
+fn unit_value_ok(v: &str) -> bool {
+    !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || "._/+:@,=-".contains(c))
+}
+
+#[cfg(target_os = "linux")]
+fn watchdog_exe(exe: std::io::Result<std::path::PathBuf>) -> Result<String, String> {
+    let exe = exe.map_err(|e| {
+        format!("this binary's own path could not be read ({e}), and a unit that runs a bare name runs whatever is found first")
+    })?;
+    let shown = exe.display().to_string();
+    match exe.to_str() {
+        Some(s) if s.starts_with('/') && unit_value_ok(s) => Ok(s.to_string()),
+        _ => Err(format!(
+            "this binary is at {shown}, which a unit file cannot name exactly (letters, digits and \
+             ._/+:@,=- only, and not a file replaced since it started); copy it to a plain path, \
+             such as /usr/local/sbin/mahoraga, and install from there"
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn watchdog_env(get: impl Fn(&str) -> Option<String>) -> Result<Vec<(&'static str, String)>, String> {
+    let mut out = Vec::new();
+    for k in WATCHDOG_ENV {
+        let Some(v) = get(k).filter(|v| !v.is_empty()) else { continue };
+        if !unit_value_ok(&v) {
+            return Err(format!(
+                "${k} is set to something a unit file would read as something else; the watchdog \
+                 must run under exactly the {k} you set, so give it a value of letters, digits and \
+                 ._/+:@,=- only"
+            ));
+        }
+        if WATCHDOG_ENV_PATHS.contains(&k) && !v.starts_with('/') {
+            return Err(format!(
+                "${k} is the relative path {v}, and the watchdog runs from / under systemd, where \
+                 it names another file; give ${k} as an absolute path"
+            ));
+        }
+        out.push((k, v));
+    }
+    Ok(out)
+}
+
+#[cfg(target_os = "linux")]
+fn watchdog_unit_text(exe: &str, every: u64, env: &[(&str, String)]) -> String {
+    let vars: String = std::iter::once("Environment=HEMOSTAT_GOLDEN=1\n".to_string())
+        .chain(env.iter().map(|(k, v)| format!("Environment={k}={v}\n")))
+        .collect();
+    format!(
+        "[Unit]\n\
+         Description=Mahoraga scored-service uptime watchdog\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\n\
+         [Service]\n\
+         {vars}\
+         ExecStart={exe} services --restore --every {every} --arm\n\
+         Restart=always\n\
+         RestartSec=5\n\n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitAt {
+
+    Absent,
+
+    Ours,
+}
+
+#[cfg(target_os = "linux")]
+fn watchdog_unit_at(path: &std::path::Path, want: &str, owner: u32) -> Result<UnitAt, String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let refuse = |why: String| format!("refusing to install over {}: {why}", path.display());
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(UnitAt::Absent),
+        Err(e) => return Err(refuse(format!("it could not be examined ({e})"))),
+    };
+    if let Some(why) = file_refusal(md.file_type().is_symlink(), md.is_file(), md.uid(), md.nlink(), owner) {
+        return Err(refuse(why));
+    }
+
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| refuse(format!("it could not be opened without following a link ({e})")))?;
+    let md = f.metadata().map_err(|e| refuse(format!("it could not be examined ({e})")))?;
+    if let Some(why) = file_refusal(false, md.is_file(), md.uid(), md.nlink(), owner) {
+        return Err(refuse(why));
+    }
+
+    let cap = u64::try_from(want.len()).map_or(u64::MAX, |n| n.saturating_add(1));
+    let mut have = Vec::new();
+    (&f).take(cap).read_to_end(&mut have).map_err(|e| refuse(format!("it could not be read ({e})")))?;
+    if have == want.as_bytes() {
+        Ok(UnitAt::Ours)
+    } else {
+        Err(refuse(
+            "a different unit is already there. If it is an earlier watchdog, `mahoraga services \
+             --uninstall-watchdog --arm` takes it out; then install again"
+                .into(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_unit_file(path: &std::path::Path, body: &str, owner: u32) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let (Some(dir), Some(name)) = (path.parent().filter(|d| !d.as_os_str().is_empty()), path.file_name()) else {
+        return Err(format!("{} names no file in a directory", path.display()));
+    };
+    let dmd = std::fs::symlink_metadata(dir).map_err(|e| format!("{} could not be examined ({e})", dir.display()))?;
+    if let Some(why) = dir_refusal(dmd.file_type().is_symlink(), dmd.is_dir(), dmd.uid(), dmd.mode(), owner) {
+        return Err(format!("{}: {why}", dir.display()));
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp = dir.join(format!(".{}.{}.{nonce}.tmp", name.to_string_lossy(), std::process::id()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
+        .map_err(|e| format!("{} could not be created ({e})", tmp.display()))?;
+    let written = f
+        .write_all(body.as_bytes())
+        .and_then(|()| f.set_permissions(std::fs::Permissions::from_mode(0o644)))
+        .and_then(|()| f.sync_all());
+    drop(f);
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{} could not be written ({e})", path.display()));
+    }
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn install_watchdog(args: &[String], every: u64) -> u8 {
+    use hemostat_enforce_linux::{journal, ApplyOptions, Outcome, ProtectSet, RemovalAction, UndoKind, UndoRecord};
+
+    if let Err(msg) = require_built(hemostat_buildinfo::ActionClass::ServiceStart) {
+        eprintln!("hemostat services: {msg}");
+        return EXIT_NOT_BUILT;
+    }
+    let armed = args.iter().any(|a| a == "--arm");
+    let exe = match watchdog_exe(std::env::current_exe()) {
+        Ok(e) => e,
+        Err(why) => {
+            eprintln!("hemostat services: {}. Nothing was changed.", h(&why));
+            return EXIT_USAGE;
+        }
+    };
+    let env = match watchdog_env(|k| match std::env::var(k) {
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+
+        Err(std::env::VarError::NotUnicode(_)) => Some("\u{FFFD}".to_string()),
+    }) {
+        Ok(v) => v,
+        Err(why) => {
+            eprintln!("hemostat services: {}. Nothing was changed.", h(&why));
+            return EXIT_USAGE;
+        }
+    };
+    let unit = watchdog_unit_text(&exe, every, &env);
+    let unit_path = std::path::Path::new(WATCHDOG_UNIT);
+
+    let at = match watchdog_unit_at(unit_path, &unit, 0) {
+        Ok(a) => a,
+        Err(why) => {
+            eprintln!("hemostat services: {}. Nothing was changed.", h(&why));
+            return EXIT_POLICY;
+        }
+    };
+
+    let ticket =
+        match crate::authz::armed_gate("services", hemostat_buildinfo::ActionClass::ServiceStart, armed, 1) {
+            Ok(t) => t,
+            Err(code) => return code,
+        };
+    if let Err(code) = crate::authz::spend_armed("services", armed, ticket) {
+        return code;
+    }
+
+    let carried: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+    if !armed {
+        match at {
+            UnitAt::Absent => {
+                println!("install the uptime watchdog as a systemd service ({WATCHDOG_UNIT}):\n");
+                print!("{unit}");
+            }
+            UnitAt::Ours => println!(
+                "the uptime watchdog unit is already at {WATCHDOG_UNIT}, exactly as this would write \
+                 it; only the enable and the start are left"
+            ),
+        }
+        println!(
+            "\nIt runs `{exe} services --restore --every {every} --arm` with HEMOSTAT_GOLDEN=1{} and \
+             restarts on boot. Then `systemctl enable --now {WATCHDOG_SERVICE}`, checked active; the \
+             unit and the start are journaled together, so `hemostat undo` takes the install back out.",
+            if carried.is_empty() { String::new() } else { format!(" and {}", carried.join(", ")) }
+        );
+        println!("\nNothing was changed. Add --arm to install (remove later with `services --uninstall-watchdog --arm`).");
+        return EXIT_DRYRUN;
+    }
+
+    if systemctl().is_none() {
+        eprintln!("hemostat services: systemctl not found; cannot install the watchdog service. Nothing was changed.");
+        return EXIT_ENFORCER;
+    }
+    let vault = std::path::Path::new(hemostat_enforce_linux::DEFAULT_VAULT);
+    let mut ledger = journal::Appender::new(vault);
+    if at == UnitAt::Absent {
+
+        let kept = match hemostat_enforce_linux::snapshot(unit_path, &unit, vault) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("hemostat services: {}. Nothing was changed.", h(&e));
+                return EXIT_FAILED;
+            }
+        };
+        if let Err(why) = write_unit_file(unit_path, &unit, 0) {
+            eprintln!("hemostat services: {}. Nothing was changed.", h(&why));
+            return EXIT_ENFORCER;
+        }
+        let wrote = UndoRecord {
+            did: format!("wrote the uptime watchdog unit {WATCHDOG_UNIT}"),
+            undo: UndoKind::RemoveCreatedFile { vault: kept, original: unit_path.to_path_buf() },
+            reversible: true,
+        };
+        if let Err(e) = ledger.append(&wrote) {
+
+            let left = match std::fs::remove_file(unit_path) {
+                Ok(()) => "was taken back out".to_string(),
+                Err(re) => format!("could not be taken back out ({re}): delete {WATCHDOG_UNIT} by hand"),
+            };
+            eprintln!(
+                "hemostat services: the undo journal could not be written ({e}), so the unit {left}. \
+                 The watchdog was not installed."
+            );
+            return EXIT_FAILED;
+        }
+    }
+
+    if let Err(e) = hemostat_enforce_linux::daemon_reload() {
+        let undo = if ledger.started() {
+            format!(" — undo: hemostat undo {}", ledger.path().display())
+        } else {
+            String::new()
+        };
+        eprintln!("hemostat services: systemd was not reloaded ({}), so the watchdog was not started{undo}", h(&e));
+        return EXIT_ENFORCER;
+    }
+
+    let protect = ProtectSet::gather();
+    match (RemovalAction::StartService { unit: WATCHDOG_SERVICE.to_string() }).apply(&ApplyOptions::armed(), &protect) {
+        Outcome::Applied(rec) => {
+            let journalled = ledger.append(&rec);
+            println!("installed and started the uptime watchdog ({WATCHDOG_SERVICE}, every {every}s)");
+            println!("  status: systemctl status mahoraga-watchdog   logs: journalctl -u mahoraga-watchdog -f");
+            println!("  remove: mahoraga services --uninstall-watchdog --arm");
+            match journalled {
+                Ok(()) => {
+                    println!("{} — undo: hemostat undo {}", h(&rec.did), h(&ledger.path().display().to_string()));
+                    EXIT_OK
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{} — WARNING: the undo journal could not be written ({e}); `services \
+                         --uninstall-watchdog --arm` still removes it",
+                        h(&rec.did)
+                    );
+                    EXIT_FAILED
+                }
+            }
+        }
+        Outcome::Failed(f) => {
+            eprintln!("hemostat services: {} failed: {}", h(&f.action), h(&f.reason));
+            if ledger.started() {
+                eprintln!("  the unit is written — undo: hemostat undo {}", h(&ledger.path().display().to_string()));
+            }
+            eprintln!("  `services --uninstall-watchdog --arm` takes out whatever of it is there.");
+            EXIT_ENFORCER
+        }
+        Outcome::Refused(r) => {
+            eprintln!("hemostat services: {}", h(&r.message));
+            EXIT_POLICY
+        }
+        Outcome::Planned(_) => {
+            eprintln!("hemostat services: an armed start came back as a plan; the watchdog was not started");
+            EXIT_ENFORCER
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn uninstall_watchdog(args: &[String]) -> u8 {
+    use hemostat_enforce_linux::{UndoKind, UndoRecord};
+
+    if let Err(msg) = require_built(hemostat_buildinfo::ActionClass::Uninstall) {
+        eprintln!("hemostat services: {msg}");
+        return EXIT_NOT_BUILT;
+    }
+    let armed = args.iter().any(|a| a == "--arm");
+    match crate::authz::reversal_authority(hemostat_evcrypto::ticket::Op::Uninstall, armed) {
+        Ok(None) => {}
+        Ok(Some(gap)) => eprintln!("hemostat services: NOTE: {gap}"),
+        Err((code, why)) => {
+            eprintln!("hemostat services: {why}");
+            return code;
+        }
+    }
+    let Some(sc) = systemctl() else {
+        eprintln!("hemostat services: systemctl not found; nothing was changed");
+        return EXIT_ENFORCER;
+    };
+    let unit_path = std::path::Path::new(WATCHDOG_UNIT);
+    let file = std::fs::symlink_metadata(unit_path).is_ok();
+    let active = watchdog_active(&sc);
+    if !file && active == Some(false) {
+        println!("the watchdog service is not installed (nothing to remove)");
+        return EXIT_OK;
+    }
+    if !armed {
+        println!("remove the uptime watchdog service ({WATCHDOG_SERVICE}):");
+        println!(
+            "  stop it ({}) and disable it",
+            match active {
+                Some(true) => "it is running",
+                Some(false) => "it is not running",
+                None => "systemctl could not say whether it is running",
+            }
+        );
+        if file {
+            println!("  delete {WATCHDOG_UNIT}, then reload systemd");
+        }
+        println!("  The scored services it was keeping up are left as they are.");
+        println!("\nNothing was changed. Add --arm to remove it.");
+        return EXIT_DRYRUN;
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    if let Err(e) = systemctl_run(&sc, &["stop", WATCHDOG_SERVICE]) {
+        problems.push(e);
+    }
+    if file {
+        if let Err(e) = systemctl_run(&sc, &["disable", WATCHDOG_SERVICE]) {
+            problems.push(e);
+        }
+        if let Err(e) = std::fs::remove_file(unit_path) {
+            problems.push(format!("{WATCHDOG_UNIT} could not be removed ({e})"));
+        }
+        if let Err(e) = hemostat_enforce_linux::daemon_reload() {
+            problems.push(format!("systemd was not reloaded ({e})"));
+        }
+    }
+
+    let _ = systemctl_run(&sc, &["reset-failed", WATCHDOG_SERVICE]);
+
+    let mut left: Vec<&str> = Vec::new();
+    match watchdog_active(&sc) {
+        Some(false) => {}
+        Some(true) => left.push("it is still running"),
+        None => left.push("systemctl could not say whether it is still running"),
+    }
+    if std::fs::symlink_metadata(unit_path).is_ok() {
+        left.push("its unit file is still there");
+    }
+    if !left.is_empty() {
+        eprintln!("hemostat services: the uptime watchdog was NOT removed: {}", left.join("; "));
+        for p in &problems {
+            eprintln!("  {}", h(p));
+        }
+        return EXIT_ENFORCER;
+    }
+    for p in &problems {
+        eprintln!("  note: {}", h(p));
+    }
+    journal_or_fail(&UndoRecord {
+        did: format!("stopped, disabled and removed the uptime watchdog service ({WATCHDOG_SERVICE})"),
+        undo: UndoKind::Irreversible {
+            note: "the watchdog goes back with `mahoraga services --install-watchdog --arm`".into(),
+        },
+        reversible: false,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn firewall_allow(args: &[String], _json: bool) -> u8 {
+    use hemostat_enforce_linux::{ApplyOptions, Outcome, ProtectSet, RemovalAction};
+
+    if let Err(msg) = require_built(hemostat_buildinfo::ActionClass::IsolateInbound) {
+        eprintln!("hemostat firewall: {msg}");
+        return EXIT_NOT_BUILT;
+    }
+    let Some(i) = args.iter().position(|a| a == "--allow") else {
+        eprintln!("hemostat firewall --allow <port> [--arm]: name the TCP port to allow inbound");
+        return EXIT_USAGE;
+    };
+    let Some(port) = args.get(i + 1).and_then(|v| v.parse::<u16>().ok()).filter(|p| *p > 0) else {
+        eprintln!("hemostat firewall --allow <port>: <port> must be a TCP port number, 1-65535");
+        return EXIT_USAGE;
+    };
+
+    let armed = args.iter().any(|a| a == "--arm");
+    let ticket = match crate::authz::armed_gate(
+        "firewall",
+        hemostat_buildinfo::ActionClass::IsolateInbound,
+        armed,
+        1,
+    ) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    if let Err(code) = crate::authz::spend_armed("firewall", armed, ticket) {
+        return code;
+    }
+
+    let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
+    let protect = ProtectSet::gather();
+    match (RemovalAction::AllowInboundPort { port }).apply(&opts, &protect) {
+        Outcome::Planned(plan) => {
+            println!("{}", h(&plan.summary));
+            println!("  {}", h(&plan.detail));
+            println!("  undo: {}", h(&plan.undo));
+            println!();
+            println!("Nothing was changed. Add --arm to apply.");
+            EXIT_DRYRUN
+        }
+        Outcome::Refused(r) => {
+            eprintln!("hemostat firewall: {}", h(&r.message));
+            EXIT_POLICY
+        }
+        Outcome::Failed(f) => {
+            eprintln!("hemostat firewall: {} failed: {}", h(&f.action), h(&f.reason));
+            EXIT_ENFORCER
+        }
+        Outcome::Applied(rec) => journal_or_fail(&rec),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
+pub(crate) fn seal_binaries(args: &[String], json: bool) -> u8 {
+    let replace = args.iter().any(|a| a == "--replace");
+    if crate::binvault::is_sealed() && !replace {
+        eprintln!(
+            "hemostat remediate: an arrival binary vault already exists at {}. Re-seal with \
+             --replace only if the binaries are still known-clean — re-sealing after a compromise \
+             would capture tampered bytes as \"arrival\".",
+            crate::binvault::VAULT
+        );
+        return EXIT_POLICY;
+    }
+    let results = match crate::binvault::seal_critical() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("hemostat remediate: could not seal binaries: {e}");
+            return EXIT_FAILED;
+        }
+    };
+    let sealed = results.iter().filter(|r| r.outcome.is_ok()).count();
+
+    let unsealed = results
+        .iter()
+        .filter(|r| matches!(&r.outcome, Err(e) if e != crate::binvault::NOT_PRESENT))
+        .count();
+    if json {
+        let rows: Vec<String> = results
+            .iter()
+            .map(|r| {
+                format!(
+                    "{{\"path\":{},\"sealed\":{},\"detail\":{}}}",
+                    json_str(&r.path),
+                    r.outcome.is_ok(),
+                    json_str(match &r.outcome {
+                        Ok(s) => s,
+                        Err(e) => e,
+                    })
+                )
+            })
+            .collect();
+        jprintln!(
+            "{{\"seal_binaries\":{{\"vault\":{},\"sealed\":{sealed},\"unsealed\":{unsealed},\"items\":[{}]}}}}",
+            json_str(crate::binvault::VAULT),
+            rows.join(",")
+        );
+    } else {
+        println!(
+            "arrival binary vault — sealed {sealed} critical binar{} into {}",
+            if sealed == 1 { "y" } else { "ies" },
+            crate::binvault::VAULT
+        );
+        for r in &results {
+            match &r.outcome {
+                Ok(sha) => println!("  [sealed]  {}  sha256:{}", h(&r.path), &sha[..16.min(sha.len())]),
+
+                Err(e) if e == crate::binvault::NOT_PRESENT => {}
+                Err(e) => println!("  [skipped] {} — {}", h(&r.path), h(e)),
+            }
+        }
+        if unsealed > 0 {
+            let (y, is, it) = if unsealed == 1 { ("y", "is", "it") } else { ("ies", "are", "them") };
+            println!(
+                "\n{unsealed} critical binar{y} here {is} NOT sealed (see [skipped] above); a later \
+                 --restore-binary of {it} will be refused."
+            );
+        }
+        println!("\nRestore a tampered one with `mahoraga remediate --restore-binary <path> --arm`.");
+    }
+    if sealed == 0 || unsealed > 0 {
+        EXIT_PARTIAL
+    } else {
+        EXIT_OK
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
+pub(crate) fn restore_binary(path: &str, args: &[String]) -> u8 {
+    use hemostat_enforce_linux::{ApplyOptions, Outcome, ProtectSet, RemovalAction};
+
+    if let Err(msg) = require_built(hemostat_buildinfo::ActionClass::PersistenceNeutralize) {
+        eprintln!("hemostat remediate: {msg}");
+        return EXIT_NOT_BUILT;
+    }
+    let (bytes, sha) = match crate::binvault::sealed_good(path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("hemostat remediate: {}", h(&e));
+            return EXIT_POLICY;
+        }
+    };
+
+    let armed = args.iter().any(|a| a == "--arm");
+    let ticket = match crate::authz::armed_gate(
+        "remediate",
+        hemostat_buildinfo::ActionClass::PersistenceNeutralize,
+        armed,
+        1,
+    ) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    if let Err(code) = crate::authz::spend_armed("remediate", armed, ticket) {
+        return code;
+    }
+
+    let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
+    let protect = ProtectSet::gather();
+    let action = RemovalAction::RestoreKnownGood {
+        path: std::path::PathBuf::from(path),
+        content: bytes,
+        want_sha256: sha,
+        label: format!("{path} (arrival vault copy)"),
+    };
+    match action.apply(&opts, &protect) {
+        Outcome::Planned(plan) => {
+            println!("{}", h(&plan.summary));
+            println!("  {}", h(&plan.detail));
+            println!("  undo: {}", h(&plan.undo));
+            println!();
+            println!("Nothing was changed. Add --arm to apply.");
+            EXIT_DRYRUN
+        }
+        Outcome::Refused(r) => {
+            eprintln!("hemostat remediate: {}", h(&r.message));
+            EXIT_POLICY
+        }
+        Outcome::Failed(f) => {
+            eprintln!("hemostat remediate: {} failed: {}", h(&f.action), h(&f.reason));
+            EXIT_ENFORCER
+        }
+        Outcome::Applied(rec) => journal_or_fail(&rec),
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn print_account(args: &[String], user: Option<&str>) -> u8 {
     use hemostat_buildinfo::ActionClass;
     use hemostat_enforce_linux::account::{self, AccountAction};
@@ -812,7 +1981,7 @@ pub(crate) fn print_account(args: &[String], user: Option<&str>) -> u8 {
     let Some(user) = user.filter(|u| !u.starts_with("--")) else {
         eprintln!(
             "hemostat account <user> --end-sessions | --purge-tickets | --expire-password | \
-             --drop-group <group> [--arm]"
+             --drop-group <group> | --lock [--arm]"
         );
         return EXIT_USAGE;
     };
@@ -838,10 +2007,18 @@ pub(crate) fn print_account(args: &[String], user: Option<&str>) -> u8 {
         }
     } else if let Some(group) = val("--drop-group") {
         AccountAction::GroupDrop { user: user.to_string(), uid, group: group.to_string() }
+    } else if has("--lock") {
+
+        AccountAction::Lock {
+            user: user.to_string(),
+            uid,
+            prior_shell: account::read_shell(user),
+            prior_locked: account::read_password_locked(user),
+        }
     } else {
         eprintln!(
             "hemostat account {user}: name one of --end-sessions, --purge-tickets, \
-             --expire-password or --drop-group <group>"
+             --expire-password, --drop-group <group> or --lock"
         );
         return EXIT_USAGE;
     };
@@ -851,6 +2028,7 @@ pub(crate) fn print_account(args: &[String], user: Option<&str>) -> u8 {
         AccountAction::TicketPurge { .. } => ActionClass::TicketPurge,
         AccountAction::CredRotate { .. } => ActionClass::CredRotate,
         AccountAction::GroupDrop { .. } => ActionClass::GroupDrop,
+        AccountAction::Lock { .. } => ActionClass::AccountDisable,
     };
     if let Err(msg) = require_built(class) {
         eprintln!("hemostat account: {msg}");
@@ -899,9 +2077,16 @@ pub(crate) fn print_account(args: &[String], user: Option<&str>) -> u8 {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn print_narrow(pid: Option<u32>, dest: Option<&str>, armed: bool) -> ExitCode {
+pub(crate) fn print_narrow(
+    pid: Option<u32>,
+    dest: Option<&str>,
+    armed: bool,
+    subnet: bool,
+    plan: Option<&str>,
+) -> ExitCode {
     use hemostat_buildinfo::ActionClass;
     use hemostat_sensor_linux::netnarrow as nn;
+    use hemostat_sensor_linux::netpolicy as np;
 
     if pid.is_some() && dest.is_some() {
         eprintln!(
@@ -910,13 +2095,28 @@ pub(crate) fn print_narrow(pid: Option<u32>, dest: Option<&str>, armed: bool) ->
         );
         return ExitCode::from(EXIT_USAGE);
     }
+    if subnet && dest.is_none() {
+        eprintln!("hemostat network: --allow-subnet widens a --block-dest, and there is none. Nothing was changed");
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    if subnet && crate::golden::active() {
+        eprintln!(
+            "hemostat network: REFUSED — --allow-subnet is refused while HEMOSTAT_GOLDEN is set: \
+             the IRSeC packet (rule 15) allows blocks of single IP addresses only. Nothing was changed"
+        );
+        return ExitCode::from(EXIT_POLICY);
+    }
     let class = if pid.is_some() { ActionClass::ProcBlock } else { ActionClass::DestBlock };
     if let Err(msg) = require_built(class) {
         eprintln!("hemostat network: {msg}");
         return ExitCode::from(EXIT_NOT_BUILT);
     }
 
-    let mut narrowing = nn::Narrowing::default();
+    let mut narrowing = nn::Narrowing {
+        width: if subnet { nn::Width::Subnet } else { nn::Width::Single },
+        ..nn::Narrowing::default()
+    };
 
     if let Some(pid) = pid {
         let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
@@ -938,9 +2138,33 @@ pub(crate) fn print_narrow(pid: Option<u32>, dest: Option<&str>, armed: bool) ->
 
     if let Some(d) = dest {
 
-        if let Err(why) = nn::render_dest_block(d, "operator") {
-            eprintln!("hemostat network: {why}");
-            return ExitCode::from(EXIT_USAGE);
+        let c = match nn::parse_dest(d, narrowing.width) {
+            Ok(c) => c,
+            Err(why) => {
+                eprintln!("hemostat network: {}", h(&why));
+                return ExitCode::from(EXIT_USAGE);
+            }
+        };
+
+        if let Some(why) = crate::golden::block_scope_here(&c, &crate::golden::own_addrs()) {
+            eprintln!("hemostat network: REFUSED — {}. Nothing was changed", h(&why));
+            return ExitCode::from(EXIT_POLICY);
+        }
+
+        narrowing.keep = match nn::read_syslog_targets() {
+            Ok(k) => k,
+            Err(why) => {
+                eprintln!(
+                    "hemostat network: the syslog configuration did not read ({}), so this cannot be \
+                     shown not to cut this host's log forwarding. Nothing was changed",
+                    h(&why)
+                );
+                return ExitCode::from(EXIT_POLICY);
+            }
+        };
+        if let Some(why) = nn::kept_by(&c, &narrowing.keep) {
+            eprintln!("hemostat network: REFUSED — {}. Nothing was changed", h(&why));
+            return ExitCode::from(EXIT_POLICY);
         }
         narrowing
             .destinations
@@ -977,6 +2201,14 @@ pub(crate) fn print_narrow(pid: Option<u32>, dest: Option<&str>, armed: bool) ->
     }
     println!();
 
+    let digest = np::plan_digest(&ruleset);
+    if armed {
+        if let Err(why) = np::plan_matches(plan, &digest) {
+            eprintln!("hemostat network: REFUSED — {}", h(&why));
+            return ExitCode::from(if plan.is_none() { EXIT_USAGE } else { EXIT_POLICY });
+        }
+    }
+
     let ticket = match crate::authz::armed_gate("network", class, armed, 1) {
         Ok(t) => t,
         Err(code) => return ExitCode::from(code),
@@ -985,7 +2217,13 @@ pub(crate) fn print_narrow(pid: Option<u32>, dest: Option<&str>, armed: bool) ->
         return ExitCode::from(code);
     }
     if !armed {
-        println!("Nothing was changed. Add --arm to load it.");
+        let what = match (pid, dest) {
+            (Some(p), _) => format!("--block-pid {p}"),
+            (None, Some(d)) => format!("--block-dest {}{}", h(d.trim()), if subnet { " --allow-subnet" } else { "" }),
+            (None, None) => String::new(),
+        };
+        println!("Nothing was changed. To load exactly this ruleset:");
+        println!("    hemostat network {what} --arm --plan {digest}");
         return ExitCode::from(EXIT_DRYRUN);
     }
 
@@ -1014,7 +2252,7 @@ fn network_build_gate(egress: bool) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn journal_or_fail(rec: &hemostat_enforce_linux::UndoRecord) -> u8 {
+pub(crate) fn journal_or_fail(rec: &hemostat_enforce_linux::UndoRecord) -> u8 {
     match journal_one(rec) {
         Ok(line) => {
             println!("{line}");
@@ -1028,7 +2266,14 @@ fn journal_or_fail(rec: &hemostat_enforce_linux::UndoRecord) -> u8 {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn print_network(arm: bool, seconds: u64, confirm: bool, revert: bool, egress: bool) -> ExitCode {
+pub(crate) fn print_network(
+    arm: bool,
+    seconds: u64,
+    confirm: bool,
+    revert: bool,
+    egress: bool,
+    given: Option<&str>,
+) -> ExitCode {
     use hemostat_sensor_linux::netpolicy as np;
 
     if confirm {
@@ -1147,13 +2392,19 @@ pub(crate) fn print_network(arm: bool, seconds: u64, confirm: bool, revert: bool
     }
 
     let eplan = egress.then(|| {
-        np::egress_plan(&np::resolvers(), &egress_declared, np::uses_dhcp(), &np::resolved_upstreams())
+        let accounts = hemostat_sensor_linux::saferead::read_text(std::path::Path::new("/etc/passwd"))
+            .ok()
+            .map(|t| hemostat_sensor_linux::accounts::parse_passwd(&t));
+        np::egress_plan(&np::resolvers(), &egress_declared, np::uses_dhcp(), &np::resolved_upstreams(), accounts.as_deref())
     });
 
     if let Some(eg) = &eplan {
         println!();
         println!("Egress policy plan — default deny outbound, with these exceptions:");
         println!();
+        for (uid, origin) in &eg.owners {
+            println!("  {:<11} {:<22} {}", "any", format!("from uid {uid}"), np::describe(origin));
+        }
         for a in &eg.allows {
             println!(
                 "  {:<4}/{:<6} {:<22} {}",
@@ -1170,7 +2421,13 @@ pub(crate) fn print_network(arm: bool, seconds: u64, confirm: bool, revert: bool
             println!();
             println!("WARNING: {w}");
         }
+        for b in &eg.blocked {
+            println!();
+            println!("REFUSED WHEN ARMED: {}", h(b));
+        }
     }
+
+    let digest = np::plan_digest(&np::render_nft_with_egress(&plan, eplan.as_ref()));
 
     if !arm {
         println!();
@@ -1184,15 +2441,23 @@ pub(crate) fn print_network(arm: bool, seconds: u64, confirm: bool, revert: bool
             println!("    egress tcp/*    10.0.1.2     # the domain controller, every port");
         }
         println!();
-        println!("To apply:  hemostat network --arm 120");
-        println!("  The ruleset loads, and rolls itself back in 120s unless you run");
+        println!("To apply, `--arm` with this plan's digest (the window is yours to choose).");
+        println!("  The ruleset loads, and rolls itself back in that many seconds unless you run");
         println!("  `hemostat network --confirm`. Open a SECOND connection and check it works");
         println!("  before confirming — that check is the point, not a formality.");
         println!("  On a VM you can reach by console, that console is your way back regardless.");
+        println!("  The armed run plans again from the host, and refuses if that plan is not");
+        println!("  this one: a listener that came or went since is a different plan.");
         if let Some(why) = &declarations_unknown {
             println!();
             println!("WARNING: {why}");
         }
+
+        println!();
+        println!(
+            "To apply exactly this plan:  hemostat network --arm 120{} --plan {digest}",
+            if egress { " --egress" } else { "" }
+        );
 
         return ExitCode::from(EXIT_DRYRUN);
     }
@@ -1213,6 +2478,16 @@ pub(crate) fn print_network(arm: bool, seconds: u64, confirm: bool, revert: bool
              §11.9.2), which this build does not have. Nothing was changed"
         );
         return ExitCode::from(EXIT_POLICY);
+    }
+
+    if let Some(b) = eplan.as_ref().and_then(|eg| eg.blocked.first()) {
+        eprintln!("hemostat network: REFUSED — {}. Nothing was changed", h(b));
+        return ExitCode::from(EXIT_POLICY);
+    }
+
+    if let Err(why) = np::plan_matches(given, &digest) {
+        eprintln!("hemostat network: REFUSED — {}", h(&why));
+        return ExitCode::from(if given.is_none() { EXIT_USAGE } else { EXIT_POLICY });
     }
 
     let class = if egress {
@@ -1368,4 +2643,103 @@ pub(crate) fn print_sshd(json: bool) -> u8 {
     println!("Fix one from the console (`hemostat console`). It stages the change and verifies");
     println!("it with `sshd -T`; it does NOT restart the daemon.");
     code
+}
+
+#[cfg(any(target_os = "windows", all(test, target_os = "linux")))]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct WinWatchdogProcs {
+
+    pub(crate) wrappers: Vec<(u32, String)>,
+
+    pub(crate) children: Vec<(u32, String)>,
+
+    pub(crate) alive: Vec<u32>,
+
+    pub(crate) strays: Vec<(u32, String)>,
+}
+
+#[cfg(any(target_os = "windows", all(test, target_os = "linux")))]
+pub(crate) fn win_watchdog_query(wrapper: &str, pids: &[u32]) -> String {
+    let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+    format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         $w = '{w}'\n\
+         $all = @(Get-CimInstance -ClassName Win32_Process)\n\
+         $own = @()\n\
+         foreach ($c in $all) {{\n\
+         if ($c.Name -ne 'cmd.exe' -or -not $c.CommandLine) {{ continue }}\n\
+         if ($c.CommandLine.IndexOf($w, [StringComparison]::OrdinalIgnoreCase) -lt 0) {{ continue }}\n\
+         'TASK' + [char]9 + $c.ProcessId + [char]9 + $c.Name\n\
+         $own += $c.ProcessId\n\
+         foreach ($k in $all) {{ if ($k.ParentProcessId -eq $c.ProcessId -and $k.CreationDate -ge $c.CreationDate) {{ 'CHILD' + [char]9 + $k.ProcessId + [char]9 + $k.Name; $own += $k.ProcessId }} }}\n\
+         }}\n\
+         foreach ($k in $all) {{\n\
+         if ($own -contains $k.ProcessId -or -not $k.CommandLine) {{ continue }}\n\
+         if ($k.CommandLine -match ' services --restore --every [0-9]+ --arm\\s*$') {{ 'STRAY' + [char]9 + $k.ProcessId + [char]9 + $k.Name }}\n\
+         }}\n\
+         foreach ($p in @({pids})) {{ foreach ($k in $all) {{ if ($k.ProcessId -eq $p) {{ 'ALIVE' + [char]9 + $p }} }} }}\n\
+         'END'\n",
+        w = ps_single_quoted(wrapper),
+        pids = pids.join(","),
+    )
+}
+
+#[cfg(any(target_os = "windows", all(test, target_os = "linux")))]
+fn ps_single_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(any(target_os = "windows", all(test, target_os = "linux")))]
+pub(crate) fn parse_win_watchdog_procs(out: &str) -> Result<WinWatchdogProcs, String> {
+    let mut found = WinWatchdogProcs::default();
+    let mut ended = false;
+    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if ended {
+            return Err(format!("the process query went on after END: {line}"));
+        }
+        let pid = |p: &str| p.parse::<u32>().map_err(|_| format!("the process query gave {p:?} for a pid"));
+        let f: Vec<&str> = line.split('\t').collect();
+        match f.as_slice() {
+            ["END"] => ended = true,
+            ["TASK", p, name] => found.wrappers.push((pid(p)?, (*name).to_string())),
+            ["CHILD", p, name] => found.children.push((pid(p)?, (*name).to_string())),
+            ["STRAY", p, name] => found.strays.push((pid(p)?, (*name).to_string())),
+            ["ALIVE", p] => found.alive.push(pid(p)?),
+            _ => return Err(format!("the process query gave a line it does not write: {line}")),
+        }
+    }
+    if ended {
+        Ok(found)
+    } else {
+        Err("the process query did not finish (no END)".into())
+    }
+}
+
+#[cfg(any(target_os = "windows", all(test, target_os = "linux")))]
+pub(crate) fn win_watchdog_kill_list(found: &WinWatchdogProcs, me: u32) -> Vec<u32> {
+    let mut pids: Vec<u32> = found
+        .wrappers
+        .iter()
+        .chain(&found.children)
+        .map(|(p, _)| *p)
+        .filter(|p| *p != me && *p > 4)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+#[cfg(any(target_os = "windows", all(test, target_os = "linux")))]
+pub(crate) fn win_task_listed(csv: &str, name: &str) -> bool {
+    let want = format!("\\{name}");
+    csv.lines()
+        .filter_map(|l| l.trim().strip_prefix('"').and_then(|r| r.split('"').next()))
+        .any(|t| t.eq_ignore_ascii_case(&want))
 }

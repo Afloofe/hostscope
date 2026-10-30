@@ -68,11 +68,98 @@ const UNIT_SUFFIXES: &[&str] = &[
 ];
 
 fn unit_name(path: &Path) -> Option<String> {
+    if !directly_in_unit_dir(path) {
+        return None;
+    }
     let name = path.file_name()?.to_str()?;
     UNIT_SUFFIXES
         .iter()
         .any(|s| name.ends_with(s))
         .then(|| name.to_string())
+}
+
+pub(crate) fn directly_in_unit_dir(path: &Path) -> bool {
+    let Some(dir) = path.parent() else { return false };
+    dir.file_name().is_some_and(|n| n == "system")
+        && dir.parent().and_then(Path::file_name).is_some_and(|n| n == "systemd")
+}
+
+pub(crate) fn unit_file_refusal(unit: &str, path: &Path) -> Option<String> {
+    if let Some(why) = unit_file_shape_refusal(unit, path) {
+        return Some(why);
+    }
+    match fragment_path(unit) {
+        Ok(fragment) => fragment_refusal(unit, path, fragment.as_deref()),
+        Err(why) => Some(why),
+    }
+}
+
+pub(crate) fn unit_file_shape_refusal(unit: &str, path: &Path) -> Option<String> {
+    if !directly_in_unit_dir(path) {
+        return Some(format!(
+            "{} is not directly in a systemd unit directory — systemd loads no unit from a \
+             drop-in (`*.d/`), an enablement directory (`*.wants/`, `*.requires/`) or any other \
+             subdirectory, so it is not where `{unit}` is defined",
+            path.display()
+        ));
+    }
+    if path.file_name().and_then(|n| n.to_str()) != Some(unit) {
+        return Some(format!("{} is not named `{unit}`, so it is not that unit's file", path.display()));
+    }
+    None
+}
+
+pub(crate) fn fragment_refusal(unit: &str, path: &Path, fragment: Option<&Path>) -> Option<String> {
+    let Some(fragment) = fragment else {
+        return Some(format!(
+            "systemd reports no FragmentPath for `{unit}`: it has not loaded {} as that unit, so \
+             stopping `{unit}` would act on something else, or on nothing. If the file is inert, \
+             move it aside by hand",
+            path.display()
+        ));
+    };
+    let (Some(ours), Some(theirs)) =
+        (crate::paths::canonical_parent(path), crate::paths::canonical_parent(fragment))
+    else {
+        return Some(format!(
+            "{} and `{unit}`'s FragmentPath {} could not both be resolved to compare them",
+            path.display(),
+            fragment.display()
+        ));
+    };
+    if ours != theirs {
+        return Some(format!(
+            "systemd loads `{unit}` from {}, not from {} — stopping it would stop the unit that \
+             file defines, which this finding is not about",
+            fragment.display(),
+            path.display()
+        ));
+    }
+    None
+}
+
+fn fragment_path(unit: &str) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(systemctl) = crate::resolve_tool(&["/usr/bin/systemctl", "/bin/systemctl"]) else {
+        return Err(format!(
+            "systemctl not found at /usr/bin or /bin, so which file systemd loaded `{unit}` from \
+             cannot be asked"
+        ));
+    };
+    let out = hemostat_sensor_linux::services::show_within(&systemctl, &["--property=FragmentPath", "--", unit])
+        .map_err(|why| format!("{why}, so which file systemd loaded `{unit}` from is not known"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`systemctl show --property=FragmentPath {unit}` failed ({}), so which file systemd \
+             loaded it from is not known",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("FragmentPath="))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from))
 }
 
 const VENDOR_FILE_ADVICE: &str =

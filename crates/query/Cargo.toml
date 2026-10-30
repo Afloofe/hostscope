@@ -9,5 +9,13 @@ description = "A SQL subset over live host state, which refuses what it cannot e
 [dependencies]
 hemostat-core = { path = "../core" }
 
+[target.'cfg(unix)'.dependencies]
+# `O_NONBLOCK | O_NOCTTY` when a process's /proc file is opened: a FIFO or a
+# terminal mounted over one must not hold the query or become its terminal,
+# and the flags' values differ by platform. The same shape as `hemostat-scan`:
+# no new crate enters the lockfile (`sensor-linux` already has it), and no
+# `unsafe` — `custom_flags` is a safe API and these are integer constants.
+libc = "0.2"
+
 [lints]
 workspace = true

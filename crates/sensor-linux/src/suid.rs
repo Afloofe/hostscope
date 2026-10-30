@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -163,25 +164,50 @@ fn interpreter_fingerprints() -> Vec<(u64, String, &'static str)> {
     out
 }
 
+const MAX_SUID_BYTES: u64 = 256 * 1024 * 1024;
+
 fn file_digest(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
-
-    const MAX_SUID_BYTES: u64 = 256 * 1024 * 1024;
     let bytes = crate::saferead::read_whole_file(path, MAX_SUID_BYTES)?;
     let mut h = Sha256::new();
     h.update(&bytes);
     Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+fn pinned_digest(pin: &fs::File, meta: &fs::Metadata) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read as _;
+    if meta.len() > MAX_SUID_BYTES {
+        return None;
+    }
+    let f = reopen_pinned(pin, meta)?;
+    let mut r = (&f).take(meta.len().saturating_add(1));
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut seen = 0u64;
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                h.update(buf.get(..n)?);
+                seen = seen.saturating_add(n as u64);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    (seen == meta.len()).then(|| h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 fn interpreter_by_content(
-    path: &Path,
     len: u64,
     prints: &[(u64, String, &'static str)],
+    digest: impl FnOnce() -> Option<String>,
 ) -> Option<&'static str> {
     if !prints.iter().any(|(l, _, _)| *l == len) {
         return None;
     }
-    let d = file_digest(path)?;
+    let d = digest()?;
     prints.iter().find(|(l, h, _)| *l == len && *h == d).map(|(_, _, n)| *n)
 }
 
@@ -245,13 +271,42 @@ fn basename(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn read_capability(path: &Path) -> Option<Vec<u8>> {
-    let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
+fn pin_entry(dir: &fs::File, name: &OsStr) -> std::io::Result<fs::File> {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    let refuse = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, why.to_string());
+
+    if name.as_bytes().contains(&b'/') || name == OsStr::new("..") || name == OsStr::new(".") {
+        return Err(refuse("not a single directory entry"));
+    }
+    let c = CString::new(name.as_bytes()).map_err(|_| refuse("an entry name containing a NUL"))?;
+
+    let fd = unsafe {
+        libc::openat(dir.as_raw_fd(), c.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+fn reopen_pinned(pin: &fs::File, meta: &fs::Metadata) -> Option<fs::File> {
+    if !meta.is_file() {
+        return None;
+    }
+    let link = PathBuf::from(format!("/proc/self/fd/{}", pin.as_raw_fd()));
+    let (f, _) = crate::saferead::open_regular(&link, crate::saferead::NOT_REGULAR).ok()?;
+    let got = f.metadata().ok()?;
+    (got.is_file() && got.dev() == meta.dev() && got.ino() == meta.ino()).then_some(f)
+}
+
+fn read_capability(pin: &fs::File) -> Option<Vec<u8>> {
+    let cpath = CString::new(format!("/proc/self/fd/{}", pin.as_raw_fd())).ok()?;
 
     const NAME: &[u8] = b"security.capability\0";
 
     let len = unsafe {
-        libc::lgetxattr(cpath.as_ptr(), NAME.as_ptr().cast(), std::ptr::null_mut(), 0)
+        libc::getxattr(cpath.as_ptr(), NAME.as_ptr().cast(), std::ptr::null_mut(), 0)
     };
     if len <= 0 {
         return None;
@@ -259,7 +314,7 @@ fn read_capability(path: &Path) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; len as usize];
 
     let got = unsafe {
-        libc::lgetxattr(
+        libc::getxattr(
             cpath.as_ptr(),
             NAME.as_ptr().cast(),
             buf.as_mut_ptr().cast(),
@@ -273,23 +328,10 @@ fn read_capability(path: &Path) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-fn read_inode_flags(path: &Path) -> Option<i64> {
-    let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
-
-    let fd = unsafe {
-        libc::open(
-            cpath.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY,
-        )
-    };
-    if fd < 0 {
-        return None;
-    }
+fn read_inode_flags(f: &fs::File) -> Option<i64> {
     let mut attr: libc::c_long = 0;
 
-    let rc = unsafe { libc::ioctl(fd, FS_IOC_GETFLAGS as _, &mut attr as *mut libc::c_long) };
-
-    unsafe { libc::close(fd) };
+    let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_GETFLAGS as _, &mut attr as *mut libc::c_long) };
     if rc != 0 {
         return None;
     }
@@ -501,12 +543,12 @@ fn owner_label(suid: bool, uid: u32, gid: u32) -> String {
 #[derive(Clone, Copy)]
 struct ScanTarget<'a> {
     path: &'a Path,
-    mode: u32,
-    uid: u32,
-    gid: u32,
+
+    pin: &'a fs::File,
+
+    meta: &'a fs::Metadata,
 
     writable: bool,
-    len: u64,
 }
 
 fn scan_file(
@@ -515,28 +557,28 @@ fn scan_file(
     prints: &[(u64, String, &'static str)],
     report: &mut Report,
 ) {
-    let ScanTarget { path, mode, uid, gid, writable, len } = target;
+    let ScanTarget { path, pin, meta, writable } = target;
     let display = path.display().to_string();
     let mut base = basename(path);
 
     if !is_interpreter(&base) {
-        if let Some(real) = interpreter_by_content(path, len, prints) {
+        if let Some(real) = interpreter_by_content(meta.len(), prints, || pinned_digest(pin, meta)) {
             base = real.to_string();
         }
     }
 
-    let (suid, sgid) = setid_bits(mode);
+    let (suid, sgid) = setid_bits(meta.mode());
     if suid || sgid {
         report.suid_count += 1;
         let verdict = settle(classify(&base, writable, SUID_ALLOWLIST), path, packages);
         let tag = setid_tag(suid, sgid);
-        let owner = owner_label(suid, uid, gid);
+        let owner = owner_label(suid, meta.uid(), meta.gid());
         report
             .findings
             .push(setid_finding(&display, tag, &owner, verdict));
     }
 
-    if let Some(bytes) = read_capability(path) {
+    if let Some(bytes) = read_capability(pin) {
         if let Some(mask) = cap_permitted_mask(&bytes) {
             report.cap_count += 1;
             let verdict = settle(classify(&base, writable, CAP_ALLOWLIST), path, packages);
@@ -545,7 +587,7 @@ fn scan_file(
     }
 
     if writable {
-        if let Some(flags) = read_inode_flags(path) {
+        if let Some(flags) = reopen_pinned(pin, meta).and_then(|f| read_inode_flags(&f)) {
             let (imm, app) = immutable_flags(flags);
             if imm || app {
                 let which = if imm && app {
@@ -590,7 +632,7 @@ pub fn report() -> Report {
         refused.push(gap);
     }
 
-    let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut visited: BTreeSet<(u64, u64)> = BTreeSet::new();
 
     for root in &roots {
 
@@ -687,58 +729,91 @@ fn walk(
     prints: &[(u64, String, &'static str)],
     report: &mut Report,
     refused: &mut Vec<String>,
-    visited: &mut BTreeSet<PathBuf>,
+    visited: &mut BTreeSet<(u64, u64)>,
 ) {
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
-    while let Some((dir, depth)) = stack.pop() {
+
+    let dir = match crate::saferead::open_o_path(root) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => {
+            refused.push(root.display().to_string());
+            return;
+        }
+    };
+    let mut w = Walker { prefixes, packages, prints, report, refused, visited };
+    w.directory(root, &dir, 0);
+}
+
+struct Walker<'a> {
+    prefixes: &'a [String],
+    packages: Option<&'a crate::pkg::Manager>,
+    prints: &'a [(u64, String, &'static str)],
+    report: &'a mut Report,
+    refused: &'a mut Vec<String>,
+    visited: &'a mut BTreeSet<(u64, u64)>,
+}
+
+impl Walker<'_> {
+
+    fn directory(&mut self, path: &Path, dir: &fs::File, depth: usize) -> bool {
         if depth > MAX_DEPTH {
-            report.depth_pruned += 1;
-            continue;
+            self.report.depth_pruned += 1;
+            return true;
         }
 
-        let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-        if !visited.insert(key) {
-            continue;
+        let Ok(md) = dir.metadata() else {
+            self.refused.push(path.display().to_string());
+            return true;
+        };
+        if !md.is_dir() || !self.visited.insert((md.dev(), md.ino())) {
+            return true;
         }
-        let entries = match fs::read_dir(&dir) {
+
+        let entries = match fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())) {
             Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.refused.push(format!("{} (not listed: /proc/self/fd is not available)", path.display()));
+                return true;
+            }
             Err(_) => {
-                refused.push(dir.display().to_string());
-                continue;
+                self.refused.push(path.display().to_string());
+                return true;
             }
         };
         for entry in entries.flatten() {
-            if report.files_scanned >= MAX_FILES {
-                report.capped = true;
-                return;
+            if self.report.files_scanned >= MAX_FILES {
+                self.report.capped = true;
+                return false;
             }
-            let path = entry.path();
 
-            let Ok(meta) = fs::symlink_metadata(&path) else {
+            if entry.file_type().is_ok_and(|t| !t.is_dir() && !t.is_file()) {
+                continue;
+            }
+            let name = entry.file_name();
+            let Ok(pin) = pin_entry(dir, &name) else {
                 continue;
             };
-            let ft = meta.file_type();
-            if ft.is_dir() {
-                stack.push((path, depth + 1));
-            } else if ft.is_file() {
-                report.files_scanned += 1;
-                let display = path.display().to_string();
-                let writable = under_any(&display, prefixes);
+
+            let Ok(meta) = pin.metadata() else {
+                continue;
+            };
+            let child = path.join(&name);
+            if meta.is_dir() {
+                if !self.directory(&child, &pin, depth + 1) {
+                    return false;
+                }
+            } else if meta.is_file() {
+                self.report.files_scanned += 1;
+                let display = child.display().to_string();
+                let writable = under_any(&display, self.prefixes);
                 scan_file(
-                    ScanTarget {
-                        path: &path,
-                        mode: meta.mode(),
-                        uid: meta.uid(),
-                        gid: meta.gid(),
-                        writable,
-                        len: meta.len(),
-                    },
-                    packages,
-                    prints,
-                    report,
+                    ScanTarget { path: &child, pin: &pin, meta: &meta, writable },
+                    self.packages,
+                    self.prints,
+                    self.report,
                 );
             }
         }
+        true
     }
 }

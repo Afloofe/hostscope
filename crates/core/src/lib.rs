@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod toolchain;
+pub mod accounts;
 pub mod cidr;
 pub mod error;
 pub mod event;

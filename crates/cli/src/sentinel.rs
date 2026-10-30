@@ -135,6 +135,110 @@ fn agent_env(pid: Option<u32>) -> Vec<(String, String)> {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn registered_env() -> Vec<(String, String)> {
+    agent_env(None)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_uids(status: &str) -> Option<(u32, u32)> {
+    let mut ids = status.lines().find_map(|l| l.strip_prefix("Uid:"))?.split_whitespace();
+    let real = ids.next()?.parse().ok()?;
+    let effective = ids.next()?.parse().ok()?;
+    Some((real, effective))
+}
+
+#[cfg(target_os = "linux")]
+fn uids_of(pid: u32) -> Option<(u32, u32)> {
+
+    let status = std::fs::read(format!("/proc/{pid}/status")).ok()?;
+    parse_uids(&String::from_utf8_lossy(&status))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn owner_refusal(ours: Option<(u32, u32)>, theirs: Option<(u32, u32)>, pid: u32) -> Option<(u8, String)> {
+    match (ours, theirs) {
+        (Some(a), Some(b)) if a == b => None,
+        (Some((r, e)), Some((tr, te))) => Some((
+            EXIT_USAGE,
+            format!(
+                "pid {pid} runs this agent's image and arguments as uid {tr} (effective {te}), and this \
+                 sentinel runs as uid {r} (effective {e}). Anyone can start the public binary with the \
+                 agent's arguments: a process another user started is a decoy, and taking it for the \
+                 agent would leave the agent dead and carry that user's environment into a relaunch"
+            ),
+        )),
+        (None, _) => Some((
+            EXIT_PARTIAL,
+            "this sentinel cannot read its own uids from /proc/self/status, so it cannot tell the \
+             agent from a decoy started by another user"
+                .to_string(),
+        )),
+        (_, None) => Some((
+            EXIT_PARTIAL,
+            format!(
+                "the uids of pid {pid} could not be read from /proc/{pid}/status, so there is no way to \
+                 confirm it runs as this sentinel does — and a decoy started by another user is the \
+                 thing the check is for"
+            ),
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn find_owned(
+    digest: &str,
+    argv: &[String],
+    me: u32,
+    ours: (u32, u32),
+    decoy: &mut dyn FnMut(&str),
+) -> Option<hemostat_lifecycle::watch::Target> {
+    let mut found = None;
+    for t in hemostat_lifecycle::watch::find_all_where(digest, me, |a| a == argv) {
+        match owner_refusal(Some(ours), uids_of(t.pid), t.pid) {
+            None => {
+                found.get_or_insert(t);
+            }
+            Some((_, why)) => decoy(&format!("P0: not adopted — {why}")),
+        }
+    }
+    found
+}
+
+#[cfg(target_os = "linux")]
+fn owned_claim(
+    claim: hemostat_lifecycle::watch::Claim,
+    holds_claim: bool,
+    refuse: impl Fn(&hemostat_lifecycle::watch::Target) -> Option<String>,
+    rescan: impl FnOnce() -> Option<hemostat_lifecycle::watch::Target>,
+    say: &mut dyn FnMut(&str),
+) -> hemostat_lifecycle::watch::Claim {
+    use hemostat_lifecycle::watch::Claim;
+    match claim {
+        Claim::Adopted(t) => match refuse(&t) {
+            None => Claim::Adopted(t),
+            Some(why) => {
+                say(&format!("P0: not adopted — {why}"));
+                match rescan() {
+                    Some(owned) => Claim::Adopted(owned),
+                    None if holds_claim => Claim::Mine,
+                    None => Claim::Peer,
+                }
+            }
+        },
+        other => other,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn emit(json: bool, e: &str) {
+    if json {
+        jprintln!("{{\"event\":{}}}", json_str(e));
+    } else {
+        println!("  {}", h(e));
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn carried_names(env: &[(String, String)]) -> Vec<String> {
     env.iter().map(|(k, _)| k.clone()).collect()
 }
@@ -272,6 +376,11 @@ pub(crate) fn register_sentinels(pid: u32, json: bool, persist: bool) -> u8 {
     let theirs = watch::image_digest_of(pid);
     if let Some((code, why)) = guard_refusal(ours.as_deref(), theirs.as_deref(), pid) {
         eprintln!("sentinel: pid {pid} {}", h(&why));
+        return code;
+    }
+
+    if let Some((code, why)) = owner_refusal(uids_of(std::process::id()), uids_of(pid), pid) {
+        eprintln!("sentinel: {}", h(&why));
         return code;
     }
 
@@ -461,6 +570,11 @@ pub(crate) fn guard_pid(pid: u32, json: bool) -> u8 {
         return code;
     }
 
+    if let Some((code, why)) = owner_refusal(uids_of(std::process::id()), uids_of(pid), pid) {
+        eprintln!("sentinel: {}", h(&why));
+        return code;
+    }
+
     let argv = match watch::argv_of(pid) {
         Some(a) => a,
         None => {
@@ -472,11 +586,11 @@ pub(crate) fn guard_pid(pid: u32, json: bool) -> u8 {
         }
     };
 
-    watch_agent(&argv, json)
+    watch_agent(&argv, agent_env(Some(pid)), json)
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn watch_agent(argv: &[String], json: bool) -> u8 {
+pub(crate) fn watch_agent(argv: &[String], env: Vec<(String, String)>, json: bool) -> u8 {
     use hemostat_lifecycle::{image::Sealed, restart::Policy, watch};
 
     let image = match Sealed::from_path(std::path::Path::new("/proc/self/exe")) {
@@ -504,15 +618,30 @@ pub(crate) fn watch_agent(argv: &[String], json: bool) -> u8 {
         }
     };
 
-    let found = watch::find_by(&our_digest, argv, me);
+    let Some(ours) = uids_of(me) else {
+        eprintln!(
+            "sentinel: this process cannot read its own uids from /proc/self/status, so it cannot \
+             tell the agent from a decoy started by another user"
+        );
+        return EXIT_PARTIAL;
+    };
+    let refuse = |t: &watch::Target| owner_refusal(Some(ours), uids_of(t.pid), t.pid).map(|(_, why)| why);
 
-    let env = agent_env(found.map(|t| t.pid));
+    let found = find_owned(&our_digest, argv, me, ours, &mut |e| emit(json, e));
     let target = match found {
         Some(t) => t,
         None => {
 
             let mut boot = hemostat_lifecycle::coordinate::Coordinator::new(&our_digest, me);
-            match boot.claim(argv) {
+            let claim = boot.claim(argv);
+            let claim = owned_claim(
+                claim,
+                boot.holds_claim(),
+                refuse,
+                || find_owned(&our_digest, argv, me, ours, &mut |_| {}),
+                &mut |e| emit(json, e),
+            );
+            match claim {
                 watch::Claim::Adopted(t) => t,
                 watch::Claim::Peer => {
                     eprintln!(
@@ -617,16 +746,17 @@ pub(crate) fn watch_agent(argv: &[String], json: bool) -> u8 {
             if let Some(e) = coord.last_error() {
                 eprintln!("sentinel: {}", h(e));
             }
-            c
+
+            owned_claim(
+                c,
+                coord.holds_claim(),
+                refuse,
+                || find_owned(&our_digest, dead_argv, me, ours, &mut |_| {}),
+                &mut |e| emit(json, e),
+            )
         },
         &mut peer_check,
-        |e| {
-            if json {
-                jprintln!("{{\"event\":{}}}", json_str(e));
-            } else {
-                println!("  {}", h(e));
-            }
-        },
+        |e| emit(json, e),
     );
 
     match outcome {

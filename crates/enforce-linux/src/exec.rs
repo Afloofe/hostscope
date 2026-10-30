@@ -51,7 +51,47 @@ pub const NEVER_BLOCKED: &[&str] = &[
     "/bin/sudo",
     "/usr/bin/env",
     "/bin/env",
+    "/usr/sbin/sshd",
+    "/usr/bin/sshd",
+    "/sbin/sshd",
+    "/usr/lib/openssh/sshd-session",
+    "/usr/libexec/openssh/sshd-session",
+    "/usr/lib/ssh/sshd-session",
+    "/usr/libexec/sshd-session",
+    "/usr/lib/openssh/sshd-auth",
+    "/usr/libexec/openssh/sshd-auth",
+    "/usr/lib/ssh/sshd-auth",
+    "/usr/libexec/sshd-auth",
 ];
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceImages {
+
+    pub listeners: Vec<(u32, PathBuf)>,
+
+    pub declared: Vec<(String, PathBuf)>,
+}
+
+pub fn service_images(protect: &ProtectSet) -> Result<ServiceImages, String> {
+    let listeners = protect
+        .listener_pids
+        .iter()
+        .filter_map(|pid| {
+            std::fs::read_link(format!("/proc/{pid}/exe")).ok().map(|exe| (*pid, image_name(exe)))
+        })
+        .collect();
+    let declared = hemostat_sensor_linux::services::declared_exec_paths(
+        &hemostat_sensor_linux::services::declarations(),
+    )?;
+    Ok(ServiceImages { listeners, declared })
+}
+
+pub fn image_name(link: PathBuf) -> PathBuf {
+    match link.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(s) => PathBuf::from(s),
+        None => link,
+    }
+}
 
 pub fn is_never_blocked(path: &Path) -> bool {
     NEVER_BLOCKED.iter().any(|p| Path::new(p) == path)
@@ -66,6 +106,7 @@ pub fn refusal_for(
     protect: &ProtectSet,
     pid1_exe: Option<&Path>,
     session_images: &[(u32, PathBuf)],
+    services: &ServiceImages,
 ) -> Option<Refusal> {
     let say = |cause: RefuseCause, message: String| {
         Some(Refusal {
@@ -106,8 +147,19 @@ pub fn refusal_for(
         );
     }
     let same = |p: &Path| p == path || same_file(p, path);
-    if let Some(r) = identity_refusal(path, same, pid1_exe, session_images) {
+    if let Some(r) = identity_refusal(path, same, pid1_exe, session_images, services) {
         return Some(r);
+    }
+
+    if !protect.listener_map_complete {
+        return say(
+            RefuseCause::UnverifiedProtectSet,
+            format!(
+                "refused to block {}: the listening-socket map is incomplete, so this cannot be \
+                 shown not to be a scored service's binary. Re-run as root",
+                path.display()
+            ),
+        );
     }
     if let Some(reason) = protect.path_reason(path) {
         return say(
@@ -123,6 +175,7 @@ fn identity_refusal(
     is: impl Fn(&Path) -> bool,
     pid1_exe: Option<&Path>,
     session_images: &[(u32, PathBuf)],
+    services: &ServiceImages,
 ) -> Option<Refusal> {
     let say = |cause: RefuseCause, message: String| {
         Some(Refusal {
@@ -143,8 +196,9 @@ fn identity_refusal(
             RefuseCause::InvalidTarget("recovery path".into()),
             format!(
                 "refused to block {}: it is part of the path back onto this host. `umount` is \
-                 how this very action is reversed, and a shell is how anything is run at all — \
-                 blocking one turns a reversible containment into a rebuild",
+                 how this very action is reversed, sshd is how a responder reaches the host, \
+                 and a shell is how anything is run at all — blocking one turns a reversible \
+                 containment into a rebuild",
                 path.display()
             ),
         );
@@ -170,6 +224,33 @@ fn identity_refusal(
                     "refused to block {}: pid {pid} is running it, and that pid is on the \
                      session chain this agent was launched from. Blocking it cuts the \
                      responder off the host at their next command",
+                    path.display()
+                ),
+            );
+        }
+    }
+
+    for (pid, exe) in &services.listeners {
+        if is(exe) {
+            return say(
+                RefuseCause::Protected(crate::ProtectReason::ServiceListener),
+                format!(
+                    "refused to block {}: pid {pid} runs it and holds a listening socket, and a \
+                     scored service whose binary is blocked fails at its next start. If it is a \
+                     bind shell, stop it first (`remediate --allow-listener <unit>` for one a \
+                     unit runs, or by hand) and block the file once nothing listening runs it",
+                    path.display()
+                ),
+            );
+        }
+    }
+    for (unit, exe) in &services.declared {
+        if is(exe) {
+            return say(
+                RefuseCause::Protected(crate::ProtectReason::OperatorDeclared),
+                format!(
+                    "refused to block {}: {unit}, declared in /etc/hemostat/critical, starts it, \
+                     and the service would fail at its next start",
                     path.display()
                 ),
             );
@@ -201,7 +282,22 @@ pub fn apply(
 ) -> Outcome {
     let pid1 = std::fs::read_link("/proc/1/exe").ok();
     let images = session_images(protect);
-    if let Some(r) = refusal_for(path, protect, pid1.as_deref(), &images) {
+    let services = match service_images(protect) {
+        Ok(s) => s,
+        Err(why) => {
+            return Outcome::Refused(Refusal {
+                action: format!("block execution of {}", path.display()),
+                cause: RefuseCause::UnverifiedProtectSet,
+                message: format!(
+                    "refused to block {}: {why}, so this cannot be shown not to be a declared \
+                     service's binary",
+                    path.display()
+                ),
+                suggested_alternative: None,
+            })
+        }
+    };
+    if let Some(r) = refusal_for(path, protect, pid1.as_deref(), &images, &services) {
         return Outcome::Refused(r);
     }
 
@@ -235,7 +331,7 @@ pub fn apply(
         });
     }
 
-    let held = match pin(path, pid1.as_deref(), &images) {
+    let held = match pin(path, pid1.as_deref(), &images, &services) {
         Ok(f) => f,
         Err(o) => return *o,
     };
@@ -249,6 +345,7 @@ fn pin(
     path: &Path,
     pid1_exe: Option<&Path>,
     session_images: &[(u32, PathBuf)],
+    services: &ServiceImages,
 ) -> Result<std::fs::File, Box<Outcome>> {
     use std::os::unix::fs::MetadataExt as _;
     let failed = |reason: String| {
@@ -264,7 +361,7 @@ fn pin(
         return Err(failed(format!("{} is not a regular file", path.display())));
     }
     let is_held = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.dev() == md.dev() && m.ino() == md.ino());
-    if let Some(mut r) = identity_refusal(path, is_held, pid1_exe, session_images) {
+    if let Some(mut r) = identity_refusal(path, is_held, pid1_exe, session_images, services) {
         r.message.push_str(
             ". It was not that file when the name was judged a moment earlier, so something \
              changed it in between",

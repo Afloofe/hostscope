@@ -26,6 +26,7 @@ pub(crate) enum Source {
     Systemd,
     Injected,
     Kwalk,
+    Kground,
     KernelPosture,
     Trust,
     Scan,
@@ -157,7 +158,7 @@ pub(crate) fn console_model() -> hemostat_tui::ConsoleModel {
     cov.note_flag(Source::Suid, suid.available, &suid.reason);
     push(&mut rows, Source::Suid, &suid.findings);
 
-    let inv = hemostat_sensor_linux::inventory::report_with(crate::vendor::manifest_for("console").as_deref());
+    let (inv, _) = crate::vendor::inventory();
     cov.note_flag(Source::Inventory, inv.available, &inv.reason);
     push(&mut rows, Source::Inventory, &inv.findings);
 
@@ -179,7 +180,10 @@ pub(crate) fn console_model() -> hemostat_tui::ConsoleModel {
 
     let wd = hemostat_sensor_linux::watchdog::report();
     cov.note_flag(Source::Watchdog, wd.available, &wd.reason);
-    push(&mut rows, Source::Watchdog, &wd.findings);
+
+    for (i, f) in wd.findings.iter().enumerate() {
+        rows.push(watchdog_row(f, rsev(f.severity), wd.seed(i).unwrap_or_default()));
+    }
 
     let acc = hemostat_sensor_linux::account_report();
 
@@ -195,10 +199,41 @@ pub(crate) fn console_model() -> hemostat_tui::ConsoleModel {
             source: Source::Accounts.name().into(),
             subject: f.subject.clone(),
             what: f.what.clone(),
-            why: f.why.clone(),
+
+            why: crate::remedy::scoped_why(Source::Accounts.name(), &f.subject, &f.what, &f.why),
             remedy: linux_remedy(Source::Accounts.name(), &f.subject, &f.what, "", severity),
             evidence: artefacts(&f.subject, &f.what),
         });
+    }
+
+    if crate::golden::active() {
+        for a in crate::golden::rogue_users(&acc.accounts) {
+            rows.push(FindingRow {
+                severity: Sev::Critical,
+                source: Source::Accounts.name().into(),
+                subject: format!("rogue login: {}", a.name),
+                what: format!("account `{}` (uid {}) can log in but is not on the IRSeC roster", a.name, a.uid),
+
+                why: if crate::golden::is_protected(&a.name) {
+                    format!(
+                        "the packet lists every legitimate login and `{}` is not among them, so it was \
+                         added — named to be mistaken for an out-of-scope account. OUT OF SCOPE, \
+                         human-only: HEMOSTAT changes no account by that name in any case, so check it \
+                         by hand (getent passwd {}, last {}) and remove it yourself if it is not the \
+                         white team's or the DataDog agent's",
+                        a.name, a.name, a.name
+                    )
+                } else {
+                    format!(
+                        "the packet lists every legitimate login and `{}` is not among them, so it was added. \
+                         Lock it reversibly:  hemostat account {} --lock --arm",
+                        a.name, a.name
+                    )
+                },
+                remedy: None,
+                evidence: Vec::new(),
+            });
+        }
     }
 
     use hemostat_sensor_linux::{TriageFinding, TriageSeverity};
@@ -210,6 +245,16 @@ pub(crate) fn console_model() -> hemostat_tui::ConsoleModel {
         }
     }
     pub(crate) fn push_t(rows: &mut Vec<FindingRow>, source: Source, findings: &[TriageFinding]) {
+        let name = source.name();
+        push_t_with(rows, source, findings, &|f, sev| linux_remedy(name, &f.subject, &f.what, &f.locus, sev));
+    }
+
+    pub(crate) fn push_t_with(
+        rows: &mut Vec<FindingRow>,
+        source: Source,
+        findings: &[TriageFinding],
+        remedy: &dyn Fn(&TriageFinding, Sev) -> Option<hemostat_tui::Remedy>,
+    ) {
         let source = source.name();
         for f in findings {
             if matches!(f.severity, TriageSeverity::Info) {
@@ -226,7 +271,7 @@ pub(crate) fn console_model() -> hemostat_tui::ConsoleModel {
                 subject,
                 what: f.what.clone(),
                 why: f.why.clone(),
-                remedy: linux_remedy(source, &f.subject, &f.what, &f.locus, tsev(f.severity)),
+                remedy: remedy(f, tsev(f.severity)),
 
                 evidence: if f.locus.is_empty() { Vec::new() } else { vec![f.locus.clone()] },
             });
@@ -235,6 +280,75 @@ pub(crate) fn console_model() -> hemostat_tui::ConsoleModel {
     let ov = hemostat_sensor_linux::overview_report();
     cov.note(Source::Overview, crate::coverage::overview(&ov).into());
     push_t(&mut rows, Source::Overview, &ov.findings);
+
+    if crate::golden::active() {
+        let health = crate::service_health::from_overview(&ov);
+
+        if let Some(why) = &health.not_checked {
+            rows.push(FindingRow {
+                severity: Sev::Warn,
+                source: Source::Overview.name().into(),
+                subject: "scored services NOT CHECKED".into(),
+                what: why.clone(),
+                why: "no scored service can be called up or down here, so a DOWN one would not be shown. `services --restore` and the watchdog say NOT CHECKED too; a hostname that is not the packet's role name (a red-team `hostname x`) is the usual cause — HEMOSTAT_ROLE=<role> names the role outright".into(),
+                remedy: None,
+                evidence: Vec::new(),
+            });
+        }
+
+        if let Some(r) = health.role.filter(|r| r.from_override) {
+            rows.push(FindingRow {
+                severity: Sev::Note,
+                source: Source::Overview.name().into(),
+                subject: format!("scored-service {}", crate::golden::role_said(&r)),
+                what: format!("this box is checked as `{}` because HEMOSTAT_ROLE says so; its hostname is `{}`", r.name, ov.identity.hostname),
+                why: "the scored services shown here are that role's. Unset HEMOSTAT_ROLE to go by the hostname".into(),
+                remedy: None,
+                evidence: Vec::new(),
+            });
+        }
+        for h in &health.services {
+            if h.up == Some(false) {
+                let port = h.svc.port.map_or_else(|| "its port".into(), |p| p.to_string());
+                rows.push(FindingRow {
+                    severity: Sev::Critical,
+                    source: Source::Overview.name().into(),
+                    subject: format!("scored service DOWN: {} on {}", h.svc.service, h.svc.host),
+                    what: format!("nothing is listening on port {port} where the scorer reaches it (a loopback-only bind counts as down)"),
+                    why: "a scored service that is not up loses uptime every check — the usual red-team move. Bring it back: its unit may be stopped, failed, or bound to localhost only (`mahoraga services --restore --arm`)".into(),
+                    remedy: None,
+                    evidence: Vec::new(),
+                });
+            }
+        }
+
+        let fw = hemostat_sensor_linux::firewall_report();
+        for (s, reach) in crate::service_health::firewall_reach(&health, &fw) {
+            use hemostat_sensor_linux::firewall::Reach;
+            let port = s.port.map_or_else(|| "its port".into(), |p| p.to_string());
+            match reach {
+                Reach::Blocked(by) => rows.push(FindingRow {
+                    severity: Sev::Critical,
+                    source: Source::Overview.name().into(),
+                    subject: format!("scored service UNREACHABLE: {} on {}", s.service, s.host),
+                    what: format!("the daemon is listening on port {port}, but the firewall drops a new connection to it — the scorer cannot reach it: {by}"),
+                    why: format!("the service scores DOWN though it is up: a firewall rule (often a red-team addition) is blocking the scored port, and a restart will not help. Remove the rule named; `mahoraga firewall --allow {port} --arm` puts an accept at the top of the first input chain, which does not undo a drop in another base chain (firewalld's own table, a prerouting drop). Rule 15 permits individual-IP blocking, never a block of the scorer"),
+                    remedy: None,
+                    evidence: Vec::new(),
+                }),
+                Reach::Unknown(why) => rows.push(FindingRow {
+                    severity: Sev::Warn,
+                    source: Source::Overview.name().into(),
+                    subject: format!("scored service reachability UNKNOWN: {} on {}", s.service, s.host),
+                    what: format!("the daemon is listening on port {port}, but whether the firewall lets the scorer's connection through cannot be told: {why}"),
+                    why: "not known to be reachable is not reachable: check the rule named against the scorer's address, or read the ruleset (`mahoraga firewall`)".into(),
+                    remedy: None,
+                    evidence: Vec::new(),
+                }),
+                Reach::Open => {}
+            }
+        }
+    }
 
     let pr = hemostat_sensor_linux::persist_report();
     cov.note(Source::Persistence, crate::coverage::persistence(&pr).into());
@@ -252,13 +366,17 @@ pub(crate) fn console_model() -> hemostat_tui::ConsoleModel {
     cov.note(Source::Kwalk, crate::coverage::kwalk(&kw).into());
     push_t(&mut rows, Source::Kwalk, &kw.findings);
 
+    let kg = hemostat_sensor_linux::kground_report();
+    cov.note(Source::Kground, crate::coverage::kground(&kg).into());
+    push_t(&mut rows, Source::Kground, &kg.findings);
+
     let kpo = hemostat_sensor_linux::kernposture_report();
     cov.note(Source::KernelPosture, crate::coverage::kernel_posture(&kpo).into());
     push_t(&mut rows, Source::KernelPosture, &kpo.findings);
 
     let tr = hemostat_sensor_linux::trust::report_with(&crate::snapshot::anchor_baseline(crate::snapshot::DEFAULT_STORE));
     cov.note(Source::Trust, crate::coverage::trust(&tr).into());
-    push_t(&mut rows, Source::Trust, &tr.findings);
+    push_t_with(&mut rows, Source::Trust, &tr.findings, &|f, sev| trust_remedy(&tr, f, sev));
 
     #[cfg(feature = "mod-scan-yara")]
     {
@@ -360,7 +478,7 @@ pub(crate) fn artefacts(subject: &str, what: &str) -> Vec<String> {
                 if let Some(n) = words.peek() {
                     let n = n.trim_matches(|c: char| "`'\"(),;:".contains(c));
                     if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() {
-                        out.push(format!("pid {n}  (ls -l /proc/{n}/exe, cat /proc/{n}/cmdline)"));
+                        out.push(pid_artefact(n));
                     }
                 }
             }
@@ -372,19 +490,41 @@ pub(crate) fn artefacts(subject: &str, what: &str) -> Vec<String> {
 }
 
 #[cfg(all(target_os = "linux", feature = "mod-tui"))]
-pub(crate) fn pids_in(what: &str) -> Vec<u32> {
-    let mut out: Vec<u32> = Vec::new();
-    let toks: Vec<&str> = what.split_whitespace().collect();
-    for w in toks.windows(2) {
-        if w[0] == "pid" {
-            if let Ok(n) = w[1].trim_matches(|c: char| !c.is_ascii_digit()).parse::<u32>() {
-                if n > 1 && !out.contains(&n) {
-                    out.push(n);
-                }
-            }
-        }
+fn pid_artefact(n: impl std::fmt::Display) -> String {
+    format!("pid {n}  (ls -l /proc/{n}/exe, cat /proc/{n}/cmdline)")
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+pub(crate) fn watchdog_row(
+    f: &hemostat_sensor_linux::rootkit::Finding,
+    severity: hemostat_tui::Sev,
+    seed: &[hemostat_sensor_linux::watchdog::Pinned],
+) -> hemostat_tui::FindingRow {
+    let mut evidence: Vec<String> = artefacts(&f.subject, "").into_iter().filter(|e| e.starts_with('/')).collect();
+    evidence.extend(seed.iter().map(|s| pid_artefact(s.pid)));
+    evidence.sort();
+    evidence.dedup();
+    hemostat_tui::FindingRow {
+        severity,
+        source: Source::Watchdog.name().to_string(),
+        subject: f.subject.clone(),
+        what: f.what.clone(),
+        why: f.why.clone(),
+        remedy: crate::remedy::watchdog_remedy(seed),
+        evidence,
     }
-    out
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn trust_remedy(
+    r: &hemostat_sensor_linux::trust::Report,
+    f: &hemostat_sensor_linux::TriageFinding,
+    sev: hemostat_tui::Sev,
+) -> Option<hemostat_tui::Remedy> {
+    match crate::trust_verb::anchor_for(r, f) {
+        Some(found) => found.ok().and_then(|a| crate::remedy::anchor_remedy(a, sev)),
+        None => linux_remedy(Source::Trust.name(), &f.subject, &f.what, &f.locus, sev),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -397,7 +537,7 @@ pub(crate) fn journal_one(rec: &hemostat_enforce_linux::UndoRecord) -> Result<St
     let failed = |why: String| format!("{} — WARNING: the undo journal could not be written ({why})", rec.did);
     std::fs::create_dir_all(dir).map_err(|e| failed(e.to_string()))?;
     for _ in 0..16 {
-        let path = journal::unique_path(dir);
+        let Some(path) = journal::unique_path(dir) else { break };
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut f) => {
                 return f
@@ -410,7 +550,7 @@ pub(crate) fn journal_one(rec: &hemostat_enforce_linux::UndoRecord) -> Result<St
             Err(e) => return Err(failed(e.to_string())),
         }
     }
-    Err(failed("no free journal name after 16 attempts".into()))
+    Err(failed("no free journal name in this second".into()))
 }
 
 #[cfg(all(target_os = "windows", feature = "mod-tui"))]
@@ -530,6 +670,90 @@ pub(crate) fn console_model() -> hemostat_tui::ConsoleModel {
 
     #[cfg(feature = "mod-detect-sigma")]
     crate::win_detect::console_live_rows(&mut rows, &mut cov.gaps);
+
+    if crate::golden::active() {
+        let role = crate::golden::this_role(Some(&host));
+        let mine = role.as_ref().map(|r| crate::golden::services_of_role(r.name)).unwrap_or_default();
+
+        let not_checked = |what: String| FindingRow {
+            severity: Sev::Warn,
+            source: "overview".to_string(),
+            subject: "scored services NOT CHECKED".to_string(),
+            what,
+            why: "no scored service can be called up or down here, so a DOWN one would not be shown. `services --restore` and the watchdog say NOT CHECKED too; a computer name that is not the packet's role name is the usual cause — HEMOSTAT_ROLE=<role> names the role outright".to_string(),
+            remedy: None,
+            evidence: Vec::new(),
+        };
+        match &role {
+            Err(why) => rows.push(not_checked(why.clone())),
+
+            Ok(r) if r.from_override => rows.push(FindingRow {
+                severity: Sev::Note,
+                source: "overview".to_string(),
+                subject: format!("scored-service {}", crate::golden::role_said(r)),
+                what: format!("this box is checked as `{}` because HEMOSTAT_ROLE says so; its computer name is `{host}`", r.name),
+                why: "the scored services shown here are that role's. Unset HEMOSTAT_ROLE to go by the computer name".to_string(),
+                remedy: None,
+                evidence: Vec::new(),
+            }),
+            Ok(_) => {}
+        }
+        if !mine.is_empty() {
+            let ov = hemostat_sensor_win::overview::report();
+            if !ov.available {
+                rows.push(not_checked(format!(
+                    "the socket table could not be read ({})",
+                    ov.reason.as_deref().unwrap_or("no reason given")
+                )));
+            }
+
+            if ov.available {
+                let listening: std::collections::BTreeSet<u16> =
+                    ov.sockets.iter().filter(|s| s.world_reachable()).map(|s| s.port).collect();
+                for s in mine {
+                    if let Some(p) = s.port {
+                        if !listening.contains(&p) {
+                            rows.push(FindingRow {
+                                severity: Sev::Critical,
+                                source: "overview".to_string(),
+                                subject: format!("scored service DOWN: {} on {}", s.service, s.host),
+                                what: format!("nothing is listening on port {p} where the scorer reaches it"),
+                                why: format!("a scored service that is not up loses uptime every check — the usual red-team move. Bring it back: `Restart-Service` the {} service (or `sc.exe start`), and check it is bound where the scorer reaches it", s.service),
+                                remedy: None,
+                                evidence: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        for s in crate::win_firewall::firewall_blocked() {
+            let port = s.port.map_or_else(|| "its port".into(), |p| p.to_string());
+            rows.push(FindingRow {
+                severity: Sev::Critical,
+                source: "overview".to_string(),
+                subject: format!("scored service UNREACHABLE: {} on {}", s.service, s.host),
+                what: format!("the service is listening on port {port}, but Windows Firewall is blocking it — the scorer cannot reach it"),
+                why: format!("the service scores DOWN though it is up: a firewall rule (often a red-team addition) blocks the scored port. `mahoraga firewall --allow {port} --arm` opens a default-deny firewall; if an explicit Block rule is the cause, remove that rule (an Allow does not override a Block on Windows). A restart will not help"),
+                remedy: None,
+                evidence: Vec::new(),
+            });
+        }
+
+        for u in crate::win_accounts::rogue_locals() {
+            rows.push(FindingRow {
+                severity: Sev::Critical,
+                source: "accounts".to_string(),
+                subject: format!("rogue local user: {u}"),
+                what: format!("`{u}` is an enabled local account that is not on the IRSeC packet roster"),
+                why: format!("a local user the red team added is a foothold. Disable it with `mahoraga account --disable {u} --arm` (reversible); confirm it is not a legitimate account first"),
+                remedy: None,
+                evidence: Vec::new(),
+            });
+        }
+    }
+
     hemostat_tui::ConsoleModel::new(host, when, rows).with_gaps(cov.gaps)
 }
 
@@ -642,7 +866,7 @@ pub(crate) fn posture_model() -> hemostat_tui::PostureModel {
 #[cfg(all(target_os = "linux", feature = "mod-tui"))]
 impl Source {
 
-    pub(crate) const ALL: [Source; 17] = [
+    pub(crate) const ALL: [Source; 18] = [
         Source::Rootkit,
         Source::Suid,
         Source::Inventory,
@@ -657,6 +881,7 @@ impl Source {
         Source::Systemd,
         Source::Injected,
         Source::Kwalk,
+        Source::Kground,
         Source::KernelPosture,
         Source::Trust,
         Source::Scan,
@@ -678,6 +903,7 @@ impl Source {
             Source::Systemd => "systemd",
             Source::Injected => "injected",
             Source::Kwalk => "kwalk",
+            Source::Kground => "kground",
             Source::KernelPosture => "kernel-posture",
             Source::Trust => "trust",
             Source::Scan => "scan",

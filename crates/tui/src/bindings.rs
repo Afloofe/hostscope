@@ -83,7 +83,7 @@ const VERB_OUTPUT: &[Binding] = &[
     b(M::VerbOutput, A::PageDown, &[is(Key::PageDown), ch(' ')], &[Ms::Scrollbar], "the output down a page"),
     b(M::VerbOutput, A::Top, &[is(Key::Home), ch('g')], &[Ms::Button("Top")], "the output's first line"),
     b(M::VerbOutput, A::Bottom, &[is(Key::End), ch('G')], &[Ms::Button("Bottom")], "the output's last line, and follow it"),
-    b(M::VerbOutput, A::Arm, &[ch('a')], &[Ms::Button("Arm")], "apply exactly the plan the dry run showed (asks first)"),
+    b(M::VerbOutput, A::Arm, &[ch('a')], &[Ms::Button("Arm")], "run the dry run's flags armed (asks first); network is refused if its plan changed"),
     b(M::VerbOutput, A::Stop, &[ch('s')], &[Ms::Button("Stop")], "stop a read or a watch (never an armed run, or one that writes)"),
     b(M::VerbOutput, A::Keep, &[ch('p')], &[Ms::Button("Keep")], "keep the change before its rollback (asks first)"),
     b(M::VerbOutput, A::Revert, &[ch('u')], &[Ms::Button("Revert")], "put the change back now, before its deadline (asks first)"),

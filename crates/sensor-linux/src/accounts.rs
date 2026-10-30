@@ -244,33 +244,110 @@ fn sudoers(out: &mut Vec<Finding>, unread: &mut Vec<String>) {
 
 const MAX_SUDOERS_FILES: usize = 256;
 
+const MAX_BEYOND_CAP_NAMED: usize = 16;
+
+#[derive(Default)]
+struct Worklist {
+
+    queue: std::collections::VecDeque<(String, bool)>,
+
+    queued: std::collections::BTreeSet<(String, bool)>,
+
+    charged: usize,
+
+    beyond: usize,
+    beyond_named: Vec<String>,
+}
+
+impl Worklist {
+
+    fn charge(&mut self, name: &str) -> bool {
+        if self.charged >= MAX_SUDOERS_FILES {
+            self.beyond += 1;
+            if self.beyond_named.len() < MAX_BEYOND_CAP_NAMED {
+                self.beyond_named.push(name.to_string());
+            }
+            return false;
+        }
+        self.charged += 1;
+        true
+    }
+
+    fn push(&mut self, path: String, listed: bool) -> bool {
+        let key = (path, listed);
+        if self.queued.contains(&key) {
+            return true;
+        }
+        if !self.charge(&key.0) {
+            return false;
+        }
+        self.queue.push_back(key.clone());
+        self.queued.insert(key);
+        true
+    }
+}
+
 fn sudoers_from(roots: &[&str], out: &mut Vec<Finding>, unread: &mut Vec<String>) {
+    use std::os::unix::fs::MetadataExt as _;
 
     let mut files: Vec<String> = Vec::new();
-    let mut queue: std::collections::VecDeque<String> =
-        roots.iter().map(|r| (*r).to_string()).collect();
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut beyond_cap: Vec<String> = Vec::new();
+    let mut work = Worklist::default();
+    for r in roots {
+        work.push((*r).to_string(), false);
+    }
+
+    let mut seen: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
+
+    let mut not_entered: Vec<(String, Option<(u64, u64)>)> = Vec::new();
+
+    let mut cut: Vec<String> = Vec::new();
 
     let host = fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
         .map(|h| h.trim().to_string());
 
-    while let Some(item) = queue.pop_front() {
-        if !seen.insert(item.clone()) {
-            continue;
-        }
-        if files.len() >= MAX_SUDOERS_FILES {
-            beyond_cap.push(item);
-            continue;
-        }
+    while let Some((item, listed)) = work.queue.pop_front() {
         let meta = fs::metadata(&item);
-        if meta.as_ref().is_ok_and(|m| m.is_dir()) {
+        let is_dir = meta.as_ref().is_ok_and(|m| m.is_dir());
+
+        if is_dir && listed {
+            not_entered.push((item, meta.as_ref().ok().map(|m| (m.dev(), m.ino()))));
+            continue;
+        }
+        if let Ok(m) = &meta {
+            if !seen.insert((m.dev(), m.ino())) {
+                continue;
+            }
+        }
+        if is_dir {
             match fs::read_dir(&item) {
                 Ok(dir) => {
                     for e in dir.flatten() {
-                        if let Some(p) = e.path().to_str() {
-                            queue.push_back(p.to_string());
+                        let p = e.path();
+                        let Some(s) = p.to_str() else {
+
+                            let shown = p.to_string_lossy().into_owned();
+                            if !work.charge(&shown) {
+                                cut.push(item.clone());
+                                break;
+                            }
+                            unread.push(format!("{shown} (a name that is not UTF-8)"));
+                            out.push(Finding {
+                                severity: Severity::Warn,
+                                subject: shown,
+                                what: "a sudoers source whose name is not UTF-8 was not read — sudo posture unknown"
+                                    .into(),
+                                why: "sudo reads every file in an include directory whatever bytes its name \
+                                      is, and this walk could not open this one by name. A password-free \
+                                      root grant inside it would be invisible; a name like this is itself \
+                                      worth explaining"
+                                    .into(),
+                            });
+                            continue;
+                        };
+                        if !work.push(s.to_string(), true) {
+                            cut.push(item.clone());
+                            break;
                         }
                     }
                 }
@@ -295,7 +372,10 @@ fn sudoers_from(roots: &[&str], out: &mut Vec<Finding>, unread: &mut Vec<String>
         if let Ok(text) = crate::saferead::read_text(std::path::Path::new(&item)) {
             for (_, target) in include_targets(&text) {
                 match resolve_include(&target, &item, host.as_deref()) {
-                    Some(path) => queue.push_back(path),
+
+                    Some(path) => {
+                        work.push(path, false);
+                    }
                     None => {
                         unread.push(format!("{target} (included from {item}; path not resolvable)"));
                         out.push(Finding {
@@ -315,18 +395,55 @@ fn sudoers_from(roots: &[&str], out: &mut Vec<Finding>, unread: &mut Vec<String>
     }
     files.sort();
 
-    if !beyond_cap.is_empty() {
-        unread.extend(beyond_cap.iter().map(|p| format!("{p} (beyond the {MAX_SUDOERS_FILES}-source cap)")));
+    if work.beyond > 0 {
+        unread.extend(
+            work.beyond_named.iter().map(|p| format!("{p} (beyond the {MAX_SUDOERS_FILES}-source cap)")),
+        );
+        if work.beyond > work.beyond_named.len() {
+            unread.push(format!(
+                "{} more source(s) beyond the {MAX_SUDOERS_FILES}-source cap",
+                work.beyond - work.beyond_named.len()
+            ));
+        }
+
+        unread.extend(cut.iter().map(|d| format!("{d} (listed only in part: the {MAX_SUDOERS_FILES}-source cap)")));
+        let rest = if cut.is_empty() {
+            String::new()
+        } else {
+            format!(", and the listing of {} stopped there, so it holds more", cut.join(", "))
+        };
         out.push(Finding {
             severity: Severity::Warn,
-            subject: beyond_cap[0].clone(),
+            subject: work.beyond_named.first().or(cut.first()).cloned().unwrap_or_default(),
             what: format!(
-                "{} sudoers source(s) beyond the {MAX_SUDOERS_FILES}-file cap were not read",
-                beyond_cap.len()
+                "{} sudoers source(s) beyond the {MAX_SUDOERS_FILES}-source cap were not read{rest}",
+                work.beyond
             ),
             why: "the walk stops at a fixed count so a hostile include chain cannot spin it, and \
                   everything past that count is unexamined — including a password-free grant. \
                   A drop-in directory this full is itself worth a look"
+                .into(),
+        });
+    }
+
+    not_entered.retain(|(_, key)| key.is_none_or(|k| !seen.contains(&k)));
+    if !not_entered.is_empty() {
+        let shown: Vec<&str> =
+            not_entered.iter().take(MAX_BEYOND_CAP_NAMED).map(|(p, _)| p.as_str()).collect();
+        let more = not_entered.len() - shown.len();
+        out.push(Finding {
+            severity: Severity::Note,
+            subject: not_entered.first().map(|(p, _)| p.clone()).unwrap_or_default(),
+            what: format!(
+                "{} director(y/ies) inside a sudoers include directory, not entered: {}{}",
+                not_entered.len(),
+                shown.join(", "),
+                if more > 0 { format!(" and {more} more") } else { String::new() }
+            ),
+            why: "sudo reads only the files directly inside an include directory, never anything \
+                  below one, so nothing in these is policy unless a sudoers file includes it by \
+                  name — which this sweep follows. They were not entered, so a link back up the \
+                  tree cannot make the walk endless, and a grant inside one is not reported as live"
                 .into(),
         });
     }

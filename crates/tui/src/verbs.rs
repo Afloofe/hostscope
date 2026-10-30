@@ -156,6 +156,8 @@ pub enum Commit {
         keep: &'static [&'static str],
 
         revert: &'static [&'static str],
+
+        carry: &'static [&'static str],
     },
 }
 
@@ -631,11 +633,20 @@ impl VerbsPane {
                 if let Some(f) = self.form.as_mut().filter(|f| f.item == item) {
                     f.plan = o.plan_ok.then(|| argv.clone());
                 }
+
                 if o.plan_ok {
-                    self.status = Some(format!(
-                        "the plan is above; nothing was applied. Arm (a) applies exactly this plan, after asking ({})",
-                        o.label
-                    ));
+                    self.status = Some(match self.shown_digest() {
+                        Some(d) => format!(
+                            "the plan is above (digest {d}); nothing was applied. Arm (a) applies exactly this plan, after \
+                             asking: the armed run refuses if the plan it builds from the host is not this one ({})",
+                            o.label
+                        ),
+                        None => format!(
+                            "the plan is above; nothing was applied. Arm (a) runs these flags armed, after asking: the \
+                             armed run checks the host again and acts on what it finds then ({})",
+                            o.label
+                        ),
+                    });
                 }
             }
             Purpose::Armed => {
@@ -696,7 +707,7 @@ impl VerbsPane {
                     closed: None,
                 });
             }
-            Commit::Block { what, marker, deadline, default_secs, keep, revert } => {
+            Commit::Block { what, marker, deadline, default_secs, keep, revert, carry } => {
                 let secs = argv
                     .iter()
                     .position(|a| a == deadline)
@@ -704,9 +715,15 @@ impl VerbsPane {
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(default_secs);
                 let id = self.run.as_ref().and_then(|r| find_id(&r.lines, marker));
+                let carried: Vec<String> = carry
+                    .iter()
+                    .filter_map(|f| argv.iter().position(|a| a == f).and_then(|i| argv.get(i + 1)).map(|v| [f.to_string(), v.clone()]))
+                    .flatten()
+                    .collect();
                 let with = |v: &[&str], id: &str| {
                     let mut o = owned(v);
                     o.push(id.to_string());
+                    o.extend(carried.iter().cloned());
                     o
                 };
                 self.window = Some(Window {
@@ -788,7 +805,18 @@ impl VerbsPane {
             }
             None => {}
         }
+        if let Some(d) = self.shown_digest() {
+            v.push(PLAN_FLAG.to_string());
+            v.push(d);
+        }
         v
+    }
+
+    fn shown_digest(&self) -> Option<String> {
+        if self.spec().and_then(|s| s.argv.first()) != Some(&PLAN_VERB) {
+            return None;
+        }
+        self.run.as_ref().filter(|r| r.purpose == Purpose::Plan).and_then(|r| plan_digest(&r.lines))
     }
 
     fn ticket_text(&self) -> String {
@@ -1175,10 +1203,18 @@ impl VerbsPane {
                     let Some(spec) = self.spec() else { return };
                     let argv = self.armed_argv(&plan);
                     let mut lines = vec![format!("  hemostat {}", argv.join(" "))];
-                    lines.push(format!(
-                        "The plan you saw is the dry run `hemostat {}`: its output is on the Output page.",
-                        plan.join(" ")
-                    ));
+                    lines.push(match self.shown_digest() {
+                        Some(d) => format!(
+                            "The plan you saw is the dry run `hemostat {}` (digest {d}), on the Output page: the armed run \
+                             refuses if the plan it builds is not this one.",
+                            plan.join(" ")
+                        ),
+                        None => format!(
+                            "The plan you saw is the dry run `hemostat {}`, on the Output page: the armed run checks the \
+                             host again and acts on what it finds then.",
+                            plan.join(" ")
+                        ),
+                    });
                     if !spec.warn.is_empty() {
                         lines.push(spec.warn.to_string());
                     }
@@ -1500,9 +1536,12 @@ impl VerbsPane {
         };
         put(buf, r.x + 2, r.y + 1, &sanitize(&head).cell(w), style, r);
         let second = match (run.purpose, &run.outcome) {
-            (Purpose::Plan, Some(_)) if self.arm_ready().is_ok() => {
-                "the plan is below and NOTHING was applied · Arm (a) applies exactly this, after asking".to_string()
-            }
+
+            (Purpose::Plan, Some(_)) if self.arm_ready().is_ok() => match self.shown_digest() {
+                Some(d) => format!("the plan is below and NOTHING was applied · Arm (a) applies exactly this plan ({d}), after asking"),
+                None => "the plan is below and NOTHING was applied · Arm (a) runs these flags armed, after asking: it checks the host again"
+                    .to_string(),
+            },
             (Purpose::Armed | Purpose::Keep | Purpose::Revert, _) => format!("ticket: {}", run.ticket),
             _ if run.dropped > 0 => format!("{} earlier line(s) were not kept", run.dropped),
             _ => format!("{} line(s)", run.lines.len()),
@@ -1581,4 +1620,18 @@ fn find_id(lines: &[String], marker: &str) -> Option<String> {
         let tok: String = rest.trim_start().chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
         (!tok.is_empty()).then_some(tok)
     })
+}
+
+pub const PLAN_FLAG: &str = "--plan";
+
+pub const PLAN_VERB: &str = "network";
+
+pub const DIGEST_HEX: usize = 16;
+
+pub fn plan_digest(lines: &[String]) -> Option<String> {
+    let marker = format!("{PLAN_FLAG} ");
+    let line = lines.iter().rev().find(|l| l.contains(&marker))?;
+    let (_, rest) = line.rsplit_once(&marker)?;
+    let tok = rest.split_whitespace().next()?;
+    (tok.len() == DIGEST_HEX && tok.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).then(|| tok.to_string())
 }

@@ -1,4 +1,6 @@
+use hemostat_sensor_linux::rootkit::{Finding, Severity};
 use hemostat_sensor_linux::vendor::{self, Manifest, Verified};
+use hemostat_sensor_linux::{TriageFinding, TriageSeverity};
 
 use crate::identity::parse_hex32;
 use crate::render::{h, hex32, jesc, rootkit_row};
@@ -16,17 +18,87 @@ pub(crate) fn load_manifest(path: Option<&str>) -> Result<Option<Verified>, Stri
     crate::vendor_manifest::load_with(path, hemostat_sensor_linux::saferead::read_whole_file)
 }
 
-pub(crate) fn manifest_for(verb: &str) -> Option<Verified> {
-    match load_manifest(None) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!(
-                "hemostat {verb}: NOTE: the vendor manifest was refused ({}); package integrity \
-                 falls back to the host's own database",
-                h(&e)
-            );
-            None
+pub(crate) struct Reference {
+
+    manifest: Option<Verified>,
+
+    refused: Option<String>,
+}
+
+impl Reference {
+
+    pub(crate) fn manifest(&self) -> Option<&Manifest> {
+        self.manifest.as_deref()
+    }
+
+    pub(crate) fn refused(&self) -> Option<&str> {
+        self.refused.as_deref()
+    }
+
+    pub(crate) fn finding(&self) -> Option<Finding> {
+        self.refused().map(refused_finding)
+    }
+
+    pub(crate) fn triage_finding(&self, source: &str) -> Option<TriageFinding> {
+        self.refused().map(|why| {
+            let f = refused_finding(why);
+            TriageFinding::flag(TriageSeverity::Critical, source, f.subject, f.what, f.why)
+        })
+    }
+
+    pub(crate) fn exit(&self, code: u8) -> u8 {
+        if self.refused.is_some() && code == EXIT_OK {
+            EXIT_PARTIAL
+        } else {
+            code
         }
+    }
+
+    pub(crate) fn coverage(&self, r: &hemostat_sensor_linux::inventory::Report) -> crate::coverage::Covered {
+        use crate::coverage::Covered;
+        match (crate::coverage::from_flag(r.available, &r.reason), self.refused()) {
+            (Covered::Fully, Some(why)) => Covered::InPart(format!(
+                "the vendor manifest that was named was refused ({why}), so package integrity rested \
+                 on this host's own database"
+            )),
+            (c, _) => c,
+        }
+    }
+}
+
+pub(crate) fn reference() -> Reference {
+    reference_from(load_manifest(None))
+}
+
+fn reference_from(loaded: Result<Option<Verified>, String>) -> Reference {
+    match loaded {
+        Ok(manifest) => Reference { manifest, refused: None },
+        Err(why) => Reference { manifest: None, refused: Some(why) },
+    }
+}
+
+pub(crate) fn inventory() -> (hemostat_sensor_linux::inventory::Report, Reference) {
+    let reference = reference();
+    let mut r = hemostat_sensor_linux::inventory::report_with(reference.manifest());
+    if let Some(f) = reference.finding() {
+        r.findings.insert(0, f);
+    }
+    (r, reference)
+}
+
+pub(crate) fn refused_finding(why: &str) -> Finding {
+    Finding {
+        severity: Severity::Critical,
+        subject: format!("vendor manifest refused (${MANIFEST_ENV})"),
+        what: format!(
+            "the vendor manifest that was named was refused: {why}. Package integrity rests on \
+             this host's own package database instead"
+        ),
+        why: "a manifest is named because the host's own database cannot be trusted: a root that \
+              trojans a package can rewrite the digests recorded for it, and one that breaks the \
+              manifest's signature is hiding something from the check that would have caught it. \
+              No package-integrity result here is clean until the manifest verifies"
+            .to_string(),
     }
 }
 

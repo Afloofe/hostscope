@@ -6,7 +6,7 @@ use crate::{UndoKind, UndoRecord};
 
 pub const HEADER: &str = "# hemostat undo journal v1";
 
-pub fn unique_path(dir: &Path) -> PathBuf {
+pub fn unique_path(dir: &Path) -> Option<PathBuf> {
     tsvjournal::unique_path(dir, "undo")
 }
 
@@ -56,10 +56,16 @@ pub fn line(r: &UndoRecord) -> String {
             esc(&path.to_string_lossy()),
             mode & 0o7777
         ),
-        UndoKind::UnlockAccount { user, shell } => format!(
-            "unlock-account\t{rev}\t{}\t{}\t-",
+
+        UndoKind::UnlockAccount { user, shell, was_locked } => format!(
+            "unlock-account\t{rev}\t{}\t{}\t{}",
             esc(user),
-            shell.as_deref().map_or_else(|| "-".to_string(), esc)
+            shell.as_deref().map_or_else(|| "-".to_string(), esc),
+            match was_locked {
+                Some(true) => "1",
+                Some(false) => "0",
+                None => "-",
+            }
         ),
         UndoKind::RemoveCreatedFile { vault, original } => format!(
             "remove-created-file\t{rev}\t{}\t{}\t-",
@@ -84,6 +90,13 @@ pub fn line(r: &UndoRecord) -> String {
         UndoKind::RemoveCanary { path } => {
             format!("remove-canary\t{rev}\t{}\t-\t-", esc(&path.to_string_lossy()))
         }
+
+        UndoKind::RemoveNftAllow { family, table, chain, comment } => format!(
+            "remove-nft-allow\t{rev}\t{}\t{}\t{}",
+            esc(family),
+            esc(table),
+            esc(&format!("{chain}{PAIR_SEP}{comment}"))
+        ),
         UndoKind::UnmountExecBlock { path } => format!(
             "unmount-exec-block\t{rev}\t{}\t-\t-",
             esc(&path.to_string_lossy())
@@ -144,7 +157,8 @@ pub struct Appender {
 impl Appender {
 
     pub fn new(dir: &Path) -> Self {
-        Appender { inner: tsvjournal::Appender::new(unique_path(dir), HEADER) }
+
+        Appender { inner: tsvjournal::Appender::new(dir, "undo", HEADER) }
     }
 
     pub fn path(&self) -> &Path {
@@ -231,6 +245,12 @@ pub fn decode(text: &str) -> Result<Vec<UndoRecord>, String> {
                 user: unesc(arg1),
 
                 shell: if arg2 == "-" { None } else { Some(unesc(arg2)) },
+
+                was_locked: match arg3 {
+                    "1" => Some(true),
+                    "0" => Some(false),
+                    _ => None,
+                },
             },
             "remove-created-file" => UndoKind::RemoveCreatedFile {
                 vault: PathBuf::from(unesc(arg1)),
@@ -252,6 +272,18 @@ pub fn decode(text: &str) -> Result<Vec<UndoRecord>, String> {
                 }
             }
             "remove-canary" => UndoKind::RemoveCanary { path: PathBuf::from(unesc(arg1)) },
+            "remove-nft-allow" => {
+                let joined = unesc(arg3);
+                let (chain, comment) = joined.split_once(PAIR_SEP).ok_or_else(|| {
+                    format!("line {n}: remove-nft-allow needs a chain and a comment")
+                })?;
+                UndoKind::RemoveNftAllow {
+                    family: unesc(arg1),
+                    table: unesc(arg2),
+                    chain: chain.to_string(),
+                    comment: comment.to_string(),
+                }
+            }
             "unmount-exec-block" => {
                 UndoKind::UnmountExecBlock { path: PathBuf::from(unesc(arg1)) }
             }

@@ -348,6 +348,10 @@ pub trait Host {
     fn com_server(&self, clsid: &str) -> Option<String>;
 
     fn writable_by_users(&self, path: &str) -> Option<bool>;
+
+    fn refuse(&self, path: &str) -> Option<String> {
+        crate::localpath::local(path).err()
+    }
 }
 
 pub fn run_commands(s: &Snapshot) -> Vec<String> {
@@ -407,14 +411,36 @@ pub fn clsid(s: &str) -> Option<&str> {
 }
 
 pub fn resolve(command: &str, host: &dyn Host) -> Option<String> {
+    match locate(command, host) {
+        Located::File(f) => Some(f),
+        Located::Refused(..) | Located::Nothing => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Located {
+
+    File(String),
+
+    Refused(String, String),
+
+    Nothing,
+}
+
+pub fn locate(command: &str, host: &dyn Host) -> Located {
     let root = host.env("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
     let c = expand(command.trim(), host);
     let c = c.trim();
     if let Some(id) = clsid(c) {
-        return host.com_server(id).and_then(|p| resolve(&p, host));
+
+        return match host.com_server(id) {
+            Some(p) if clsid(expand(p.trim(), host).trim()).is_none() => locate(&p, host),
+            _ => Located::Nothing,
+        };
     }
     let lc = c.to_ascii_lowercase();
-    let c = if let Some(r) = c.get(4..).filter(|_| lc.starts_with(r"\??\")) {
+
+    let c = if let Some(r) = c.get(4..).filter(|r| lc.starts_with(r"\??\") && r.as_bytes().get(1) == Some(&b':')) {
         r.to_string()
     } else if let Some(r) = c.get(12..).filter(|_| lc.starts_with(r"\systemroot\")) {
         format!(r"{root}\{r}")
@@ -423,16 +449,7 @@ pub fn resolve(command: &str, host: &dyn Host) -> Option<String> {
     } else {
         c.to_string()
     };
-    let with_ext = |p: &str| -> Option<String> {
-        if host.exists(p) {
-            return Some(p.to_string());
-        }
-        let has_ext = p.rsplit(['\\', '/']).next().is_some_and(|n| n.contains('.'));
-        if has_ext {
-            return None;
-        }
-        [".exe", ".dll"].iter().map(|e| format!("{p}{e}")).find(|q| host.exists(q))
-    };
+    let mut refused: Option<(String, String)> = None;
     let candidate = if let Some(rest) = c.strip_prefix('"') {
         rest.split('"').next().unwrap_or_default().to_string()
     } else {
@@ -441,24 +458,49 @@ pub fn resolve(command: &str, host: &dyn Host) -> Option<String> {
         for n in 1..=words.len() {
             let p = words.get(..n).unwrap_or_default().join(" ");
             if p.contains('\\') {
-                if let Some(f) = with_ext(&p) {
+                if let Some(f) = file_at(host, &p, n == 1, &mut refused) {
                     found = Some(f);
                     break;
                 }
             }
         }
         match found {
-            Some(f) => return Some(f),
+            Some(f) => return Located::File(f),
             None => words.first().copied().unwrap_or_default().trim_end_matches(',').to_string(),
         }
     };
-    if candidate.is_empty() {
-        return None;
+    let found = if candidate.is_empty() {
+        None
+    } else if candidate.contains('\\') || candidate.contains('/') {
+        file_at(host, &candidate, true, &mut refused)
+    } else {
+        [format!(r"{root}\System32\{candidate}"), format!(r"{root}\{candidate}")]
+            .iter()
+            .find_map(|p| file_at(host, p, true, &mut refused))
+    };
+    match (found, refused) {
+        (Some(f), _) => Located::File(f),
+        (None, Some((p, why))) => Located::Refused(p, why),
+        (None, None) => Located::Nothing,
     }
-    if candidate.contains('\\') || candidate.contains('/') {
-        return with_ext(&candidate);
+}
+
+fn file_at(host: &dyn Host, p: &str, named: bool, refused: &mut Option<(String, String)>) -> Option<String> {
+    let has_ext = p.rsplit(['\\', '/']).next().is_some_and(|n| n.contains('.'));
+    let tries = std::iter::once(p.to_string())
+        .chain([".exe", ".dll"].iter().filter(|_| !has_ext).map(|e| format!("{p}{e}")));
+    for q in tries {
+        if let Some(why) = host.refuse(&q) {
+            if (named || crate::localpath::local(&q).is_ok()) && refused.is_none() {
+                *refused = Some((q, why));
+            }
+            continue;
+        }
+        if host.exists(&q) {
+            return Some(q);
+        }
     }
-    [format!(r"{root}\System32\{candidate}"), format!(r"{root}\{candidate}")].iter().find_map(|p| with_ext(p))
+    None
 }
 
 fn leaf(p: &str) -> String {
@@ -478,13 +520,24 @@ pub struct Graded {
 }
 
 pub fn grade(command: &str, host: &mut dyn Host) -> Graded {
-    let Some(bin) = resolve(command, host) else {
-        return Graded {
-            severity: Severity::Critical,
-            binary: None,
-            signer: None,
-            reason: "what it runs does not resolve to a file on this host, so nothing vouches for it".into(),
-        };
+    let bin = match locate(command, host) {
+        Located::File(bin) => bin,
+        Located::Refused(_, why) => {
+            return Graded {
+                severity: Severity::Critical,
+                binary: None,
+                signer: None,
+                reason: format!("what it runs was not opened, so nothing vouches for it: {why}"),
+            }
+        }
+        Located::Nothing => {
+            return Graded {
+                severity: Severity::Critical,
+                binary: None,
+                signer: None,
+                reason: "what it runs does not resolve to a file on this host, so nothing vouches for it".into(),
+            }
+        }
     };
     let name = leaf(&bin);
     if INTERPRETERS.contains(&name.as_str()) {
@@ -503,7 +556,9 @@ pub fn grade(command: &str, host: &mut dyn Host) -> Graded {
         (true, Some(signer)) => {
 
             let dir = bin.rsplit_once(['\\', '/']).map_or(bin.as_str(), |(d, _)| d).to_string();
-            let writable = [bin.as_str(), dir.as_str()].map(|p| host.writable_by_users(p));
+
+            let writable =
+                [bin.as_str(), dir.as_str()].map(|p| if host.refuse(p).is_some() { None } else { host.writable_by_users(p) });
             if let Some(p) = [&bin, &dir].into_iter().zip(writable).find_map(|(p, w)| (w == Some(true)).then_some(p)) {
                 return Graded {
                     severity: Severity::Critical,
@@ -1020,7 +1075,10 @@ mod read {
 
     impl Host for LiveHost {
         fn exists(&self, path: &str) -> bool {
-            std::path::Path::new(path).is_file()
+            matches!(crate::localpath::vet(path), Ok(Some((_, md))) if md.is_file())
+        }
+        fn refuse(&self, path: &str) -> Option<String> {
+            crate::localpath::vet(path).err()
         }
         fn env(&self, name: &str) -> Option<String> {
             std::env::var(name).ok()
@@ -1030,6 +1088,7 @@ mod read {
             if let Some(s) = self.seen.get(&k) {
                 return s.clone();
             }
+
             let (trust, signer) = crate::authenticode::verify_signer(path);
             let s = Signed { token: trust.token(), valid: trust.is_valid(), signer };
             self.seen.insert(k, s.clone());
@@ -1042,7 +1101,9 @@ mod read {
             })
         }
         fn writable_by_users(&self, path: &str) -> Option<bool> {
-            crate::acl::dacl_of_read(path).ok().map(|aces| crate::acl::grants_unprivileged_write(&aces))
+
+            let (p, _) = crate::localpath::vet(path).ok()??;
+            crate::acl::dacl_of_read(&p).ok().map(|aces| crate::acl::grants_unprivileged_write(&aces))
         }
     }
 }

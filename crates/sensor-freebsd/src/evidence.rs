@@ -268,6 +268,8 @@ impl Judged {
 
 pub const MAX_ENTRIES: usize = 4096;
 
+pub const MAX_KEPT_BYTES: u64 = 64 * 1024 * 1024;
+
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct Collector {
@@ -275,6 +277,9 @@ pub struct Collector {
 
     pub ev: Evidence,
     throttle: crate::saferead::Throttle,
+
+    kept: u64,
+    budget: u64,
 }
 
 #[cfg(unix)]
@@ -285,6 +290,8 @@ impl Collector {
             root: root.to_path_buf(),
             ev: Evidence::new(kind),
             throttle: crate::saferead::Throttle::new(crate::saferead::HASH_BYTES_PER_SEC),
+            kept: 0,
+            budget: MAX_KEPT_BYTES,
         }
     }
 
@@ -335,9 +342,25 @@ impl Collector {
             _ => return,
         }
         let p = self.at(path);
-        let o = match crate::saferead::read_bytes(&p, max) {
-            Ok(b) => Obs::Bytes(b),
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return self.hash(path),
+        let left = self.budget.saturating_sub(self.kept);
+        let o = match crate::saferead::open_regular(&p, crate::saferead::NOT_REGULAR) {
+            Ok((_, md)) if md.len() > max => return self.hash(path),
+
+            Ok((_, md)) if md.len() > left => Obs::Refused(format!(
+                "{} bytes, not read: this sweep had already kept {} bytes of files, and keeps at most {}",
+                md.len(),
+                self.kept,
+                self.budget
+            )),
+            Ok((f, md)) => match crate::saferead::read_open(&f, &md, max.min(left)) {
+                Ok(b) => {
+                    self.kept = self.kept.saturating_add(b.len() as u64);
+                    Obs::Bytes(b)
+                }
+
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return self.hash(path),
+                Err(e) => Obs::Refused(e.to_string()),
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Obs::Absent,
             Err(e) => Obs::Refused(e.to_string()),
         };

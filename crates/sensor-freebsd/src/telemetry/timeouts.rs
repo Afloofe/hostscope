@@ -71,7 +71,7 @@ impl Timeouts {
         let timeout = base.checked_mul(num)? / den.max(1);
         let left = expires?;
 
-        if left > timeout + 1 {
+        if left > timeout.saturating_add(1) {
             return None;
         }
         Some(timeout.saturating_sub(left))

@@ -29,12 +29,31 @@ pub(crate) fn remediate(args: &[String], json: bool) -> u8 {
     use hemostat_enforce_linux::persistence::{plan, Disposition};
     use hemostat_enforce_linux::{ApplyOptions, Outcome, ProtectSet};
 
+    if args.iter().any(|a| a == "--log") {
+        return log_timeline(json);
+    }
+
     if let Some(code) = crate::strip_verb::dispatch(args, json) {
         return code;
     }
 
     if let Some(code) = crate::anchor_verb::dispatch(args, json) {
         return code;
+    }
+
+    if let Some(code) = crate::pam_verb::dispatch(args, json) {
+        return code;
+    }
+
+    if args.iter().any(|a| a == "--seal-binaries") {
+        return crate::actions::seal_binaries(args, json);
+    }
+    if let Some(i) = args.iter().position(|a| a == "--restore-binary") {
+        let Some(path) = args.get(i + 1).filter(|p| p.starts_with('/')) else {
+            eprintln!("hemostat remediate --restore-binary <path> [--arm]: give the absolute path of the binary to restore");
+            return EXIT_USAGE;
+        };
+        return crate::actions::restore_binary(path, args);
     }
     let armed = args.iter().any(|a| a == "--arm");
 
@@ -459,7 +478,13 @@ pub(crate) fn open_run_journal() -> Result<(std::fs::File, String), u8> {
         );
         return Err(1);
     }
-    let path = journal::unique_path(dir);
+    let Some(path) = journal::unique_path(dir) else {
+        eprintln!(
+            "hemostat remediate: every undo journal name in {} for this second is taken\n  Nothing was changed.",
+            h(&dir.display().to_string())
+        );
+        return Err(1);
+    };
     let mut f = std::fs::OpenOptions::new()
         .create_new(true)
         .append(true)
@@ -482,6 +507,76 @@ pub(crate) fn open_run_journal() -> Result<(std::fs::File, String), u8> {
             1_u8
         })?;
     Ok((f, path.display().to_string()))
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
+pub(crate) fn log_timeline(json: bool) -> u8 {
+    use hemostat_enforce_linux::{journal, DEFAULT_VAULT};
+
+    let dir = std::path::Path::new(DEFAULT_VAULT);
+    let names: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+
+    let mut runs: Vec<(u64, String, bool)> = names
+        .iter()
+        .filter_map(|n| {
+            let epoch = n.strip_prefix("undo-")?.strip_suffix(".tsv")?.parse::<u64>().ok()?;
+            let replayed = names.iter().any(|m| m.starts_with(&format!("{n}.replayed")));
+            Some((epoch, n.clone(), replayed))
+        })
+        .collect();
+    runs.sort_by_key(|(e, _, _)| *e);
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut n_actions = 0usize;
+    for (epoch, name, replayed) in &runs {
+        let when = epoch_to_utc(*epoch);
+        let records = hemostat_sensor_linux::saferead::read_text(&dir.join(name))
+            .ok()
+            .and_then(|t| journal::decode(&t).ok())
+            .unwrap_or_default();
+        for rec in &records {
+            n_actions += 1;
+            if json {
+                rows.push(format!(
+                    "{{\"time\":\"{when}\",\"epoch\":{epoch},\"did\":\"{}\",\"reversible\":{},\"reversed\":{replayed},\"journal\":\"{}\"}}",
+                    jesc(&rec.did),
+                    rec.reversible,
+                    jesc(&dir.join(name).display().to_string())
+                ));
+            } else {
+                let tail = if *replayed { "  (later reversed)" } else { "" };
+                println!("  {when}  {}{tail}", h(&rec.did));
+            }
+        }
+    }
+    if json {
+        jprintln!("{{\"actions\":[{}]}}", rows.join(","));
+    } else if n_actions == 0 {
+        println!("  No remediation has been armed on this host (no run journals in {}).", h(&dir.display().to_string()));
+    } else {
+        println!("\n  {n_actions} armed action(s) across {} run(s). Each is reversible with `mahoraga undo <journal>`.", runs.len());
+    }
+    EXIT_OK
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn epoch_to_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}Z")
 }
 
 #[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]

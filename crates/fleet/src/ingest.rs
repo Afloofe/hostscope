@@ -141,6 +141,10 @@ pub const SEAL_KEY_MISMATCH: Alert = Alert { kind: "seal-key-mismatch", severity
 
 pub const UNKNOWN_AGENT: Alert = Alert { kind: "unknown-agent", severity: "warn" };
 
+pub const UNANNOUNCED_STORE: Alert = Alert { kind: "unannounced-store", severity: "warn" };
+
+pub const ANNOUNCED_STORE_MISSING: Alert = Alert { kind: "announced-store-missing", severity: "critical" };
+
 impl Alert {
 
     pub fn to_json(&self, o: &Outcome) -> String {
@@ -220,10 +224,11 @@ impl Outcome {
     pub fn to_json(&self) -> String {
         let opt = |v: Option<[u8; 32]>| v.map_or("null".to_string(), |b| format!("\"{}\"", hex(&b)));
         let opts = |v: Option<&str>| v.map_or("null".to_string(), js);
+
         format!(
             "{{\"kind\":\"ingest\",\"verdict\":\"{}\",\"parcel\":{},\"sha256\":\"{}\",\"bytes\":{},\
              \"received_ns\":{},\"host\":{},\"genesis\":{},\"seal\":{},\"pin\":{},\"shape\":{},\
-             \"records\":{},\"kept\":{},\"from\":{},\"reason\":{}}}",
+             \"records\":{},\"kept\":{},\"from\":{},\"alert\":{},\"reason\":{}}}",
             self.verdict.name(),
             js(&self.name),
             hex(&self.sha256),
@@ -237,6 +242,7 @@ impl Outcome {
             self.records,
             js(&self.kept),
             self.from.as_deref().map_or("null".to_string(), js),
+            opts(self.alert.map(|a| a.kind)),
             js(&self.reason),
         )
     }
@@ -612,6 +618,13 @@ pub(crate) fn ingest_one(
         return refuse(o, why);
     }
 
+    if pin == "first-seen" {
+        if let Some((alert, why)) = unannounced(layout, &checked.header.host_id, &checked.genesis, from) {
+            o.alert = Some(alert);
+            o.reason = why;
+        }
+    }
+
     crate::shared_dir(&host_dir).map_err(|e| format!("cannot create {}: {e}", host_dir.display()))?;
     fs::rename(&staging, &dest).map_err(|e| format!("cannot move the verified store into {rel}: {e}"))?;
     crate::share_finished(&dest);
@@ -648,6 +661,51 @@ fn reject(layout: &Layout, tmp: &Path, mut o: Outcome, why: String) -> Result<Ou
     o.reason = why;
     o.kept = format!("rejected/{}", hex(&o.sha256));
     Ok(o)
+}
+
+fn unannounced(layout: &Layout, host: &[u8; 32], genesis: &[u8; 32], from: Option<&Enrolled>) -> Option<(Alert, String)> {
+    let missing = crate::announce::outstanding(layout, host, genesis);
+    if !missing.is_empty() {
+        let named: Vec<String> = missing
+            .iter()
+            .take(4)
+            .map(|a| {
+                format!(
+                    "{} (run {}, sealed under {}, announced at {} by the collector's clock)",
+                    hex(&a.genesis),
+                    hex(&a.agent_id),
+                    a.seal.map_or("no key".to_string(), |k| hex(&k)),
+                    a.at_ns
+                )
+            })
+            .collect();
+        return Some((
+            ANNOUNCED_STORE_MISSING,
+            format!(
+                "store {} was never announced, and host {} announced {} store(s) the collector has never \
+                 received: {}{}. A store re-sealed under a fresh run id and key, with the announced one \
+                 withheld, looks exactly like this; it is kept, pinned first-seen, so nothing here bounds \
+                 when it was sealed",
+                hex(genesis),
+                hex(host),
+                missing.len(),
+                named.join("; "),
+                if missing.len() > named.len() { "; …" } else { "" }
+            ),
+        ));
+    }
+    from.map(|agent| {
+        (
+            UNANNOUNCED_STORE,
+            format!(
+                "store {} was pushed by the agent enrolled as {}, and its run never announced it: it is \
+                 kept, pinned first-seen, so nothing here bounds when it was sealed. A collector that was \
+                 down when the store was opened leaves this; so does a store re-sealed under a fresh run id",
+                hex(genesis),
+                shown(&agent.label)
+            ),
+        )
+    })
 }
 
 type HeldRun = (String, Option<[u8; 32]>);

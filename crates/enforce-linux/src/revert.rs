@@ -1,14 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::{bootparam, deceive, exec};
+use crate::{bootparam, deceive, exec, fwallow};
 use crate::guards::{identity_matches, read_proc_id, ProcId};
 use crate::paths::move_file;
 use crate::outcome::{
     ApplyOptions, Failure, Outcome, Plan, RefuseCause, Refusal, UndoKind, UndoRecord,
 };
 use crate::paths::{
-    path_refusal, resolve_tool, run_tool, vault_dest,
+    path_refusal, resolve_tool, run_tool,
 };
 
 fn undo_restore_mode(path: &Path, mode: u32, opts: &ApplyOptions) -> Outcome {
@@ -94,7 +94,12 @@ fn undo_restore_mode(path: &Path, mode: u32, opts: &ApplyOptions) -> Outcome {
     }
 }
 
-fn undo_unlock_account(user: &str, shell: Option<&str>, opts: &ApplyOptions) -> Outcome {
+fn undo_unlock_account(
+    user: &str,
+    shell: Option<&str>,
+    was_locked: Option<bool>,
+    opts: &ApplyOptions,
+) -> Outcome {
 
     if user.is_empty() || user == "root" {
         return Outcome::Refused(Refusal {
@@ -104,6 +109,54 @@ fn undo_unlock_account(user: &str, shell: Option<&str>, opts: &ApplyOptions) -> 
             suggested_alternative: None,
         });
     }
+
+    let unlock = was_locked == Some(false);
+    let mut args: Vec<String> = Vec::new();
+    if unlock {
+        args.push("-U".into());
+    }
+    if let Some(sh) = shell {
+        args.push("-s".into());
+        args.push(sh.to_string());
+    }
+    if args.is_empty() {
+
+        return match was_locked {
+            Some(true) if !opts.armed => Outcome::Planned(Plan {
+                summary: format!("leave {user} locked"),
+                detail: format!(
+                    "Change nothing: {user}'s password was locked before this tool locked it, so \
+                     it stays locked, and its previous shell was not recorded."
+                ),
+                undo: "Nothing to reverse.".into(),
+                reversible: false,
+                prefer_instead: None,
+            }),
+            Some(true) => Outcome::Applied(UndoRecord {
+                did: format!(
+                    "left `{user}` as it is: its password was locked before this tool locked it, \
+                     so it stays locked, and its previous shell was not recorded, so it keeps \
+                     whatever the lock left. Set one by hand"
+                ),
+                undo: UndoKind::Irreversible { note: "nothing was changed".into() },
+                reversible: false,
+            }),
+            _ => Outcome::Refused(Refusal {
+                action: format!("unlock {user}"),
+                cause: RefuseCause::InvalidTarget("the prior lock state was not recorded".into()),
+                message: format!(
+                    "not unlocking {user} from this record: it records neither whether its \
+                     password was locked before this tool locked it nor its previous shell, and \
+                     unlocking a password someone had locked by hand hands it back. Nothing was \
+                     changed. If it should log in again: usermod -U {user}, and set its shell \
+                     with usermod -s"
+                ),
+                suggested_alternative: None,
+            }),
+        };
+    }
+    args.push(user.to_string());
+
     let Some(usermod) = ["/usr/sbin/usermod", "/sbin/usermod", "/usr/bin/usermod"]
         .iter()
         .map(PathBuf::from)
@@ -115,26 +168,42 @@ fn undo_unlock_account(user: &str, shell: Option<&str>, opts: &ApplyOptions) -> 
         });
     };
 
-    let mut args: Vec<String> = vec!["-U".into()];
-    if let Some(sh) = shell {
-        args.push("-s".into());
-        args.push(sh.to_string());
-    }
-    args.push(user.to_string());
+    let kept_locked = match was_locked {
+        Some(false) => None,
+        Some(true) => Some("it was locked before this tool locked it".to_string()),
+        None => Some(
+            "whether it was locked before this tool locked it is not recorded (a journal from an \
+             older build, or /etc/shadow unreadable at the lock), and unlocking one someone had \
+             locked by hand hands it back"
+                .to_string(),
+        ),
+    };
 
     if !opts.armed {
         return Outcome::Planned(Plan {
-            summary: format!("unlock {user}"),
+            summary: if kept_locked.is_some() {
+                format!("put back {user}'s shell")
+            } else {
+                format!("unlock {user}")
+            },
             detail: format!(
-                "Run `{} {}`.",
+                "Run `{} {}`.{}",
                 usermod.display(),
 
                 args.iter()
                     .map(|a| if a.is_empty() { "''" } else { a.as_str() })
                     .collect::<Vec<_>>()
-                    .join(" ")
+                    .join(" "),
+                kept_locked
+                    .as_deref()
+                    .map(|why| format!(" Its password stays locked: {why}."))
+                    .unwrap_or_default()
             ),
-            undo: format!("Lock it again with `usermod -L {user}`."),
+            undo: if kept_locked.is_some() {
+                format!("Put nologin back with `usermod -s /usr/sbin/nologin {user}`.")
+            } else {
+                format!("Lock it again with `usermod -L {user}`.")
+            },
             reversible: true,
             prefer_instead: None,
         });
@@ -155,12 +224,48 @@ fn undo_unlock_account(user: &str, shell: Option<&str>, opts: &ApplyOptions) -> 
             reason: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         });
     }
+    let shell_back = match shell {
+        Some("") => "set its shell field back to empty, which is /bin/sh".to_string(),
+        Some(sh) => format!("set its shell back to {sh}"),
+        None => String::new(),
+    };
+    if let Some(why) = kept_locked {
+
+        return match was_locked {
+            Some(true) => Outcome::Applied(UndoRecord {
+                did: format!("left `{user}`'s password locked and {shell_back}: {why}"),
+                undo: UndoKind::Irreversible {
+                    note: format!(
+                        "put nologin back with `usermod -s /usr/sbin/nologin {user}` if that was wrong"
+                    ),
+                },
+                reversible: false,
+            }),
+
+            _ => Outcome::Failed(Failure {
+                action: format!("unlock {user}"),
+                reason: format!(
+                    "{shell_back} for `{user}`, but its password is still LOCKED: {why}. Run \
+                     `usermod -U {user}` yourself if it should log in again"
+                ),
+            }),
+        };
+    }
+
+    if crate::account::read_password_locked(user) == Some(true) {
+        return Outcome::Failed(Failure {
+            action: format!("unlock {user}"),
+            reason: format!(
+                "usermod ran, but `{user}`'s password still reads as locked{} — it had no \
+                 password before the lock, and usermod will not unlock to an empty one. Set one \
+                 with `passwd {user}`",
+                if shell_back.is_empty() { String::new() } else { format!(" (it did {shell_back})") }
+            ),
+        });
+    }
     Outcome::Applied(UndoRecord {
         did: match shell {
-            Some("") => format!(
-                "unlocked `{user}` and set its shell field back to empty, which is /bin/sh"
-            ),
-            Some(sh) => format!("unlocked `{user}` and set its shell back to {sh}"),
+            Some(_) => format!("unlocked `{user}` and {shell_back}"),
 
             None => format!(
                 "unlocked `{user}` — its previous shell was not recorded, so it still has \
@@ -255,6 +360,20 @@ fn undo_restore_sysctl(was: &[(String, String)], opts: &ApplyOptions) -> Outcome
         return Outcome::Failed(Failure {
             action: "restore kernel tunables".into(),
             reason: "the record names no keys".into(),
+        });
+    }
+
+    if let Some((key, _)) =
+        was.iter().find(|(k, _)| !sysctlpolicy::CONTROLS.iter().any(|c| c.keys.contains(&k.as_str())))
+    {
+        return Outcome::Refused(Refusal {
+            action: "restore kernel tunables".into(),
+            cause: RefuseCause::InvalidTarget("not a kernel tunable this tool hardens".into()),
+            message: format!(
+                "refused to replay this record: {key:?} is not one of the kernel tunables this \
+                 tool hardens, so the record was not written by it. Nothing was changed"
+            ),
+            suggested_alternative: None,
         });
     }
     if !opts.armed {
@@ -365,8 +484,8 @@ pub fn undo_with(record: &UndoRecord, opts: &ApplyOptions, allow_auth: bool) -> 
     }
     match &record.undo {
         UndoKind::RestoreMode { path, mode } => undo_restore_mode(path, *mode, opts),
-        UndoKind::UnlockAccount { user, shell } => {
-            undo_unlock_account(user, shell.as_deref(), opts)
+        UndoKind::UnlockAccount { user, shell, was_locked } => {
+            undo_unlock_account(user, shell.as_deref(), *was_locked, opts)
         }
         UndoKind::RemoveCreatedFile { vault, original } => {
             undo_remove_created_file(vault, original, opts)
@@ -426,6 +545,9 @@ pub fn undo_with(record: &UndoRecord, opts: &ApplyOptions, allow_auth: bool) -> 
 
         UndoKind::UnmountExecBlock { path } => exec::undo_unmount(path, opts),
         UndoKind::RemoveCanary { path } => deceive::undo_remove(path, opts),
+        UndoKind::RemoveNftAllow { family, table, chain, comment } => {
+            fwallow::undo_allow(family, table, chain, comment, opts)
+        }
 
         UndoKind::RestoreBootParams { vault, original, generator, output } => {
             match bootparam::detect() {
@@ -663,8 +785,12 @@ pub fn undo_with(record: &UndoRecord, opts: &ApplyOptions, allow_auth: bool) -> 
                 });
             }
             match restore_from_vault(vault, original, *moved) {
-                Ok(()) => Outcome::Applied(UndoRecord {
-                    did: format!("restored {} from the vault", original.display()),
+                Ok(kept) => Outcome::Applied(UndoRecord {
+                    did: format!(
+                        "restored {} from the vault{}",
+                        original.display(),
+                        kept_note(kept.as_deref())
+                    ),
                     undo: UndoKind::Irreversible { note: "restore is the undo".into() },
                     reversible: false,
                 }),
@@ -780,62 +906,101 @@ fn restore_refusal(vault: &Path, original: &Path, moved: bool) -> Option<Refusal
     None
 }
 
-fn restore_from_vault(vault: &Path, original: &Path, moved: bool) -> Result<(), String> {
+fn restore_from_vault(vault: &Path, original: &Path, moved: bool) -> Result<Option<PathBuf>, String> {
     if moved {
-        move_file(vault, original).map(|_| ())
+        move_file(vault, original).map(|_| None)
     } else {
         restore_in_place(vault, original)
     }
 }
 
-pub(crate) fn restore_in_place(vault: &Path, original: &Path) -> Result<(), String> {
-    use std::io::{Read as _, Seek as _, Write as _};
+pub(crate) fn restore_in_place(vault: &Path, original: &Path) -> Result<Option<PathBuf>, String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    const LIVE_CAP: u64 = MAX_VAULT_BYTES;
 
     let body = hemostat_sensor_linux::saferead::read_bytes(vault, MAX_VAULT_BYTES)
         .map_err(|e| format!("restore failed reading the vault: {e}"))?;
 
-    let mut f = crate::paths::pin_parent(original)
-        .map_err(|e| format!("refused to restore {}: {e}", original.display()))?
-        .open(libc::O_RDWR, 0)
-        .map_err(|e| {
-            format!(
-                "refused to restore {}: it could not be opened without following a symlink \
-                 ({e}). A link where the file was is how a restore becomes an arbitrary write",
-                original.display()
-            )
-        })?;
+    let pinned = crate::paths::pin_parent(original)
+        .map_err(|e| format!("refused to restore {}: {e}", original.display()))?;
 
-    if !f.metadata().map_err(|e| format!("restore failed: {e}"))?.is_file() {
+    let file = pinned.open(libc::O_RDONLY | libc::O_NONBLOCK, 0).map_err(|e| {
+        format!(
+            "refused to restore {}: it could not be opened without following a symlink \
+             ({e}). A link where the file was is how a restore becomes an arbitrary write",
+            original.display()
+        )
+    })?;
+
+    let md = file.metadata().map_err(|e| format!("restore failed: {e}"))?;
+    if !md.is_file() {
         return Err(format!(
             "refused to restore {}: what is there now is not a regular file",
             original.display()
         ));
     }
-
+    if md.len() > LIVE_CAP {
+        return Err(format!(
+            "refused to restore {}: it is {} bytes now, past the {LIVE_CAP}-byte cap a restore \
+             reads. Nothing was written; the vault copy is still at {}",
+            original.display(),
+            md.len(),
+            vault.display()
+        ));
+    }
     let mut current = Vec::new();
-    f.read_to_end(&mut current).map_err(|e| format!("restore failed reading the live file: {e}"))?;
-
-    if current != body {
-
-        let kept = vault_dest(
-            vault.parent().unwrap_or_else(|| Path::new(".")),
-            &vault.with_extension("superseded"),
-        );
-        fs::write(&kept, &current).map_err(|e| {
-            format!(
-                "refused to restore {}: its contents changed since the remediation and the \
-                 copy that would be overwritten could not be kept at {} ({e})",
-                original.display(),
-                kept.display()
-            )
-        })?;
+    (&file)
+        .take(LIVE_CAP + 1)
+        .read_to_end(&mut current)
+        .map_err(|e| format!("restore failed reading the live file: {e}"))?;
+    if current.len() as u64 > LIVE_CAP {
+        return Err(format!(
+            "refused to restore {}: it grew past the {LIVE_CAP}-byte cap while being read",
+            original.display()
+        ));
     }
 
-    f.rewind().map_err(|e| format!("restore failed: {e}"))?;
-    f.set_len(0).map_err(|e| format!("restore failed: {e}"))?;
-    f.write_all(&body).map_err(|e| format!("restore failed: {e}"))?;
-    f.sync_all().map_err(|e| format!("restore failed: {e}"))?;
-    drop(f);
+    let kept = if current != body {
 
-    fs::remove_file(vault).map_err(|e| format!("restore failed clearing the vault: {e}"))
+        let kept = crate::strip::snapshot(
+            &vault.with_extension("superseded"),
+            &current,
+            vault.parent().unwrap_or_else(|| Path::new(".")),
+        )
+        .map_err(|e| {
+            format!(
+                "refused to restore {}: its contents changed since the remediation and the \
+                 copy that would be overwritten could not be kept ({e})",
+                original.display()
+            )
+        })?;
+        Some(kept)
+    } else {
+        None
+    };
+
+    let meta = crate::strip::Meta { mode: md.mode(), uid: md.uid(), gid: md.gid() };
+    let read = crate::strip::sha256(&current);
+    let live = crate::strip::Read { pinned, file, md, bytes: current };
+    if let Err(e) = crate::strip::replace(&live, &body, meta, None, &read) {
+
+        if let Some(k) = &kept {
+            let _ = fs::remove_file(k);
+        }
+        return Err(format!(
+            "restore of {} failed and it is unchanged: {e}. The vault copy is still at {}",
+            original.display(),
+            vault.display()
+        ));
+    }
+
+    fs::remove_file(vault).map_err(|e| format!("restore failed clearing the vault: {e}"))?;
+    Ok(kept)
+}
+
+pub(crate) fn kept_note(kept: Option<&Path>) -> String {
+    kept.map(|k| format!("; what it held until now is kept at {}", k.display()))
+        .unwrap_or_default()
 }

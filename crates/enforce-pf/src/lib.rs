@@ -62,6 +62,8 @@ pub struct Enrolled {
     pub tracker: u32,
 
     pub protect: Vec<Cidr>,
+
+    pub width: protect::Width,
 }
 
 pub fn operand(class: ActionClass, host: &[u8; 32], alias: Alias, cidr: &Cidr) -> [u8; 32] {
@@ -217,7 +219,7 @@ fn counted(
     }
     let ps = protect::gather(&mut ro);
     let protected = protect::collect(&ps, config.as_ref().ok(), resolv, ssh_connection, enrolled);
-    let verdict = protect::judge(&cidr, &protected);
+    let verdict = protect::judge(&cidr, &protected, enrolled.width);
     let req = Request {
         class,
         origin: hemostat_broker::Origin::Operator,

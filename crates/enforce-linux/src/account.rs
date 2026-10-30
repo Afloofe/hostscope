@@ -34,6 +34,17 @@ pub enum AccountAction {
 
         group: String,
     },
+
+    Lock {
+
+        user: String,
+
+        uid: u32,
+
+        prior_shell: Option<String>,
+
+        prior_locked: Option<bool>,
+    },
 }
 
 impl AccountAction {
@@ -43,7 +54,8 @@ impl AccountAction {
             AccountAction::SessionKill { user, .. }
             | AccountAction::TicketPurge { user, .. }
             | AccountAction::CredRotate { user, .. }
-            | AccountAction::GroupDrop { user, .. } => user,
+            | AccountAction::GroupDrop { user, .. }
+            | AccountAction::Lock { user, .. } => user,
         }
     }
 
@@ -52,12 +64,16 @@ impl AccountAction {
             AccountAction::SessionKill { uid, .. }
             | AccountAction::TicketPurge { uid, .. }
             | AccountAction::CredRotate { uid, .. }
-            | AccountAction::GroupDrop { uid, .. } => *uid,
+            | AccountAction::GroupDrop { uid, .. }
+            | AccountAction::Lock { uid, .. } => *uid,
         }
     }
 
     pub const fn changes_the_account(&self) -> bool {
-        matches!(self, AccountAction::CredRotate { .. } | AccountAction::GroupDrop { .. })
+        matches!(
+            self,
+            AccountAction::CredRotate { .. } | AccountAction::GroupDrop { .. } | AccountAction::Lock { .. }
+        )
     }
 }
 
@@ -215,6 +231,88 @@ pub fn uid_of(user: &str) -> Option<u32> {
     uid_in_passwd(&hemostat_sensor_linux::saferead::read_scan_target(std::path::Path::new("/etc/passwd"))?, user)
 }
 
+pub fn name_in_passwd(text: &str, uid: u32) -> Option<String> {
+    id_name(text, uid)
+}
+
+pub fn name_in_group(text: &str, gid: u32) -> Option<String> {
+    id_name(text, gid)
+}
+
+fn id_name(text: &str, id: u32) -> Option<String> {
+    text.lines().find_map(|l| {
+        let mut f = l.split(':');
+        let name = f.next()?;
+        let _pw = f.next()?;
+        let n = f.next()?.parse::<u32>().ok()?;
+        (n == id && !name.is_empty()).then(|| name.to_string())
+    })
+}
+
+pub fn name_of_uid(uid: u32) -> Option<String> {
+    name_in_passwd(&hemostat_sensor_linux::saferead::read_scan_target(std::path::Path::new("/etc/passwd"))?, uid)
+}
+
+pub fn name_of_gid(gid: u32) -> Option<String> {
+    name_in_group(&hemostat_sensor_linux::saferead::read_scan_target(std::path::Path::new("/etc/group"))?, gid)
+}
+
+pub(crate) fn status_uids(status: &str) -> Option<(u32, u32)> {
+    let mut v = status.lines().find_map(|l| l.strip_prefix("Uid:"))?.split_whitespace();
+    let real = v.next()?.parse().ok()?;
+    let effective = v.next()?.parse().ok()?;
+    Some((real, effective))
+}
+
+pub(crate) fn login_uid(text: &str) -> Option<u32> {
+    text.trim().parse::<u32>().ok().filter(|u| *u != u32::MAX)
+}
+
+pub(crate) fn owner_names(passwd: &str, uids: &[u32]) -> Result<Vec<String>, u32> {
+    let mut out: Vec<String> = Vec::new();
+    for &uid in uids {
+        let name = name_in_passwd(passwd, uid).ok_or(uid)?;
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn owners_of(pid: u32) -> Result<Vec<String>, String> {
+    use hemostat_sensor_linux::saferead::{read_proc, read_scan_target, MAX_PROC_BYTES};
+    let (status, _) = read_proc(std::path::Path::new(&format!("/proc/{pid}/status")), MAX_PROC_BYTES)
+        .map_err(|e| format!("/proc/{pid}/status could not be read ({e})"))?;
+    let (real, effective) = status_uids(&String::from_utf8_lossy(&status))
+        .ok_or_else(|| format!("/proc/{pid}/status names no uid"))?;
+    let login = read_proc(std::path::Path::new(&format!("/proc/{pid}/loginuid")), 64)
+        .ok()
+        .and_then(|(b, _)| login_uid(&String::from_utf8_lossy(&b)));
+    let passwd = read_scan_target(std::path::Path::new("/etc/passwd"))
+        .ok_or_else(|| "/etc/passwd could not be read".to_string())?;
+    let mut uids = vec![real, effective];
+    uids.extend(login);
+    owner_names(&passwd, &uids).map_err(|uid| format!("uid {uid} has no entry in /etc/passwd"))
+}
+
+pub fn read_shell(user: &str) -> Option<String> {
+    shell_in_passwd(
+        &hemostat_sensor_linux::saferead::read_scan_target(std::path::Path::new("/etc/passwd"))?,
+        user,
+    )
+}
+
+pub(crate) fn shell_in_passwd(text: &str, user: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        let mut f = l.split(':');
+        if f.next()? != user {
+            return None;
+        }
+
+        f.nth(5).map(str::to_string)
+    })
+}
+
 pub fn last_change_in_shadow(text: &str, user: &str) -> Option<String> {
     text.lines()
         .filter_map(|l| {
@@ -229,6 +327,22 @@ pub fn last_change_in_shadow(text: &str, user: &str) -> Option<String> {
 
 pub fn read_last_change(user: &str) -> Option<String> {
     last_change_in_shadow(&hemostat_sensor_linux::saferead::read_scan_target(std::path::Path::new("/etc/shadow"))?, user)
+}
+
+pub fn password_locked_in_shadow(text: &str, user: &str) -> Option<bool> {
+    text.lines().find_map(|l| {
+        let mut f = l.split(':');
+        let name = f.next()?;
+        let hash = f.next()?;
+        (name == user).then(|| hash.starts_with('!'))
+    })
+}
+
+pub fn read_password_locked(user: &str) -> Option<bool> {
+    password_locked_in_shadow(
+        &hemostat_sensor_linux::saferead::read_scan_target(std::path::Path::new("/etc/shadow"))?,
+        user,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +412,17 @@ pub fn check(
     protect: &ProtectSet,
     session_via: SessionMechanism,
 ) -> Result<AccountPlan, AccountRefusal> {
+
+    if hs_core::accounts::is_hard_protected(action.user()) {
+        return Err(AccountRefusal {
+            rule: "out-of-scope-account",
+            because: format!(
+                "{}: {}",
+                action.user(),
+                crate::ProtectReason::OutOfScopeAccount.describe()
+            ),
+        });
+    }
     if action.uid() == 0 {
         return Err(AccountRefusal {
             rule: "never-root",
@@ -325,7 +450,7 @@ pub fn check(
             because: format!("{}: {}", action.user(), reason.describe()),
         });
     }
-    if matches!(action, AccountAction::CredRotate { .. }) && !is_a_human_login(action.uid()) {
+    if matches!(action, AccountAction::CredRotate { .. } | AccountAction::Lock { .. }) && !is_a_human_login(action.uid()) {
         return Err(AccountRefusal {
             rule: "service-account",
             because: format!(
@@ -361,6 +486,16 @@ pub fn check(
             format!("remove {user} from the {group} group"),
             How::Run(vec!["gpasswd".into(), "-d".into(), user.clone(), group.clone()]),
         ),
+        AccountAction::Lock { user, .. } => (
+            format!("lock the login {user}: disable its password and set its shell to nologin"),
+            How::Run(vec![
+                "usermod".into(),
+                "-L".into(),
+                "-s".into(),
+                "/usr/sbin/nologin".into(),
+                user.clone(),
+            ]),
+        ),
     };
 
     Ok(AccountPlan { summary, needs_operator: action.changes_the_account(), how })
@@ -378,6 +513,11 @@ pub fn undo_for(action: &AccountAction) -> Option<UndoKind> {
         AccountAction::GroupDrop { user, group, .. } => Some(UndoKind::RejoinGroup {
             user: user.clone(),
             group: group.clone(),
+        }),
+        AccountAction::Lock { user, prior_shell, prior_locked, .. } => Some(UndoKind::UnlockAccount {
+            user: user.clone(),
+            shell: prior_shell.clone(),
+            was_locked: *prior_locked,
         }),
     }
 }
@@ -402,6 +542,51 @@ pub fn apply(
         }
     };
 
+    if let AccountAction::SessionKill { uid, .. } = action {
+        let procs = read_proc_sessions();
+        let mut ended =
+            pids_in_sessions(&procs, &login_session_ids(&procs, *uid, &protect.session_pids));
+        if matches!(plan.how, How::Run(_)) {
+            let cgroups: Vec<(u32, String)> = procs
+                .iter()
+                .map(|p| {
+                    let cg = hemostat_sensor_linux::saferead::read_scan_target(std::path::Path::new(
+                        &format!("/proc/{}/cgroup", p.pid),
+                    ));
+                    (p.pid, cg.unwrap_or_default())
+                })
+                .collect();
+            ended.extend(pids_in_user_slice(&cgroups, *uid));
+            ended.sort_unstable();
+            ended.dedup();
+        }
+        let passwd =
+            hemostat_sensor_linux::saferead::read_scan_target(std::path::Path::new("/etc/passwd"));
+        let held = passwd.as_deref().map(|text| protected_among(&procs, &ended, text, protect));
+        let why = match held {
+            None => Some("/etc/passwd could not be read, so who else is running in its sessions \
+                          cannot be told"
+                .to_string()),
+            Some(Some((pid, name))) => Some(format!(
+                "pid {pid} in its login session belongs to `{name}`, and {}",
+                protect.user_reason(&name).map_or("", |r| r.describe())
+            )),
+            Some(None) => None,
+        };
+        if let Some(why) = why {
+            return Outcome::Refused(crate::Refusal {
+                action: format!("end the sessions of {}", action.user()),
+                cause: RefuseCause::InvalidTarget("a protected account runs in the session".into()),
+                message: format!(
+                    "refused to end {}'s sessions: {why}. Ending a session ends everyone in it; \
+                     end it by hand once that is dealt with",
+                    action.user()
+                ),
+                suggested_alternative: None,
+            });
+        }
+    }
+
     if !opts.armed {
         let reversible = undo_for(action).is_some();
         return Outcome::Planned(crate::Plan {
@@ -413,6 +598,28 @@ pub fn apply(
                 }
                 Some(UndoKind::RestorePasswordAge { user, last_change }) => {
                     format!("chage -d {last_change} {user}")
+                }
+                Some(UndoKind::UnlockAccount { user, shell, was_locked }) => {
+                    let set_shell = match shell.as_deref() {
+                        Some(s) if !s.is_empty() => format!(" -s {s}"),
+                        _ => String::new(),
+                    };
+                    match was_locked {
+                        Some(false) => format!("usermod -U{set_shell} {user}"),
+
+                        Some(true) if set_shell.is_empty() => format!(
+                            "nothing: {user}'s password was locked before this lock, so it stays locked"
+                        ),
+                        Some(true) => format!(
+                            "usermod{set_shell} {user} — its password was locked before this lock, \
+                             so it stays locked"
+                        ),
+                        None => format!(
+                            "usermod{set_shell} {user}, leaving its password locked: whether it was \
+                             locked before could not be read. `usermod -U {user}` by hand if it \
+                             should log in"
+                        ),
+                    }
                 }
                 _ => "nothing to reverse — the user recovers by authenticating again".into(),
             },
@@ -483,6 +690,29 @@ fn signal_login_sessions(uid: u32, protect: &ProtectSet) -> Result<String, Strin
             failed.join("; ")
         ))
     }
+}
+
+pub(crate) fn protected_among(
+    procs: &[ProcSession],
+    pids: &[u32],
+    passwd: &str,
+    protect: &ProtectSet,
+) -> Option<(u32, String)> {
+    pids.iter().find_map(|&pid| {
+        let p = procs.iter().find(|p| p.pid == pid)?;
+        let name = name_in_passwd(passwd, p.uid)?;
+        protect.user_reason(&name).map(|_| (pid, name))
+    })
+}
+
+pub(crate) fn pids_in_user_slice(cgroups: &[(u32, String)], uid: u32) -> Vec<u32> {
+    let mut out: Vec<u32> = cgroups
+        .iter()
+        .filter(|(pid, cg)| *pid > 1 && login_slice_uid(cg) == Some(uid))
+        .map(|(pid, _)| *pid)
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 fn still_running(uid: u32, ended: &std::collections::BTreeSet<u32>) -> String {
@@ -691,4 +921,211 @@ pub(crate) fn login_slice_uid(cgroup: &str) -> Option<u32> {
             c.strip_prefix("user-")?.strip_suffix(".slice")?.parse().ok()
         })
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SudoersScope {
+
+    Protected(String),
+
+    Unresolved(String),
+}
+
+impl SudoersScope {
+
+    pub fn describe(&self) -> String {
+        match self {
+            SudoersScope::Protected(name) => format!(
+                "the line is `{name}`'s, and {}",
+                crate::ProtectReason::OutOfScopeAccount.describe()
+            ),
+            SudoersScope::Unresolved(token) => format!(
+                "the line names `{token}`, which this cannot resolve to an account — an alias \
+                 defined in another sudoers file, a netgroup, or an id with no entry — so it \
+                 cannot be shown not to be the white team's or the DataDog agent's. Read it \
+                 and edit it by hand with visudo"
+            ),
+        }
+    }
+}
+
+const MAX_ALIAS_DEPTH: usize = 8;
+
+pub fn sudoers_scope(
+    line: &str,
+    file: &str,
+    uid_name: &dyn Fn(u32) -> Option<String>,
+    gid_name: &dyn Fn(u32) -> Option<String>,
+) -> Option<SudoersScope> {
+    let body = sudoers_code(line).trim();
+    let lists: Vec<String> = if let Some(rest) = body.strip_prefix("Defaults") {
+
+        vec![leading_list(rest.strip_prefix(':')?)]
+    } else if let Some(defs) = keyword(body, "User_Alias") {
+        alias_definitions(defs).into_iter().map(|(_, members)| members.to_string()).collect()
+    } else if ["Runas_Alias", "Host_Alias", "Cmnd_Alias", "Cmd_Alias"]
+        .iter()
+        .any(|k| keyword(body, k).is_some())
+        || body.starts_with('@')
+        || body.is_empty()
+    {
+        return None;
+    } else {
+        vec![leading_list(body)]
+    };
+    let aliases = user_aliases(file);
+    let mut unresolved: Option<String> = None;
+    for list in &lists {
+        if let Some(name) = protected_in(list, &aliases, uid_name, gid_name, 0, &mut unresolved) {
+            return Some(SudoersScope::Protected(name));
+        }
+    }
+    unresolved.map(SudoersScope::Unresolved)
+}
+
+fn protected_in(
+    list: &str,
+    aliases: &std::collections::BTreeMap<String, String>,
+    uid_name: &dyn Fn(u32) -> Option<String>,
+    gid_name: &dyn Fn(u32) -> Option<String>,
+    depth: usize,
+    unresolved: &mut Option<String>,
+) -> Option<String> {
+    fn note(slot: &mut Option<String>, t: &str) {
+        slot.get_or_insert_with(|| t.to_string());
+    }
+    for raw in list.split(',') {
+
+        let t = raw.trim().trim_start_matches(|c: char| c == '!' || c.is_whitespace());
+        let t = t.trim_matches('"');
+        if t.is_empty() || t == "ALL" {
+            continue;
+        }
+        let name = if let Some(g) = t.strip_prefix("%:") {
+            if g.starts_with('#') {
+                note(unresolved, t);
+                continue;
+            }
+            g.to_string()
+        } else if let Some(gid) = t.strip_prefix("%#") {
+            match gid.parse::<u32>().ok().and_then(gid_name) {
+                Some(g) => g,
+                None => {
+                    note(unresolved, t);
+                    continue;
+                }
+            }
+        } else if let Some(g) = t.strip_prefix('%') {
+            g.to_string()
+        } else if let Some(uid) = t.strip_prefix('#') {
+            match uid.parse::<u32>().ok().and_then(uid_name) {
+                Some(u) => u,
+                None => {
+                    note(unresolved, t);
+                    continue;
+                }
+            }
+        } else if t.starts_with('+') {
+            note(unresolved, t);
+            continue;
+        } else if is_alias_name(t) {
+            match aliases.get(t) {
+                Some(members) if depth < MAX_ALIAS_DEPTH => {
+                    if let Some(p) = protected_in(members, aliases, uid_name, gid_name, depth + 1, unresolved) {
+                        return Some(p);
+                    }
+                    continue;
+                }
+                _ => {
+                    note(unresolved, t);
+                    continue;
+                }
+            }
+        } else {
+            t.to_string()
+        };
+        if hs_core::accounts::is_hard_protected(&name) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn sudoers_code(line: &str) -> &str {
+    let b = line.as_bytes();
+    for (i, c) in line.char_indices() {
+        if c == '#' && !b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            return line.get(..i).unwrap_or_default();
+        }
+    }
+    line
+}
+
+fn keyword<'a>(body: &'a str, word: &str) -> Option<&'a str> {
+    body.strip_prefix(word).filter(|rest| rest.starts_with(char::is_whitespace))
+}
+
+fn leading_list(s: &str) -> String {
+    let mut out = String::new();
+    let mut blank = false;
+    for c in s.trim_start().chars() {
+        if c.is_whitespace() {
+            blank = true;
+            continue;
+        }
+        if blank && c != ',' && !out.ends_with(',') {
+            break;
+        }
+        blank = false;
+        out.push(c);
+    }
+    out
+}
+
+fn is_alias_name(t: &str) -> bool {
+    let mut c = t.chars();
+    c.next().is_some_and(|f| f.is_ascii_uppercase())
+        && c.all(|x| x.is_ascii_uppercase() || x.is_ascii_digit() || x == '_')
+}
+
+fn alias_definitions(defs: &str) -> Vec<(&str, &str)> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let b = defs.as_bytes();
+    for (i, c) in defs.char_indices() {
+        if c == ':' && (i == 0 || b.get(i - 1) != Some(&b'%')) {
+            parts.push(defs.get(start..i).unwrap_or_default());
+            start = i + 1;
+        }
+    }
+    parts.push(defs.get(start..).unwrap_or_default());
+    parts
+        .into_iter()
+        .filter_map(|p| p.split_once('='))
+        .map(|(n, m)| (n.trim(), m.trim()))
+        .collect()
+}
+
+fn user_aliases(file: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut logical = String::new();
+    for raw in file.lines() {
+        let code = sudoers_code(raw).trim_end();
+        let (part, continued) = match code.strip_suffix('\\') {
+            Some(p) => (p, true),
+            None => (code, false),
+        };
+        logical.push_str(part);
+        logical.push(' ');
+        if continued {
+            continue;
+        }
+        let line = std::mem::take(&mut logical);
+        if let Some(defs) = keyword(line.trim(), "User_Alias") {
+            for (name, members) in alias_definitions(defs) {
+                out.insert(name.to_string(), members.to_string());
+            }
+        }
+    }
+    out
 }

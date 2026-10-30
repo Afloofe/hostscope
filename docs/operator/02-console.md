@@ -12,6 +12,8 @@
 
 Everything known about the selected finding, untruncated: the subject, what and why in full, the paths and PIDs to go and look at, the remedy, and the coverage gaps. Up and down (k and j) move to the previous and next finding; the wheel, J and K, and the scrollbar scroll the text.
 
+On Linux every sweep the console shows (the first, each r, and the re-sweep after a fix) is sealed into its own store under /var/lib/hemostat/evidence, one at a time, in the background. The evidence rows say which recovery key the stores are wrapped to and what each seal came to; a seal that failed is a WARN for the rest of the session. With no $HEMOSTAT_RECOVERY_PUBKEY set and none built in, a key is minted: it is in the evidence row and the footer, and printed again when the console closes. Write it down and take it off the host: it is the only key that reads those stores. Quitting waits up to 10 seconds for a seal in progress and begins no other; a seal still being written then is cut off, and the console names the store it left incomplete.
+
 ## Fixing a finding
 
 Most findings have no remedy, and that is correct: a rootkit is not a setting to flip. Where there is one:

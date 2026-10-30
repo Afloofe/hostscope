@@ -201,6 +201,16 @@ const fn windows_wiring(class: ActionClass) -> Executor {
         ActionClass::Harden => Executor::Reachable,
 
         ActionClass::Collect => Executor::Reachable,
+
+        ActionClass::Kill | ActionClass::Quarantine => Executor::Reachable,
+
+        ActionClass::PersistenceNeutralize => Executor::Reachable,
+
+        ActionClass::AccountDisable => Executor::Reachable,
+
+        ActionClass::IsolateInbound => Executor::Reachable,
+
+        ActionClass::ServiceStart => Executor::Reachable,
         _ => Executor::NotOnThisOs,
     }
 }
@@ -280,6 +290,14 @@ pub fn implementation_on(os: TargetOs, id: ModuleId) -> Implementation {
         (TargetOs::Windows, ModuleId::HardenReboot) => {
             R("cli/src/remedy.rs::apply_remedy (driver blocklist)")
         }
+
+        (TargetOs::Windows, ModuleId::EnfProc) => R("cli/src/win_respond.rs::kill"),
+        (TargetOs::Windows, ModuleId::EnfFile) => R("cli/src/win_respond.rs::quarantine"),
+        (TargetOs::Windows, ModuleId::EnfAccount) => R("cli/src/win_accounts.rs::disable"),
+        (TargetOs::Windows, ModuleId::EnfPersistence) => {
+            R("cli/src/win_respond.rs + win_wmi.rs + win_binvault.rs + win_restore.rs")
+        }
+        (TargetOs::Windows, ModuleId::EnfNetIngress) => R("cli/src/win_firewall.rs::allow"),
 
         (TargetOs::Linux | TargetOs::Windows, ModuleId::EnfPerimeter | ModuleId::EnfPerimeterKill) => {
             Implementation::NotOnThisOs

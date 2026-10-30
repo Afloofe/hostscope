@@ -14,6 +14,35 @@ pub const WIDEST_V4: u8 = 24;
 
 pub const WIDEST_V6: u8 = 56;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Width {
+
+    #[default]
+    Single,
+
+    Subnet,
+}
+
+impl Width {
+
+    pub const fn widest(self, v4: bool) -> u8 {
+        match (self, v4) {
+            (Width::Single, true) => 32,
+            (Width::Single, false) => 128,
+            (Width::Subnet, true) => WIDEST_V4,
+            (Width::Subnet, false) => WIDEST_V6,
+        }
+    }
+
+    pub fn of(cidr: &Cidr) -> Width {
+        if cidr.prefix() < Width::Single.widest(cidr.is_v4()) {
+            Width::Subnet
+        } else {
+            Width::Single
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Gathered {
 
@@ -74,6 +103,21 @@ pub fn parse_addr(s: &str) -> Option<IpAddr> {
 
 fn sock_addr(s: &str) -> Option<IpAddr> {
     let (a, _port) = s.rsplit_once(':')?;
+    parse_addr(a)
+}
+
+pub fn syslog_server(s: &str) -> Option<IpAddr> {
+    let s = s.trim();
+    if let Some(a) = parse_addr(s) {
+        return Some(a);
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        let (a, port) = rest.split_once(']')?;
+        let port_ok = port.is_empty() || port.strip_prefix(':').is_some_and(|p| p.parse::<u16>().is_ok());
+        return if port_ok { parse_addr(a) } else { None };
+    }
+    let (a, port) = s.rsplit_once(':')?;
+    port.parse::<u16>().ok()?;
     parse_addr(a)
 }
 
@@ -205,9 +249,23 @@ pub fn collect(
                 for d in sys.all("dnsserver") {
                     p.addr(&d.text, "a DNS server (config.xml)");
                 }
+
+                for t in sys.text_at("timeservers").unwrap_or_default().split_whitespace() {
+                    p.addr(t, "an NTP server (config.xml)");
+                }
+            }
+
+            if let Some(log) = c.root().child("syslog") {
+                for k in ["remoteserver", "remoteserver2", "remoteserver3"] {
+                    if let Some(a) = log.text_at(k).and_then(syslog_server) {
+                        p.add(Cidr::host(a), "a remote syslog server (config.xml)");
+                    }
+                }
             }
         }
-        None => p.gaps.push("config.xml could not be read, so its interfaces, VIPs, gateways and DNS servers are unknown".into()),
+        None => p.gaps.push(
+            "config.xml could not be read, so its interfaces, VIPs, gateways, DNS, NTP and syslog servers are unknown".into(),
+        ),
     }
     match resolv {
         Ok(t) => {
@@ -229,16 +287,25 @@ pub fn collect(
     p
 }
 
-pub fn judge(cidr: &Cidr, p: &Protected) -> Protect {
+pub fn judge(cidr: &Cidr, p: &Protected, width: Width) -> Protect {
     if cidr.is_everything() {
         return Protect::Refused(format!("{cidr} is every address: blocking it is cutting the firewall off"));
     }
-    let widest = if cidr.is_v4() { WIDEST_V4 } else { WIDEST_V6 };
+    let widest = width.widest(cidr.is_v4());
     if cidr.prefix() < widest {
-        return Protect::Refused(format!(
-            "{cidr} is wider than /{widest}. A block that wide needs dual control, which is not \
-             built, so it is refused; block the narrower ranges you mean"
-        ));
+        return Protect::Refused(match width {
+            Width::Single => format!(
+                "{cidr} is more than one address. A block names one address (a /32 or a /128): a \
+                 range can hold a scoring engine, a log host or a monitoring intake nobody listed, \
+                 and the IRSeC packet allows blocks of single IP addresses only. Block the address \
+                 you mean, or — where the rules of engagement allow ranges — pass --allow-subnet \
+                 (up to /{WIDEST_V4} or /{WIDEST_V6})"
+            ),
+            Width::Subnet => format!(
+                "{cidr} is wider than /{widest}. A block that wide needs dual control, which is not \
+                 built, so it is refused; block the narrower ranges you mean"
+            ),
+        });
     }
     if !p.gaps.is_empty() {
         return Protect::Refused(format!(

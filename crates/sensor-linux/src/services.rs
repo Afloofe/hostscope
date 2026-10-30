@@ -84,9 +84,91 @@ pub fn parse_line(line: &str) -> Option<Declared> {
     if raw.starts_with('/') {
         return None;
     }
-    let unit = if raw.contains('.') { raw.to_string() } else { format!("{raw}.service") };
+    let unit = normalise_unit(raw);
     let paths = words.filter(|w| w.starts_with('/')).map(PathBuf::from).collect();
     Some(Declared { unit, paths })
+}
+
+pub const UNIT_SUFFIXES: &[&str] = &[
+    ".service", ".socket", ".device", ".mount", ".automount", ".swap", ".target", ".path",
+    ".timer", ".slice", ".scope",
+];
+
+pub fn normalise_unit(name: &str) -> String {
+    if name.is_empty() || UNIT_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        name.to_string()
+    } else {
+        format!("{name}.service")
+    }
+}
+
+pub fn unit_names(units: &[String]) -> Vec<String> {
+    let units: Vec<&String> = units.iter().filter(|u| is_unit_name(u)).collect();
+    if units.is_empty() {
+        return Vec::new();
+    }
+    let Some(systemctl) = resolve(&["/usr/bin/systemctl", "/bin/systemctl"]) else {
+        return Vec::new();
+    };
+    let ask = |names: &[&String]| {
+        let mut args = vec!["--property=Id,Names", "--"];
+        args.extend(names.iter().map(|n| n.as_str()));
+        show_within(&systemctl, &args)
+    };
+    match ask(&units) {
+        Ok(out) if out.status.success() => parse_unit_names(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => Vec::new(),
+        Ok(_) => {
+            let mut names = Vec::new();
+            for u in &units {
+                match ask(&[*u]) {
+                    Ok(out) if out.status.success() => {
+                        names.extend(parse_unit_names(&String::from_utf8_lossy(&out.stdout)));
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            names
+        }
+    }
+}
+
+pub const SHOW_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub fn show_within(systemctl: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    let mut cmd = Command::new(systemctl);
+    cmd.arg("show").args(args).env_clear().env("LC_ALL", "C");
+    match crate::sshd::output_within(&mut cmd, std::process::Stdio::null(), SHOW_LIMIT) {
+        Ok(Some(out)) => Ok(out),
+        Ok(None) => Err(format!(
+            "`systemctl show` had not answered after {} seconds (a wedged systemd or D-Bus)",
+            SHOW_LIMIT.as_secs()
+        )),
+        Err(e) => Err(format!("could not run {}: {e}", systemctl.display())),
+    }
+}
+
+pub fn parse_unit_names(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Some(v) = line.strip_prefix("Id=").or_else(|| line.strip_prefix("Names=")) else {
+            continue;
+        };
+        for n in v.split_whitespace() {
+            if !out.iter().any(|o| o == n) {
+                out.push(n.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn is_unit_name(u: &str) -> bool {
+    !u.is_empty()
+        && u.len() <= 255
+        && !u.starts_with('-')
+        && u.bytes().all(|b| b.is_ascii_alphanumeric() || b":_.\\@-".contains(&b))
 }
 
 pub fn declarations() -> Vec<Declared> {
@@ -139,6 +221,63 @@ pub fn exec_path(rendered: &str) -> Option<PathBuf> {
     let end = rest.find([';', ' ']).unwrap_or(rest.len());
     let p = rest[..end].trim();
     (!p.is_empty()).then(|| PathBuf::from(p))
+}
+
+pub fn declared_exec_paths(declared: &[Declared]) -> Result<Vec<(String, PathBuf)>, String> {
+    if declared.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if init_other_than_systemd().is_some() {
+        return Ok(Vec::new());
+    }
+    let Some(systemctl) = resolve(&["/usr/bin/systemctl", "/bin/systemctl"]) else {
+        return Err("systemctl not found — what the declared services start cannot be asked".into());
+    };
+    let mut found = Vec::new();
+    for d in declared {
+        let out = show_within(
+            &systemctl,
+            &["--property=ExecCondition,ExecStartPre,ExecStart,ExecStartPost", "--", &d.unit],
+        )
+        .map_err(|why| format!("{why}, asked what {} starts", d.unit))?;
+        if !out.status.success() {
+            return Err(format!(
+                "`systemctl show {}` failed ({}), so what it starts is not known",
+                d.unit,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        found.extend(exec_paths(&text).into_iter().map(|p| (d.unit.clone(), p)));
+    }
+    Ok(found)
+}
+
+fn init_other_than_systemd() -> Option<String> {
+    crate::enablement::other_init(
+        fs::read_to_string("/proc/1/comm").ok().as_deref(),
+        fs::read_link("/proc/1/exe").ok().as_deref(),
+        Path::new("/run/systemd/system").is_dir(),
+    )
+}
+
+pub fn exec_paths(text: &str) -> Vec<PathBuf> {
+    const AT: &str = "{ path=";
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut rest = line;
+        while let Some(at) = rest.find(AT) {
+            let tail = rest.get(at + AT.len()..).unwrap_or_default();
+            let end = tail.find([';', ' ', '}']).unwrap_or(tail.len());
+            let p = tail.get(..end).unwrap_or_default().trim();
+            if !p.is_empty() {
+                out.push(PathBuf::from(p));
+            }
+            rest = tail.get(end..).unwrap_or_default();
+        }
+    }
+    out
 }
 
 fn query(systemctl: &Path, unit: &str) -> ServiceState {

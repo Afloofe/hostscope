@@ -292,7 +292,10 @@ impl Surface {
 }
 
 pub fn survey() -> Surface {
-    let snap = crate::overview::report();
+    survey_from(&crate::overview::report())
+}
+
+pub fn survey_from(snap: &crate::overview::Report) -> Surface {
     let (lo, hi) = ephemeral_range();
     let mut seen: BTreeSet<(Proto, u16)> = BTreeSet::new();
     let mut out =
@@ -391,20 +394,19 @@ pub fn arm_ruleset(rendered: &str, seconds: u64) -> Result<Armed, String> {
         ));
     }
 
-    let dir = std::path::Path::new(SNAPSHOT).parent().ok_or("bad snapshot path")?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let state = state_dir()?;
 
     let before = snapshot_text(&current_ruleset()?);
-    std::fs::write(SNAPSHOT, &before)
+    put(&state, SNAPSHOT, &before)
         .map_err(|e| format!("could not save the current ruleset to {SNAPSHOT}: {e}"))?;
 
     let id = arm_id();
-    std::fs::write(ARM_ID, format!("{id}\n"))
+    put(&state, ARM_ID, &format!("{id}\n"))
         .map_err(|e| format!("could not write {ARM_ID}, so nothing was applied: {e}"))?;
 
     let _ = std::fs::remove_file(CONFIRM);
 
-    std::fs::write(PROPOSED, rendered)
+    put(&state, PROPOSED, rendered)
         .map_err(|e| format!("could not write {PROPOSED}: {e}"))?;
 
     let how = schedule_rollback(seconds, &id)?;
@@ -412,7 +414,7 @@ pub fn arm_ruleset(rendered: &str, seconds: u64) -> Result<Armed, String> {
     if let Err(e) = nft(&["-f", PROPOSED]) {
 
         let _ = nft(&["-f", SNAPSHOT]);
-        let _ = std::fs::write(CONFIRM, "load failed; rolled back immediately\n");
+        let _ = put(&state, CONFIRM, "load failed; rolled back immediately\n");
         return Err(format!(
             "the ruleset would not load, so nothing was changed and the old one is back: {e}"
         ));
@@ -423,6 +425,30 @@ pub fn arm_ruleset(rendered: &str, seconds: u64) -> Result<Armed, String> {
 
 fn snapshot_text(current: &str) -> String {
     format!("flush ruleset\n{current}")
+}
+
+fn state_dir() -> Result<crate::safewrite::Pinned, String> {
+    let path = state_path()?;
+    let refused = |e: std::io::Error| format!("{} cannot hold the network state: {e}", path.display());
+    let dir = crate::safewrite::Pinned::create(path, 0o700).map_err(refused)?;
+    dir.require_root_only().map_err(refused)?;
+    Ok(dir)
+}
+
+fn token_dir() -> Result<crate::safewrite::Pinned, String> {
+    let path = state_path()?;
+    crate::safewrite::Pinned::open(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn state_path() -> Result<&'static std::path::Path, String> {
+    std::path::Path::new(SNAPSHOT).parent().ok_or_else(|| "bad snapshot path".to_string())
+}
+
+fn put(state: &crate::safewrite::Pinned, path: &str, body: &str) -> std::io::Result<()> {
+    let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{path} names no file"))
+    })?;
+    state.replace(name, body.as_bytes(), 0o600)
 }
 
 fn window_is_open(snapshot: &std::path::Path, confirm: &std::path::Path) -> bool {
@@ -528,7 +554,7 @@ pub fn confirm() -> Result<String, String> {
              {prior}. The ruleset in {SNAPSHOT} is the one from before that window."
         ));
     }
-    std::fs::write(CONFIRM, "confirmed by the operator\n")
+    put(&token_dir()?, CONFIRM, "confirmed by the operator\n")
         .map_err(|e| format!("could not write {CONFIRM}: {e}"))?;
     Ok(format!(
         "confirmed. The scheduled rollback will not fire. The previous ruleset is still in \
@@ -541,7 +567,9 @@ pub fn revert() -> Result<String, String> {
         return Err(format!("no saved ruleset at {SNAPSHOT}"));
     }
     nft(&["-f", SNAPSHOT])?;
-    let _ = std::fs::write(CONFIRM, "reverted by the operator\n");
+    if let Ok(state) = token_dir() {
+        let _ = put(&state, CONFIRM, "reverted by the operator\n");
+    }
     Ok(format!("restored the ruleset saved in {SNAPSHOT}"))
 }
 
@@ -550,8 +578,14 @@ pub struct EgressPlan {
 
     pub allows: Vec<EgressAllow>,
 
+    pub owners: Vec<(u32, Origin)>,
+
     pub warnings: Vec<String>,
+
+    pub blocked: Vec<String>,
 }
+
+pub const DATADOG_ACCOUNT: &str = "dd-agent";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressAllow {
@@ -583,7 +617,8 @@ pub fn parse_egress_declaration(text: &str) -> (Vec<EgressAllow>, Vec<String>) {
             let proto = Proto::parse(p)?;
             match port {
                 "*" => Some((proto, None)),
-                _ => port.parse::<u16>().ok().map(|n| (proto, Some(n))),
+
+                _ => port.parse::<u16>().ok().filter(|n| *n != 0).map(|n| (proto, Some(n))),
             }
         });
         let Some((proto, port)) = parsed else {
@@ -611,9 +646,12 @@ pub fn egress_plan(
     declared: &[EgressAllow],
     dhcp: bool,
     upstreams: &[String],
+    accounts: Option<&[crate::accounts::Account]>,
 ) -> EgressPlan {
     let mut allows = Vec::new();
     let mut warnings = Vec::new();
+    let mut owners = Vec::new();
+    let mut blocked = Vec::new();
 
     let mut usable = 0usize;
 
@@ -706,18 +744,98 @@ pub fn egress_plan(
         ),
     });
 
+    for (proto, port, what) in [
+        (Proto::Udp, 514, "syslog"),
+        (Proto::Tcp, 514, "syslog over TCP"),
+        (Proto::Udp, 6514, "syslog over DTLS"),
+        (Proto::Tcp, 6514, "syslog over TLS"),
+    ] {
+        allows.push(EgressAllow {
+            proto,
+            port: Some(port),
+            to: None,
+            origin: Origin::Mandatory(format!(
+                "{what}, to anywhere: log shipping is never cut by a containment. An implant \
+                 can use this port too; block its address with --block-dest"
+            )),
+        });
+    }
+
+    match accounts {
+        None => blocked.push(format!(
+            "/etc/passwd did not read, so whether the DataDog agent ({DATADOG_ACCOUNT}) runs \
+             here, and as which uid, is unknown: arming would cut it if it does"
+        )),
+        Some(list) => {
+            if let Some(dd) = list.iter().find(|a| a.name == DATADOG_ACCOUNT) {
+                if dd.uid == 0 {
+                    blocked.push(format!(
+                        "{DATADOG_ACCOUNT} is uid 0 in /etc/passwd. A rule keeping the DataDog \
+                         agent's traffic would let every root process out, and cutting it is not \
+                         a containment's to do; a second root is the finding here (`hemostat \
+                         accounts`)"
+                    ));
+                } else {
+                    let sharing: Vec<&str> = list
+                        .iter()
+                        .filter(|a| a.uid == dd.uid && a.name != dd.name)
+                        .map(|a| a.name.as_str())
+                        .collect();
+                    if !sharing.is_empty() {
+                        warnings.push(format!(
+                            "uid {} is {DATADOG_ACCOUNT}'s and also {}'s: nftables matches the uid, \
+                             so their traffic is let out too",
+                            dd.uid,
+                            sharing.join(", ")
+                        ));
+                    }
+                    owners.push((
+                        dd.uid,
+                        Origin::Mandatory(format!(
+                            "everything the DataDog agent ({DATADOG_ACCOUNT}, uid {}) sends: \
+                             monitoring is never cut by a containment",
+                            dd.uid
+                        )),
+                    ));
+                }
+            }
+        }
+    }
+
     for d in declared {
         allows.push(d.clone());
     }
 
     warnings.push(
         "egress containment stops this host reaching anything not listed above. Outbound \
-         updates, log shipping, backup agents, license checks and monitoring will all fail \
-         while it is armed"
+         updates, backup agents, license checks and any monitoring but the DataDog agent will \
+         all fail while it is armed"
             .into(),
     );
 
-    EgressPlan { allows, warnings }
+    EgressPlan { allows, owners, warnings, blocked }
+}
+
+pub const DIGEST_HEX: usize = 16;
+
+pub fn plan_digest(rendered: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(rendered.as_bytes()).iter().take(DIGEST_HEX / 2).map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn plan_matches(given: Option<&str>, planned: &str) -> Result<(), String> {
+    match given.map(str::trim) {
+        None => Err(format!(
+            "--arm needs --plan with the digest of the plan you read: the armed run plans again \
+             from the host, and loads only a plan you were shown. This one is {planned}"
+        )),
+        Some(g) if g.eq_ignore_ascii_case(planned) => Ok(()),
+        Some(g) => Err(format!(
+            "the plan built now is {planned}, not the {g} you were shown: the host changed since \
+             the dry run (a listener came or went, a declaration or a resolver changed). Nothing \
+             was changed. Read the plan above, and arm that one if it is what you want"
+        )),
+    }
 }
 
 pub fn resolvers() -> Vec<String> {
@@ -790,21 +908,23 @@ pub fn render_nft_with_egress(plan: &Plan, egress: Option<&EgressPlan>) -> Strin
     s.push_str("    ct state invalid drop\n");
     s.push_str("    meta l4proto icmp accept\n");
     s.push_str("    meta l4proto ipv6-icmp accept\n\n");
+    for (uid, origin) in &eg.owners {
+        s.push_str(&format!("    meta skuid {uid} accept  # {}\n", describe(origin)));
+    }
     for a in &eg.allows {
         let to = match &a.to {
             Some(cidr) if cidr.contains(':') => format!("ip6 daddr {cidr} "),
             Some(cidr) => format!("ip daddr {cidr} "),
             None => String::new(),
         };
-        let port = match a.port {
-            Some(p) if p != 0 => format!("dport {p} "),
-            _ => String::new(),
+
+        let what = match a.port {
+            None => format!("meta l4proto {}", a.proto.token()),
+
+            Some(0) => continue,
+            Some(p) => format!("{} dport {p}", a.proto.token()),
         };
-        s.push_str(&format!(
-            "    {to}{} {port}accept  # {}\n",
-            a.proto.token(),
-            describe(&a.origin)
-        ));
+        s.push_str(&format!("    {to}{what} accept  # {}\n", describe(&a.origin)));
     }
     s.push_str("  }\n}\n");
     s

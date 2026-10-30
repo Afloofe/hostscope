@@ -110,11 +110,17 @@ pub fn verify_signer(path: &str) -> (Trust, Option<String>) {
 
 #[cfg(target_os = "windows")]
 fn verify_full(path: &str) -> (Trust, i32, Option<i32>, Option<String>) {
-    let (embedded_status, embedded, signer) = verify_embedded(path);
+    let path = match crate::localpath::vet(path) {
+        Ok(Some((p, md))) if md.is_file() => p,
+        Ok(Some(_)) => return (Trust::Unknown("it is not a file".into()), 0, None, None),
+        Ok(None) => return (Trust::Unknown("there is no file at that path".into()), 0, None, None),
+        Err(why) => return (Trust::Unknown(format!("not opened for verification: {why}")), 0, None, None),
+    };
+    let (embedded_status, embedded, signer) = verify_embedded(&path);
     if !matches!(embedded, Trust::Unsigned) {
         return (embedded, embedded_status, None, signer);
     }
-    let (catalog_status, verdict, signer) = verify_catalog_verbose(path);
+    let (catalog_status, verdict, signer) = verify_catalog_verbose(&path);
     (verdict, embedded_status, Some(catalog_status), signer)
 }
 
@@ -226,7 +232,8 @@ fn verify_catalog_verbose(path: &str) -> (i32, Trust, Option<String>) {
         WTD_UI_NONE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
+        CreateFileW, GetFileType, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_TYPE_DISK,
+        OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     };
 
     let wide: Vec<u16> = path.encode_utf16().chain(core::iter::once(0)).collect();
@@ -238,12 +245,18 @@ fn verify_catalog_verbose(path: &str) -> (i32, Trust, Option<String>) {
             FILE_SHARE_READ,
             core::ptr::null(),
             OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
             core::ptr::null_mut(),
         )
     };
     if file == INVALID_HANDLE_VALUE {
         return (0, Trust::Unknown("the file could not be opened for catalog verification".into()), None);
+    }
+
+    if unsafe { GetFileType(file) } != FILE_TYPE_DISK {
+
+        unsafe { CloseHandle(file) };
+        return (0, Trust::Unknown("it opened as something other than a file on disk".into()), None);
     }
 
     let mut admin: isize = 0;

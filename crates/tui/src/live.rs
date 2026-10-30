@@ -21,13 +21,24 @@ impl Terminal {
     fn enter() -> io::Result<Self> {
         install_panic_hook();
         terminal::enable_raw_mode()?;
-        execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide, EnableMouseCapture)?;
+        execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
+
+        if mouse_enabled() {
+            execute!(io::stdout(), EnableMouseCapture)?;
+        }
         Ok(Terminal)
     }
 }
 
+fn mouse_enabled() -> bool {
+    std::env::var_os("HEMOSTAT_MOUSE").is_some()
+}
+
 fn restore() {
-    let _ = execute!(io::stdout(), DisableMouseCapture, cursor::Show, terminal::LeaveAlternateScreen);
+    if mouse_enabled() {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
+    let _ = execute!(io::stdout(), cursor::Show, terminal::LeaveAlternateScreen);
     let _ = terminal::disable_raw_mode();
 }
 

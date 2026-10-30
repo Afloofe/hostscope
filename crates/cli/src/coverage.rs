@@ -182,6 +182,20 @@ pub(crate) fn kwalk(r: &hemostat_sensor_linux::KwalkReport) -> Covered {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn kground(r: &hemostat_sensor_linux::KgroundReport) -> Covered {
+    use hemostat_sensor_linux::Coverage;
+    match r.coverage {
+        Coverage::Unreadable => Covered::NotAtAll(
+            r.reason.clone().unwrap_or_else(|| "the kernel task iterator could not run".into()),
+        ),
+        Coverage::Partial => Covered::InPart(
+            r.reason.clone().unwrap_or_else(|| "part of the cross-view did not run".into()),
+        ),
+        Coverage::Clean | Coverage::Populated | Coverage::NotPresent => Covered::Fully,
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn kernel_posture(r: &hemostat_sensor_linux::KernPostureReport) -> Covered {
     if r.privileged {
         Covered::Fully

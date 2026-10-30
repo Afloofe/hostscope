@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use hemostat_enforce_linux::anchor::{self, AnchorRef, Offer};
 use hemostat_enforce_linux::{ApplyOptions, Outcome, ProtectSet, RemovalAction};
 use hemostat_sensor_linux::triage::Severity;
@@ -38,12 +36,12 @@ pub(crate) fn suggestions(r: &hemostat_sensor_linux::trust::Report) -> Vec<Sugge
         .iter()
         .filter(|f| f.severity >= Severity::Warn && !f.subject.starts_with("TLS redirected") && f.subject != "store rebuild hook")
         .filter_map(|f| {
-            let fp = crate::trust_verb::fingerprint_in(&f.what)?;
+            let found = crate::trust_verb::anchor_for(r, f)?;
             Some(Suggestion {
                 severity: f.severity,
                 subject: f.subject.clone(),
                 locus: f.locus.clone(),
-                offer: anchor::offer_for(Path::new(&f.locus), &fp),
+                offer: found.and_then(anchor::offer_for_anchor),
             })
         })
         .collect()

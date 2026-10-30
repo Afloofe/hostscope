@@ -36,6 +36,123 @@ fn looks_executable(magic: Option<[u8; 4]>) -> bool {
 
 pub const MAX_ORDINARY_ZONE_BYTES: u64 = 4096;
 
+const MAX_COMMAND_PATH: usize = 1024;
+
+const MAX_COMMAND_STREAM: usize = 255;
+
+const MAX_COMMAND_RUN: usize = 16;
+
+const WHY_NOT_A_DRIVE: &str = "the path does not start at a drive letter, so a pasted command could resolve it somewhere else";
+const WHY_NETWORK: &str = "the path is on a network share, and reading it would connect to that host as you";
+const WHY_ENVIRONMENT: &str = "the path starts at an environment variable, which expands for the account the autostart runs as, not for you";
+const WHY_NAMESPACE: &str = r"the path carries a \\?\, \\.\ or \??\ prefix, which PowerShell does not resolve the way Windows does";
+const WHY_CHARACTER: &str = "a name holds a character a pasted command would not keep as itself — a quote-like or invisible \
+                             character, a control, unusual whitespace, or one of & | < > ^ % \" that cmd.exe acts on";
+const WHY_COLON: &str = "the path holds a colon after its drive, which PowerShell reads as naming a stream of its own";
+const WHY_TRAILING: &str = "a name ends in a dot or a space, which Windows drops when it resolves a path, so a command would \
+                            name a different file or stream";
+const WHY_WILDCARD: &str = "the stream name holds * ? [ ] or `, which -Stream matches as a wildcard pattern";
+const WHY_SEPARATOR: &str = "the stream name is empty or holds a path separator or a colon";
+const WHY_LONG: &str = "a name is too long to show as one command";
+const WHY_RUN: &str = "it would hold a run of one character long enough for the display to shorten it";
+const WHY_SPACES: &str = "a name holds two or more spaces in a row, which a wrapped display shows as one, so a copied \
+                          command would name a different file or stream";
+
+fn plain(c: char) -> bool {
+    match c {
+        ' ' => true,
+        '&' | '|' | '<' | '>' | '^' | '%' | '"' => false,
+        c if c.is_ascii() => c.is_ascii_graphic(),
+        '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' => false,
+        c => c.is_alphanumeric(),
+    }
+}
+
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn command_path(path: &str) -> Result<String, &'static str> {
+    let b = path.as_bytes();
+    let drive = b.first().is_some_and(u8::is_ascii_alphabetic)
+        && b.get(1) == Some(&b':')
+        && matches!(b.get(2), Some(b'\\' | b'/'));
+    if !drive {
+        return Err(if [r"\\?\", r"\\.\", r"\??\"].iter().any(|p| path.starts_with(p)) {
+            WHY_NAMESPACE
+        } else if path.starts_with(r"\\") || path.starts_with("//") {
+            WHY_NETWORK
+        } else if path.starts_with('%') {
+            WHY_ENVIRONMENT
+        } else {
+            WHY_NOT_A_DRIVE
+        });
+    }
+    if path.chars().count() > MAX_COMMAND_PATH {
+        return Err(WHY_LONG);
+    }
+    if !path.chars().all(plain) {
+        return Err(WHY_CHARACTER);
+    }
+    let rest = path.get(3..).unwrap_or_default();
+    if rest.contains(':') {
+        return Err(WHY_COLON);
+    }
+    if rest.split(['\\', '/']).any(|segment| segment.ends_with(['.', ' '])) {
+        return Err(WHY_TRAILING);
+    }
+    if path.contains("  ") {
+        return Err(WHY_SPACES);
+    }
+    Ok(ps_quote(path))
+}
+
+fn command_stream(stream: &str) -> Result<String, &'static str> {
+    if stream.is_empty() || stream.contains(['\\', '/', ':']) {
+        return Err(WHY_SEPARATOR);
+    }
+    if stream.chars().count() > MAX_COMMAND_STREAM {
+        return Err(WHY_LONG);
+    }
+    if !stream.chars().all(plain) {
+        return Err(WHY_CHARACTER);
+    }
+    if stream.contains(['*', '?', '[', ']', '`']) {
+        return Err(WHY_WILDCARD);
+    }
+    if stream.starts_with(' ') || stream.ends_with(['.', ' ']) {
+        return Err(WHY_TRAILING);
+    }
+    if stream.contains("  ") {
+        return Err(WHY_SPACES);
+    }
+    Ok(ps_quote(stream))
+}
+
+fn longest_run(s: &str) -> usize {
+    let (mut best, mut run, mut prev) = (0, 0, None);
+    for c in s.chars() {
+        run = if prev == Some(c) { run + 1 } else { 1 };
+        prev = Some(c);
+        best = best.max(run);
+    }
+    best
+}
+
+fn stream_fix(path: &str, stream: &str, lead: &str, commands: impl FnOnce(&str, &str) -> String) -> String {
+    let offered = command_path(path).and_then(|p| Ok((p, command_stream(stream)?))).and_then(|(p, n)| {
+        let text = commands(&p, &n);
+        if longest_run(&text) > MAX_COMMAND_RUN {
+            Err(WHY_RUN)
+        } else {
+            Ok(text)
+        }
+    });
+    offered.unwrap_or_else(|why| {
+        format!("{lead} by hand. No command is offered, because {why}. The file is {path:?} and the stream {stream:?}")
+    })
+}
+
 pub fn judge(s: &Stream) -> Option<Finding> {
 
     if s.name.is_empty() {
@@ -57,7 +174,9 @@ pub fn judge(s: &Stream) -> Option<Finding> {
                   unchecked, not clean, and an attacker hiding a payload has every reason to \
                   make it unreadable"
                 .into(),
-            fix: Some(format!("read it as an administrator: `Get-Item -Path '{}' -Stream '{}'`", s.path, s.name)),
+            fix: Some(stream_fix(&s.path, &s.name, "read it as an administrator", |p, n| {
+                format!("read it as an administrator: `Get-Item -Stream {n} -LiteralPath {p}`")
+            })),
         });
     }
 
@@ -73,11 +192,12 @@ pub fn judge(s: &Stream) -> Option<Finding> {
                   listing, does not change the file's displayed size, and can be launched \
                   directly by path. It is a hiding place, and nothing benign uses it this way"
                 .into(),
-            fix: Some(format!(
-                "read it before deleting it — `Get-Content -Path '{}' -Stream '{}' -Raw` — then \
-                 remove it with `Remove-Item -Path '{}' -Stream '{}'`",
-                s.path, s.name, s.path, s.name
-            )),
+            fix: Some(stream_fix(&s.path, &s.name, "read it before deleting it, then remove it", |p, n| {
+                format!(
+                    "read it before deleting it — `Get-Content -Stream {n} -LiteralPath {p} -Raw` — then \
+                     remove it with `Remove-Item -Stream {n} -LiteralPath {p}`"
+                )
+            })),
         });
     }
 
@@ -96,10 +216,9 @@ pub fn judge(s: &Stream) -> Option<Finding> {
             why: "the names the OS writes are the names tools skip on sight, which is exactly \
                   why something hiding data picks one. The size no longer matches the name"
                 .into(),
-            fix: Some(format!(
-                "look at the content: `Get-Content -Path '{}' -Stream '{}' -Raw`",
-                s.path, s.name
-            )),
+            fix: Some(stream_fix(&s.path, &s.name, "look at the content", |p, n| {
+                format!("look at the content: `Get-Content -Stream {n} -LiteralPath {p} -Raw`")
+            })),
         });
     }
 
@@ -111,10 +230,9 @@ pub fn judge(s: &Stream) -> Option<Finding> {
         why: "content in a named stream is invisible to a directory listing and to any tool \
               that reads the file by path alone"
             .into(),
-        fix: Some(format!(
-            "`Get-Content -Path '{}' -Stream '{}' -Raw` shows it without executing it",
-            s.path, s.name
-        )),
+        fix: Some(stream_fix(&s.path, &s.name, "look at it without executing it", |p, n| {
+            format!("`Get-Content -Stream {n} -LiteralPath {p} -Raw` shows it without executing it")
+        })),
     })
 }
 
@@ -219,10 +337,16 @@ pub fn judge_autostart(locus: &str, name: &str, command: &str) -> Option<Finding
               the file's size, and a sweep that reads the path sees an ordinary file. Nothing \
               legitimate starts itself from one; the stream is the hiding place"
             .into(),
-        fix: Some(format!(
-            "capture it before anything else — `Get-Content -Path '{file}' -Stream '{stream}' \
-             -Raw` — then remove the autostart, then the stream with `Remove-Item -Path '{file}' \
-             -Stream '{stream}'`"
+        fix: Some(stream_fix(
+            &file,
+            &stream,
+            "capture it before anything else, then remove the autostart, then the stream",
+            |p, n| {
+                format!(
+                    "capture it before anything else — `Get-Content -Stream {n} -LiteralPath {p} -Raw` — \
+                     then remove the autostart, then the stream with `Remove-Item -Stream {n} -LiteralPath {p}`"
+                )
+            },
         )),
     })
 }

@@ -558,11 +558,17 @@ pub(crate) fn print_modules(json: bool) -> u8 {
             .map(|(e, why)| format!("{{\"expected\":{e},\"why\":{}}}", json_str(why)))
             .collect::<Vec<_>>()
             .join(",");
+        let unread = w
+            .unread
+            .iter()
+            .map(|(why, n)| format!("{{\"why\":{},\"mappings\":{n}}}", json_str(why)))
+            .collect::<Vec<_>>()
+            .join(",");
         jprintln!(
             "{{\"processes_inspected\":{},\"processes_unopened\":{},\
              \"processes_refused_expected\":{expected},\"processes_unopened_unexpected\":{unexpected},\
-             \"unopened\":[{unopened}],\"files_read\":{},\"files_cached\":{},\"complete\":{},\
-             \"findings\":[{}]}}",
+             \"unopened\":[{unopened}],\"files_read\":{},\"files_cached\":{},\"files_unread\":[{unread}],\
+             \"complete\":{},\"findings\":[{}]}}",
             w.inspected,
             w.unopened.len(),
             w.reads,
@@ -588,6 +594,22 @@ pub(crate) fn print_modules(json: bool) -> u8 {
          from that read",
         w.reads, w.hits
     );
+
+    if !w.unread.is_empty() {
+        const SHOWN: usize = 20;
+        let mappings: usize = w.unread.iter().map(|(_, n)| n).sum();
+        println!(
+            "  {mappings} mapping(s) were NOT read for what built them — only a file the kernel \n  \
+             maps from a local fixed drive is opened. Their toolchain is unexamined; the path \n  \
+             rules still judged them:"
+        );
+        for (why, n) in w.unread.iter().take(SHOWN) {
+            println!("      {} ({n} mapping(s))", h(why));
+        }
+        if w.unread.len() > SHOWN {
+            println!("      … and {} more reason(s); --json lists every one", w.unread.len() - SHOWN);
+        }
+    }
 
     if expected > 0 {
         println!(
@@ -631,6 +653,8 @@ pub(crate) struct ModulesSweep {
 
     reads: usize,
     hits: usize,
+
+    unread: Vec<(String, usize)>,
 }
 
 #[cfg(target_os = "windows")]
@@ -655,7 +679,7 @@ pub(crate) fn modules_sweep() -> ModulesSweep {
                 inspected += 1;
                 for m in mods {
 
-                    let ident = cache.identify(&m.path);
+                    let ident = cache.identify(&m);
                     if let Some(f) = modules::judge(&m, ident.as_ref()) {
                         findings.push(f);
                     }
@@ -669,7 +693,15 @@ pub(crate) fn modules_sweep() -> ModulesSweep {
             }
         }
     }
-    ModulesSweep { findings, unopened, inspected, debug_priv, reads: cache.reads, hits: cache.hits }
+    ModulesSweep {
+        findings,
+        unopened,
+        inspected,
+        debug_priv,
+        reads: cache.reads,
+        hits: cache.hits,
+        unread: cache.unread.into_iter().collect(),
+    }
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -1145,7 +1177,9 @@ pub(crate) fn print_signature(json: bool, paths: &[String]) -> u8 {
 
     let mut any_unknown = false;
     for path in paths {
-        let (trust, embedded, catalog) = ac::verify_verbose(path);
+
+        let full = std::path::absolute(path).map_or_else(|_| path.clone(), |p| p.to_string_lossy().into_owned());
+        let (trust, embedded, catalog) = ac::verify_verbose(&full);
         if matches!(trust, ac::Trust::Unknown(_)) {
             any_unknown = true;
         }
@@ -1160,6 +1194,10 @@ pub(crate) fn print_signature(json: bool, paths: &[String]) -> u8 {
             println!("{:<12} {}", trust.token(), h(path));
 
             match (catalog, &trust) {
+
+                (None, ac::Trust::Unknown(_)) if embedded == 0 => {
+                    println!("             not verified: Authenticode was not asked about it")
+                }
                 (None, _) => println!("             embedded signature, status {embedded:#x}"),
 
                 (Some(_), ac::Trust::Unsigned) => println!(

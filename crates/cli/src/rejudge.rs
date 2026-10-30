@@ -426,10 +426,12 @@ pub(crate) fn host_facts(h: HostFlows) -> Facts {
 pub(crate) fn flow_report(r: &crate::collector::Report) -> FlowReport {
     use crate::collector::Grade;
     let c = &r.clock;
-    let clock = match c.floor {
-        Some(f) if c.violated() => format!("the agreed flows put box − host at {f:+} s or more, OVER THE ±{} s bound: no CONTRADICTION is called", c.skew),
-        Some(f) => format!("the agreed flows put box − host at {f:+} s or more, within the ±{} s bound", c.skew),
-        None => format!("no agreed TCP flow to check the ±{} s bound with", c.skew),
+    let clock = match (c.unmeasured.as_deref(), c.floor) {
+
+        (Some(why), _) => format!("the clocks are NOT MEASURED: {why}. No CONTRADICTION is called"),
+        (None, Some(f)) if c.violated() => format!("the agreed flows put box − host at {f:+} s or more, OVER THE ±{} s bound: no CONTRADICTION is called", c.skew),
+        (None, Some(f)) => format!("the agreed flows put box − host at {f:+} s or more, within the ±{} s bound", c.skew),
+        (None, None) => format!("no agreed TCP flow to check the ±{} s bound with", c.skew),
     };
     FlowReport {
         host_on_fw: r.host_on_fw.clone(),

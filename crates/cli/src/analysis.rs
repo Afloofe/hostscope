@@ -202,7 +202,7 @@ pub(crate) fn print_correlate(json: bool) -> u8 {
     for (source, fs) in [
         ("rootkit", hemostat_sensor_linux::rootkit_report().findings),
         ("suid", hemostat_sensor_linux::suid::report().findings),
-        ("inventory", hemostat_sensor_linux::inventory::report_with(crate::vendor::manifest_for("correlate").as_deref()).findings),
+        ("inventory", crate::vendor::inventory().0.findings),
         ("watchdog", hemostat_sensor_linux::watchdog::report().findings),
     ] {
         for f in &fs {
@@ -398,7 +398,9 @@ pub(crate) fn print_detect(json: bool, rules_dir: Option<&str>, watch: Option<u6
 
     let input = collect_events_for_detection();
     let events = &input.events;
-    let complete = detect_complete(set.complete(), &unreadable, events.len(), &input.gaps);
+
+    let complete = detect_complete(set.complete_over(events), &unreadable, events.len(), &input.gaps);
+    let cut = hemostat_detect::truncated_events(events);
 
     let mut available: Vec<String> = Vec::new();
     for e in events {
@@ -418,11 +420,12 @@ pub(crate) fn print_detect(json: bool, rules_dir: Option<&str>, watch: Option<u6
             .iter()
             .map(|h| {
                 format!(
-                    "{{\"level\":\"{}\",\"title\":{},\"id\":{},\"seq\":{},\"from\":{},\"event\":{}}}",
+                    "{{\"level\":\"{}\",\"title\":{},\"id\":{},\"seq\":{},\"truncated\":{},\"from\":{},\"event\":{}}}",
                     h.level.token(),
                     json_str(&h.title),
                     h.id.as_ref().map_or("null".into(), |i| json_str(i)),
                     h.seq,
+                    h.truncated,
                     input.about(h.seq).map_or("null".into(), json_str),
                     input.event(h.seq).map_or("null".into(), event_json)
                 )
@@ -456,12 +459,13 @@ pub(crate) fn print_detect(json: bool, rules_dir: Option<&str>, watch: Option<u6
             })
             .collect();
         jprintln!(
-            "{{\"evaluated\":{},\"not_evaluated\":{},\"events\":{},\"complete\":{},\
+            "{{\"evaluated\":{},\"not_evaluated\":{},\"events\":{},\"truncated_events\":{},\"complete\":{},\
               \"sources\":{},\"source_gaps\":[{}],\
               \"hits\":[{}],\"rejected\":[{}],\"unknown_fields\":[{}],\"inapplicable\":[{}]}}",
             set.rules.len(),
             set.rejected.len(),
             events.len(),
+            cut,
             complete,
             input.sources_json,
             input.gaps.iter().map(|g| json_str(g)).collect::<Vec<_>>().join(","),
@@ -482,7 +486,7 @@ pub(crate) fn print_detect(json: bool, rules_dir: Option<&str>, watch: Option<u6
     }
 
     println!("detect — Sigma rules over what this agent can see\n");
-    println!("  {}", h(&set.coverage()));
+    println!("  {}", h(&set.coverage_over(events)));
     println!("  {} event(s) evaluated against them", events.len());
     for n in &input.notes {
         println!("  {}", h(n));
@@ -526,6 +530,13 @@ pub(crate) fn print_detect(json: bool, rules_dir: Option<&str>, watch: Option<u6
         }
         if let Some(e) = input.event(hit.seq) {
             println!("      {}", h(&event_line(e)));
+        }
+        if hit.truncated {
+            println!(
+                "      a field of this event was over {} bytes and was cut: its head and tail were \
+                 evaluated, not its middle",
+                hs_core::MAX_FIELD_BYTES
+            );
         }
     }
     if hits.is_empty() && !events.is_empty() {

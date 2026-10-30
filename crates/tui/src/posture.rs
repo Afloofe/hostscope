@@ -96,7 +96,7 @@ pub(crate) fn render_view(model: &PostureModel, area: Rect, buf: &mut Buffer, ke
     let mut y = area.y;
 
     let title = format!(
-        " HEMOSTAT {} · variant {} ",
+        " Mahoraga {} · variant {} ",
         sanitize(&model.version).text,
         sanitize(&model.variant).text
     );

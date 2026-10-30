@@ -234,6 +234,65 @@ pub(crate) fn print_kwalk(json: bool) -> u8 {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn print_kground(json: bool) -> u8 {
+    let r = hemostat_sensor_linux::kground_report();
+    let code = crate::coverage::kground(&r).exit_code();
+
+    if json {
+        let f = r.findings.iter().map(|f| triage_row(f)).collect::<Vec<_>>().join(",");
+        jprintln!(
+            "{{\"coverage\":\"{}\",\"reason\":\"{}\",\"tasks_walked\":{},\"processes_walked\":{},\
+             \"procfs_processes\":{},\"hidden\":{},\"findings\":[{f}]}}",
+            r.coverage.token(),
+            jesc(r.reason.as_deref().unwrap_or("")),
+            r.tasks_walked,
+            r.processes_walked,
+            r.procfs_processes,
+            r.hidden.len(),
+        );
+        return code;
+    }
+
+    if matches!(r.coverage, hemostat_sensor_linux::Coverage::Unreadable) {
+        println!("kernel task ground-truth cross-view: DID NOT RUN");
+        println!("  {}", h(r.reason.as_deref().unwrap_or("the kernel task iterator could not run")));
+        println!(
+            "\nRun as root on a host with CONFIG_DEBUG_INFO_BTF and a kernel >= 5.8 (bpf_iter/task)."
+        );
+        return code;
+    }
+    println!(
+        "kernel task ground-truth cross-view: {} finding(s)  ({} processes from the kernel's \
+         iterator, {} listed by /proc)",
+        r.findings.len(),
+        r.processes_walked,
+        r.procfs_processes,
+    );
+    if r.findings.is_empty() {
+        println!(
+            "  the kernel's task set agrees with /proc — no process the kernel runs is hidden \
+             from a directory read."
+        );
+    }
+    if let Some(reason) = &r.reason {
+        println!("  NOT A WHOLE SWEEP — {}", h(reason));
+    }
+    for f in &r.findings {
+        println!("  [{}] {} — {}", f.severity.tag(), h(&f.subject), h(&f.locus));
+        println!("      {}", h(&f.what));
+        if !f.why.is_empty() {
+            println!("      why: {}", h(&f.why));
+        }
+    }
+    println!(
+        "\nThe task set from the kernel's own bpf_iter/task, below the /proc view a getdents or\n\
+         DKOM rootkit manipulates. A process the kernel schedules that /proc does not list is\n\
+         hidden; this is the kernel-level ground truth kwalk's /proc/kcore walk cannot guarantee."
+    );
+    code
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn print_kernposture(json: bool) {
     use hemostat_sensor_linux::TriageSeverity;
     let r = hemostat_sensor_linux::kernposture_report();

@@ -150,7 +150,7 @@ pub fn read_proc(path: &Path, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
     read_bounded(fs::File::open(path)?, cap)
 }
 
-fn read_bounded(mut r: impl std::io::Read, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
+pub(crate) fn read_bounded(mut r: impl std::io::Read, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
     let limit = usize::try_from(cap).unwrap_or(usize::MAX).saturating_add(1);
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0_u8; 64 * 1024];

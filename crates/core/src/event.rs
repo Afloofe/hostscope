@@ -5,6 +5,8 @@ use core::fmt;
 
 pub const MAX_FIELD_BYTES: usize = 8 * 1024;
 
+pub const CUT_MARK: &str = "\u{2026}";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldName(&'static str);
 
@@ -126,11 +128,7 @@ impl FieldMap {
         let value = match value {
             FieldValue::Str(s) if s.len() > MAX_FIELD_BYTES => {
                 self.truncated = true;
-                let mut end = MAX_FIELD_BYTES;
-                while end > 0 && !s.is_char_boundary(end) {
-                    end -= 1;
-                }
-                FieldValue::Str(s[..end].to_string())
+                FieldValue::Str(head_and_tail(&s))
             }
             other => other,
         };
@@ -162,6 +160,24 @@ impl FieldMap {
     pub fn iter(&self) -> impl Iterator<Item = &(FieldName, FieldValue)> {
         self.entries.iter()
     }
+}
+
+fn head_and_tail(s: &str) -> String {
+    let room = MAX_FIELD_BYTES - CUT_MARK.len();
+    let mut head = room / 2;
+    while head > 0 && !s.is_char_boundary(head) {
+        head -= 1;
+    }
+
+    let mut tail = s.len().saturating_sub(room - head);
+    while tail < s.len() && !s.is_char_boundary(tail) {
+        tail += 1;
+    }
+    let mut out = String::with_capacity(MAX_FIELD_BYTES);
+    out.push_str(s.get(..head).unwrap_or_default());
+    out.push_str(CUT_MARK);
+    out.push_str(s.get(tail..).unwrap_or_default());
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

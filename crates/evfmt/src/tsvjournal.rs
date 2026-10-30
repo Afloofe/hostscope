@@ -1,21 +1,21 @@
 use std::path::{Path, PathBuf};
 
-pub fn unique_path(dir: &Path, stem: &str) -> PathBuf {
+pub fn unique_path(dir: &Path, stem: &str) -> Option<PathBuf> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    unique_path_at(dir, stem, stamp)
+}
+
+fn unique_path_at(dir: &Path, stem: &str, stamp: u64) -> Option<PathBuf> {
+
+    let free = |p: &Path| std::fs::symlink_metadata(p).is_err();
     let first = dir.join(format!("{stem}-{stamp}.tsv"));
-    if !first.exists() {
-        return first;
+    if free(&first) {
+        return Some(first);
     }
 
-    for n in 1..1000 {
-        let p = dir.join(format!("{stem}-{stamp}-{n}.tsv"));
-        if !p.exists() {
-            return p;
-        }
-    }
-    dir.join(format!("{stem}-{stamp}-full.tsv"))
+    (1..1000).map(|n| dir.join(format!("{stem}-{stamp}-{n}.tsv"))).find(|p| free(p))
 }
 
 pub fn esc(s: &str) -> String {
@@ -94,15 +94,24 @@ pub fn records<'a>(
 }
 
 pub struct Appender {
-    path: PathBuf,
+    dir: PathBuf,
+    stem: &'static str,
     header: &'static str,
+
+    path: PathBuf,
+
+    named: bool,
     file: Option<std::fs::File>,
 }
 
 impl Appender {
 
-    pub fn new(path: PathBuf, header: &'static str) -> Self {
-        Appender { path, header, file: None }
+    pub fn new(dir: &Path, stem: &'static str, header: &'static str) -> Self {
+        let (path, named) = match unique_path(dir, stem) {
+            Some(p) => (p, true),
+            None => (dir.join(format!("{stem}.tsv")), false),
+        };
+        Appender { dir: dir.to_path_buf(), stem, header, path, named, file: None }
     }
 
     pub fn path(&self) -> &Path {
@@ -116,13 +125,8 @@ impl Appender {
     pub fn append(&mut self, line: &str) -> std::io::Result<()> {
         use std::io::Write as _;
         if self.file.is_none() {
-            if let Some(parent) = self.path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)?;
+            std::fs::create_dir_all(&self.dir)?;
+            let mut f = self.create()?;
             writeln!(f, "{}", self.header)?;
             self.file = Some(f);
         }
@@ -132,5 +136,31 @@ impl Appender {
         f.write_all(line.as_bytes())?;
         f.flush()?;
         f.sync_data()
+    }
+
+    fn create(&mut self) -> std::io::Result<std::fs::File> {
+        if !self.named {
+            self.path = unique_path(&self.dir, self.stem).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free journal name")
+            })?;
+            self.named = true;
+        }
+        let mut taken = None;
+        for _ in 0..16 {
+            match crate::disk::create_new_file(&self.path) {
+                Ok(f) => return Ok(f),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    taken = Some(e);
+                    match unique_path(&self.dir, self.stem) {
+                        Some(next) => self.path = next,
+                        None => break,
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(taken.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free journal name")
+        }))
     }
 }

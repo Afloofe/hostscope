@@ -567,22 +567,32 @@ fn runs_what_it_downloaded(c: &str) -> Option<String> {
 }
 
 pub fn suspicion(command: &str) -> Option<String> {
-    let c = command.to_lowercase();
+    suspicion_at(&command.to_lowercase(), command, 0)
+}
+
+const MAX_EVAL_DEPTH: usize = 8;
+
+const TOO_DEEP: &str = "nests eval on a command substitution more than eight levels deep, which no shell init \
+                        does; what it evaluates past that depth was not read";
+
+const _: () = assert!(MAX_EVAL_DEPTH == 8);
+
+fn suspicion_at(c: &str, command: &str, depth: usize) -> Option<String> {
 
     let fetchers = ["curl ", "wget ", "fetch ", "ftp "];
     if fetchers.iter().any(|f| c.contains(f)) {
-        if piped_into_a_program(&c, |s| fetchers.iter().any(|f| s.contains(f))) {
+        if piped_into_a_program(c, |s| fetchers.iter().any(|f| s.contains(f))) {
             return Some("fetches from the network and pipes the result to a shell".into());
         }
-        if SHELLS.iter().any(|t| tool_flag(&c, t, "-c"))
-            && substitution_bodies(&c).iter().any(|b| fetchers.iter().any(|f| b.contains(f)))
+        if SHELLS.iter().any(|t| tool_flag(c, t, "-c"))
+            && substitution_bodies(c).iter().any(|b| fetchers.iter().any(|f| b.contains(f)))
         {
             return Some("fetches from the network and hands the result to a shell to run".into());
         }
-        if download_substituted_into_a_runner(&c, &fetchers) {
+        if download_substituted_into_a_runner(c, &fetchers) {
             return Some("fetches from the network and hands the result to a shell to run".into());
         }
-        if let Some(why) = runs_what_it_downloaded(&c) {
+        if let Some(why) = runs_what_it_downloaded(c) {
             return Some(why);
         }
     }
@@ -592,8 +602,16 @@ pub fn suspicion(command: &str) -> Option<String> {
     }
 
     if c.contains("eval") {
-        for body in substitution_bodies(&c) {
-            if let Some(why) = suspicion(&body) {
+        let bodies = substitution_bodies(c);
+        if depth >= MAX_EVAL_DEPTH && !bodies.is_empty() {
+            return Some(TOO_DEEP.into());
+        }
+        for body in bodies {
+            if let Some(why) = suspicion_at(&body, &body, depth + 1) {
+
+                if why == TOO_DEEP {
+                    return Some(why);
+                }
                 return Some(format!("evaluates a dynamically-built string that {why}"));
             }
         }
@@ -603,23 +621,23 @@ pub fn suspicion(command: &str) -> Option<String> {
         return Some("opens a raw network connection through bash's /dev/tcp".into());
     }
 
-    if NETCATS.iter().any(|t| invokes_tool(&c, t))
-        && (has_flag(&c, "-e")
-            || hands_connection_to_a_command(&c)
+    if NETCATS.iter().any(|t| invokes_tool(c, t))
+        && (has_flag(c, "-e")
+            || hands_connection_to_a_command(c)
             || c.contains("mkfifo")
             || netcat_shell_flag(command)
-            || piped_into_a_program(&c, |s| NETCATS.iter().any(|t| invokes_tool(s, t))))
+            || piped_into_a_program(c, |s| NETCATS.iter().any(|t| invokes_tool(s, t))))
     {
         return Some("wires a network connection to a command — a shell handler shape".into());
     }
-    if SHELLS.iter().any(|t| tool_flag(&c, t, "-i")) {
+    if SHELLS.iter().any(|t| tool_flag(c, t, "-i")) {
         return Some("starts an interactive shell from a non-interactive context".into());
     }
 
-    let primed = loads_code_from_environment(&c);
+    let primed = loads_code_from_environment(c);
     for (name, flag) in [("python", "-c"), ("perl", "-e"), ("ruby", "-e"), ("php", "-r")] {
-        if tool_flag_versioned(&c, name, flag) {
-            let programs = inline_programs(&c, name, flag);
+        if tool_flag_versioned(c, name, flag) {
+            let programs = inline_programs(c, name, flag);
             if primed
                 || programs.is_empty()
                 || !programs.iter().all(|p| p.is_some_and(only_sleeps))
@@ -629,11 +647,11 @@ pub fn suspicion(command: &str) -> Option<String> {
         }
     }
 
-    if let Some(dir) = arg_under_world_writable(&c) {
+    if let Some(dir) = arg_under_world_writable(c) {
         return Some(format!("runs something from {dir}, which any local user can write"));
     }
 
-    if hidden_under_system_dir(&c) {
+    if hidden_under_system_dir(c) {
         return Some(
             "references a hidden path under a system directory — packaged software does not hide its files there"
                 .into(),

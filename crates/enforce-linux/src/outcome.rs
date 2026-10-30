@@ -64,6 +64,8 @@ pub enum ProtectReason {
 
     OperatorDeclared,
 
+    OutOfScopeAccount,
+
     DeclarationsUnreadable,
 
     InfrastructureProcess,
@@ -111,6 +113,13 @@ impl ProtectReason {
             ProtectReason::OperatorDeclared => {
                 "the operator declared it off-limits for this host — `--protect`, or a line \
                  in /etc/hemostat/protect or /etc/hemostat/critical"
+            }
+            ProtectReason::OutOfScopeAccount => {
+                "it is an account HEMOSTAT never changes on any host: the white team's own \
+                 login (whiteteam keeps its access at all times) or one of the DataDog \
+                 agent's (dd-agent, ddagentuser, datadog), which are out of scope. No flag or \
+                 declaration clears this — if it really must change, a person changes it by \
+                 hand"
             }
             ProtectReason::InfrastructureProcess => {
                 "it is an HA daemon, a backup agent or an EDR (design §11.9.2). Killing a \
@@ -186,6 +195,17 @@ pub enum UndoKind {
         path: PathBuf,
     },
 
+    RemoveNftAllow {
+
+        family: String,
+
+        table: String,
+
+        chain: String,
+
+        comment: String,
+    },
+
     UnmountExecBlock {
 
         path: PathBuf,
@@ -258,6 +278,8 @@ pub enum UndoKind {
         user: String,
 
         shell: Option<String>,
+
+        was_locked: Option<bool>,
     },
 
     RemoveCreatedFile {
@@ -339,6 +361,7 @@ impl UndoKind {
             UndoKind::Nothing => "nothing",
             UndoKind::UnmountExecBlock { .. } => "unmount-exec-block",
             UndoKind::RemoveCanary { .. } => "remove-canary",
+            UndoKind::RemoveNftAllow { .. } => "remove-nft-allow",
             UndoKind::RestoreBootParams { .. } => "restore-boot-params",
             UndoKind::RejoinGroup { .. } => "rejoin-group",
             UndoKind::RestorePasswordAge { .. } => "restore-password-age",
@@ -347,7 +370,7 @@ impl UndoKind {
         }
     }
 
-    pub const ALL_TOKENS: [&'static str; 17] = [
+    pub const ALL_TOKENS: [&'static str; 18] = [
         "resume-process",
         "unmask-service",
         "restore-file",
@@ -363,6 +386,7 @@ impl UndoKind {
         "unmount-exec-block",
         "restore-boot-params",
         "remove-canary",
+        "remove-nft-allow",
         "restore-stripped",
         "restore-anchor",
     ];

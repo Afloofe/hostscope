@@ -20,8 +20,14 @@ const WINDOWS_BASE: &str = r"C:\ProgramData\hemostat";
 pub(crate) fn private_dir(dir: &str) -> Result<(), String> {
     let base = Path::new(WINDOWS_BASE);
     let d = Path::new(dir);
-    if !base.exists() && (dir.eq_ignore_ascii_case(WINDOWS_BASE) || d.starts_with(base)) {
-        hemostat_sensor_win::acl::create_private_dir(WINDOWS_BASE)?;
+    if dir.eq_ignore_ascii_case(WINDOWS_BASE) || d.starts_with(base) {
+        crate::win_private::ensure_dir(base)?;
+        let mut at = base.to_path_buf();
+        for part in d.strip_prefix(base).map_or_else(|_| Vec::new(), |rest| rest.components().collect()) {
+            at.push(part);
+            crate::win_private::ensure_dir(&at)?;
+        }
+        return Ok(());
     }
     std::fs::create_dir_all(d).map_err(|e| format!("cannot create {dir}: {e}"))
 }

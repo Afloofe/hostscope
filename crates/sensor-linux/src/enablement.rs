@@ -387,7 +387,7 @@ fn recognise_own(units: &mut [UnitFact]) {
     }
 }
 
-fn other_init(comm: Option<&str>, exe: Option<&std::path::Path>, booted: bool) -> Option<String> {
+pub(crate) fn other_init(comm: Option<&str>, exe: Option<&std::path::Path>, booted: bool) -> Option<String> {
     let comm = comm.map(str::trim).filter(|c| !c.is_empty());
 
     let image = exe

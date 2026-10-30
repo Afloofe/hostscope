@@ -941,6 +941,7 @@ version = "0.1.0"
 name = "hemostat-cli"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
  "hemostat-broker",
  "hemostat-buildinfo",
  "hemostat-core",
@@ -980,6 +981,7 @@ dependencies = [
 name = "hemostat-enforce-linux"
 version = "0.1.0"
 dependencies = [
+ "hemostat-core",
  "hemostat-evcrypto",
  "hemostat-evfmt",
  "hemostat-lifecycle",
@@ -1061,6 +1063,7 @@ name = "hemostat-query"
 version = "0.1.0"
 dependencies = [
  "hemostat-core",
+ "libc",
 ]
 
 [[package]]
@@ -1126,6 +1129,20 @@ dependencies = [
  "crossterm",
  "hemostat-safestr",
  "ratatui-core",
+]
+
+[[package]]
+name = "hemostat-vm-init"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "hemostat-vm-wx-harness"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -2513,6 +2530,10 @@ dependencies = [
  "rand_core",
  "zeroize",
 ]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
 
 [[package]]
 name = "yara-x"

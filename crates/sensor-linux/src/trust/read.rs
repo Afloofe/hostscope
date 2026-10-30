@@ -11,7 +11,17 @@ const MAX_NSS_BYTES: u64 = 32 * 1024 * 1024;
 
 const MAX_DEPTH: usize = 6;
 
-#[derive(Debug, Default)]
+const MAX_SWEEP_BYTES: u64 = 256 * 1024 * 1024;
+
+const MAX_SIGHTINGS: usize = 65_536;
+
+const MAX_PROFILES: usize = 64;
+
+const MAX_REDIRECT_FILES: usize = 512;
+
+type Sighting = (String, PathBuf, Place, usize, usize, usize, Option<String>, Option<bool>, bool, Option<String>);
+
+#[derive(Debug)]
 pub(super) struct Found {
 
     pub(super) certs: BTreeMap<String, (Cert, Vec<Seen>)>,
@@ -25,14 +35,105 @@ pub(super) struct Found {
     pub(super) looked: usize,
 
     read: BTreeSet<String>,
+
+    sighted: BTreeSet<Sighting>,
+
+    inodes: BTreeMap<(u64, u64, Place), String>,
+
+    bytes: u64,
+    byte_budget: u64,
+
+    sightings: usize,
+    sighting_budget: usize,
+
+    spent: Option<(usize, usize, String)>,
+}
+
+impl Default for Found {
+    fn default() -> Self {
+        Found::within(MAX_SWEEP_BYTES, MAX_SIGHTINGS)
+    }
 }
 
 impl Found {
-    fn add(&mut self, cert: Cert, seen: Seen) {
-        let e = self.certs.entry(cert.sha256_hex()).or_insert_with(|| (cert, Vec::new()));
-        if !e.1.contains(&seen) {
-            e.1.push(seen);
+
+    fn within(bytes: u64, sightings: usize) -> Self {
+        Found {
+            certs: BTreeMap::new(),
+            unread: Vec::new(),
+            bundles: Vec::new(),
+            cut_short: Vec::new(),
+            looked: 0,
+            read: BTreeSet::new(),
+            sighted: BTreeSet::new(),
+            inodes: BTreeMap::new(),
+            bytes: 0,
+            byte_budget: bytes,
+            sightings: 0,
+            sighting_budget: sightings,
+            spent: None,
         }
+    }
+
+    fn add(&mut self, cert: Cert, seen: Seen) -> bool {
+        if self.sightings >= self.sighting_budget {
+            return false;
+        }
+        let fp = cert.sha256_hex();
+        let key: Sighting = (
+            fp.clone(),
+            seen.path.clone(),
+            seen.place,
+            seen.block,
+            seen.blocks,
+            seen.line,
+            seen.package.clone(),
+            seen.matches,
+            seen.selected,
+            seen.via.clone(),
+        );
+        if self.sighted.insert(key) {
+            self.sightings += 1;
+            self.certs.entry(fp).or_insert_with(|| (cert, Vec::new())).1.push(seen);
+        }
+        true
+    }
+
+    fn admit(&mut self, host: &str, len: u64) -> bool {
+        if self.bytes.saturating_add(len) <= self.byte_budget && self.sightings < self.sighting_budget {
+            return true;
+        }
+        let line = |n: usize, first: &str| {
+            format!(
+                "{n} file(s) not read, the first {first}: this sweep reads at most {} bytes and records at most {} \
+                 certificate sightings, and a store that size is not one a distribution makes",
+                self.byte_budget, self.sighting_budget
+            )
+        };
+        match self.spent.take() {
+            Some((at, n, first)) => {
+                let text = line(n + 1, &first);
+                if let Some(l) = self.unread.get_mut(at) {
+                    *l = text;
+                }
+                self.spent = Some((at, n + 1, first));
+            }
+            None => {
+                self.unread.push(line(1, host));
+                self.spent = Some((self.unread.len() - 1, 1, host.to_string()));
+            }
+        }
+        false
+    }
+
+    fn read_at(&self, md: &std::fs::Metadata, place: Place) -> Option<&str> {
+        use std::os::unix::fs::MetadataExt as _;
+        self.inodes.get(&(md.dev(), md.ino(), place)).map(String::as_str)
+    }
+
+    fn mark_read(&mut self, host: &str, md: &std::fs::Metadata, place: Place) {
+        use std::os::unix::fs::MetadataExt as _;
+        self.inodes.entry((md.dev(), md.ino(), place)).or_insert_with(|| host.to_string());
     }
 }
 
@@ -144,7 +245,19 @@ struct File<'a> {
 
 fn read_file(root: &Path, f: File<'_>, found: &mut Found) -> usize {
     let File { host, real, place, pkgs, selected, via } = f;
-    let bytes = match crate::saferead::read_bytes(&at(root, real), MAX_STORE_BYTES) {
+    let path = at(root, real);
+    let md = std::fs::metadata(&path).ok();
+    if let Some(md) = &md {
+
+        if place == Place::Redirect && found.read_at(md, place).is_some() {
+            return 0;
+        }
+
+        if md.len() <= MAX_STORE_BYTES && !found.admit(host, md.len()) {
+            return 0;
+        }
+    }
+    let bytes = match crate::saferead::read_bytes(&path, MAX_STORE_BYTES) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
         Err(e) => {
@@ -152,6 +265,10 @@ fn read_file(root: &Path, f: File<'_>, found: &mut Found) -> usize {
             return 0;
         }
     };
+    if let Some(md) = &md {
+        found.mark_read(host, md, place);
+    }
+    found.bytes = found.bytes.saturating_add(bytes.len() as u64);
     found.read.insert(real.to_string());
     let (certs, bad) = x509::certs_in(&bytes);
     if bad > 0 {
@@ -160,11 +277,12 @@ fn read_file(root: &Path, f: File<'_>, found: &mut Found) -> usize {
     let owner = pkgs.and_then(|p| p.judge(Path::new(host), &bytes));
     let n = certs.len();
     let mut ok = 0usize;
+    let mut dropped = 0usize;
     for (i, (pem, cert)) in certs.into_iter().enumerate() {
         match cert {
             Ok(c) => {
                 ok += 1;
-                found.add(
+                let recorded = found.add(
                     c,
                     Seen {
                         path: PathBuf::from(host),
@@ -178,11 +296,23 @@ fn read_file(root: &Path, f: File<'_>, found: &mut Found) -> usize {
                         via: via.clone(),
                     },
                 );
+                dropped += usize::from(!recorded);
             }
             Err(why) => found.unread.push(format!("{host}: certificate {} of {n} could not be read ({why})", i + 1)),
         }
     }
+    unrecorded(found, host, dropped);
     ok
+}
+
+fn unrecorded(found: &mut Found, host: &str, dropped: usize) {
+    if dropped > 0 {
+        found.unread.push(format!(
+            "{host}: {dropped} of its certificates were not recorded, so not judged: this sweep records at most {} \
+             certificate sightings",
+            found.sighting_budget
+        ));
+    }
 }
 
 pub(super) fn sources(root: &Path, pkgs: &dyn Packages, found: &mut Found) {
@@ -276,13 +406,28 @@ pub(super) fn nss(root: &Path, found: &mut Found) {
         if let Ok(rd) = std::fs::read_dir(at(root, &ff)) {
             let mut profiles: Vec<String> = rd.flatten().map(|e| format!("{ff}/{}/cert9.db", e.file_name().to_string_lossy())).collect();
             profiles.sort();
-            dbs.extend(profiles.into_iter().take(64));
+            if profiles.len() > MAX_PROFILES {
+                found.unread.push(format!("{ff}: more than {MAX_PROFILES} entries; the rest were not read"));
+            }
+            dbs.extend(profiles.into_iter().take(MAX_PROFILES));
         }
     }
     dbs.sort();
     dbs.dedup();
     for db in dbs {
-        let bytes = match crate::saferead::read_bytes(&at(root, &db), MAX_NSS_BYTES) {
+        let path = at(root, &db);
+        let md = std::fs::metadata(&path).ok();
+        if let Some(md) = &md {
+
+            if found.read_at(md, Place::Nss).is_some() {
+                found.looked += 1;
+                continue;
+            }
+            if md.len() <= MAX_NSS_BYTES && !found.admit(&db, md.len()) {
+                continue;
+            }
+        }
+        let bytes = match crate::saferead::read_bytes(&path, MAX_NSS_BYTES) {
             Ok(b) => b,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => continue,
             Err(e) => {
@@ -290,15 +435,22 @@ pub(super) fn nss(root: &Path, found: &mut Found) {
                 continue;
             }
         };
+        if let Some(md) = &md {
+            found.mark_read(&db, md, Place::Nss);
+        }
+        found.bytes = found.bytes.saturating_add(bytes.len() as u64);
         found.looked += 1;
         let certs = x509::scan_der(&bytes);
         let n = certs.len();
+        let mut dropped = 0usize;
         for (i, (_, c)) in certs.into_iter().enumerate() {
-            found.add(
+            let recorded = found.add(
                 c,
                 Seen { path: PathBuf::from(&db), place: Place::Nss, block: i, blocks: n, line: 0, package: None, matches: None, selected: true, via: None },
             );
+            dropped += usize::from(!recorded);
         }
+        unrecorded(found, &db, dropped);
     }
 }
 
@@ -306,11 +458,18 @@ pub(super) fn redirect_target(root: &Path, rd: &Redirect, found: &mut Found) {
     let host = rd.target.to_string_lossy().into_owned();
     let Some(real) = resolve(root, &host) else { return };
     let files: Vec<String> = if std::fs::metadata(at(root, &real)).is_ok_and(|m| m.is_dir()) {
-        let mut v: Vec<String> = std::fs::read_dir(at(root, &real))
-            .map(|rd| rd.flatten().map(|e| format!("{}/{}", real.trim_end_matches('/'), e.file_name().to_string_lossy())).collect())
-            .unwrap_or_default();
+        let mut v: Vec<String> = match std::fs::read_dir(at(root, &real)) {
+            Ok(rd) => rd.flatten().map(|e| format!("{}/{}", real.trim_end_matches('/'), e.file_name().to_string_lossy())).collect(),
+            Err(e) => {
+                found.unread.push(format!("{real}: not listed ({e})"));
+                Vec::new()
+            }
+        };
         v.sort();
-        v.truncate(512);
+        if v.len() > MAX_REDIRECT_FILES {
+            found.unread.push(format!("{real}: more than {MAX_REDIRECT_FILES} entries; the rest were not read"));
+            v.truncate(MAX_REDIRECT_FILES);
+        }
         v
     } else {
         vec![real]

@@ -72,6 +72,7 @@ pub const REGISTRY: &[VerbSpec] = &[
     v("ftrace-hooks", &["ftrace-hooks"], &[L], R, &[], &[]),
     v("kernel-posture", &["kernel-posture"], &[L], R, &[], &[]),
     v("kwalk", &["kwalk"], &[L], R, &[], &[]),
+    v("kground", &["kground"], &[L], R, &[], &[]),
     v("kmod", &["kmod"], &[L], R, &[], &[]),
     v("bpf-progs", &["bpf-progs"], &[L], R, &[], &[]),
     v("sysmap", &["sysmap"], &[L], R, &[], &[]),
@@ -79,6 +80,9 @@ pub const REGISTRY: &[VerbSpec] = &[
     v("crossview", &["crossview"], &[L], R, &[], &[]),
     v("ps", &["ps"], &[L], R, &[], &[]),
     v("firewall", &["firewall"], &[L], R, &[], &[]),
+    act("firewall --allow", &["firewall", "--allow"], &[L], &["mod-enf-net-ingress"], &[
+        pos("PORT", Typed, "the scored TCP port to open (additive accept at the top of the input chain)"),
+    ], "Opens a port the firewall is blocking so a listening scored service becomes reachable. Additive — it cannot lock anyone out; nftables only; `hemostat undo` removes the rule, matched by its mahoraga comment."),
     v("sysctl", &["sysctl"], &[L], R, &[], &[]),
     v("sshd", &["sshd"], &[L], R, &[], &[]),
     v("trust", &["trust"], &[L], R, &[], &[switch("--all", "every CA, the vendor-shipped ones too"), STORE]),
@@ -96,6 +100,20 @@ pub const REGISTRY: &[VerbSpec] = &[
     act("services --start", &["services", "--start"], &[L], &["mod-enf-persistence"], &[
         pos("UNIT", Live("unit"), "a declared service to enable and start"),
     ], "Only a service you declared (in /etc/hemostat/critical or with --service) can be started; `hemostat undo` restores its prior enabled/active state."),
+    act("services --restore", &["services", "--restore"], &[L], &["mod-enf-persistence"], &[
+        opt("--every", "SECS", SECS, "run as a watchdog: repeat the restore every SECS, keeping scored services up (dry without --arm)"),
+    ],
+        "Brings up every DOWN scored service this box owns per the IRSeC packet (needs HEMOSTAT_GOLDEN), each resolved to its installed unit — the uptime auto-recovery path. Names no unit: the roster is the packet's, not yours. A start counts only once the scored port answers; a unit already running with its port shut is left to you; a box it cannot check is NOT CHECKED (exit 7) — HEMOSTAT_ROLE=<role> names the role when the hostname does not. `hemostat undo` restores prior state."),
+    act("services --compose-up", &["services", "--compose-up"], &[L], &["mod-enf-persistence"], &[
+        pos_many("PROJECT", false, Typed, "the Compose projects to bring up, by the name `docker compose ls` gives them, or a compose file's path (none: list what is down and change nothing)"),
+    ],
+        "Brings up only the Docker Compose projects named here (grandstand's IRC after a `compose down`), each journaled; a project nobody named is never started, and the run is refused whole if any named one cannot be. `services --restore` restarts the daemon and restart-policy containers; this brings back a project removed from the daemon. Reversible with `compose down`."),
+    act("services --install-watchdog", &["services", "--install-watchdog"], &[L], &["mod-enf-persistence"], &[
+        opt("--every", "SECS", SECS, "the watchdog interval (default 30s)"),
+    ],
+        "Installs the uptime watchdog as a systemd service (mahoraga-watchdog.service, HEMOSTAT_GOLDEN=1 and the policy environment this view runs under, Restart=always) so it survives a reboot or a dropped console. Installing it IS the decision to auto-fix. Refuses a link or a different unit at the path; journaled. Remove with `services --uninstall-watchdog`."),
+    act("services --uninstall-watchdog", &["services", "--uninstall-watchdog"], &[L], &[], &[],
+        "Stops, disables and removes the uptime watchdog service; the scored services it kept up are left as they are. It is the way out of the auto-fix, so it is in every image, and it is reported done only once nothing of it is left."),
     v("vendor", &["vendor"], &[L, F], R, &[], &[MANIFEST, META]),
     v("allowlist", &["allowlist"], &[L], R, &[], &[opt("--check", "TARGET", Typed, "whether anything suppresses this target")]),
     v("query", &["query"], &[L], R, &["mod-query"], &[pos("SQL", Fixed(&[
@@ -110,6 +128,7 @@ pub const REGISTRY: &[VerbSpec] = &[
         opt("--rules", "DIR", Live("rules"), "a YARA feed you trust"),
     ]),
     v("export", &["export"], &[L], R, &[], &[pos_opt("FORMAT", Fixed(&["report", "jsonl", "stix", "misp"]), "the handover format (default report)")]),
+    v("brief", &["brief"], &[L, W], R, &[], &[]),
     v("drift", &["drift"], &[L, W, F], R, &[], &[STORE]),
 
     v("watch", &["watch"], &[L], Wa, &[], &[]),
@@ -146,7 +165,27 @@ pub const REGISTRY: &[VerbSpec] = &[
         OPERATOR_KEY,
         switch("--session-key-unknown", "say you cannot name the key your session came in on"),
         switch("--last-admin-key", "allow removing what may be the last admin key"),
-    ], "One line comes out of a shared file; the journal holds it, and `hemostat undo <journal>` (with --auth for a login file) puts it back."),
+    ], "One line comes out of a shared file; the journal holds it, and `hemostat undo <journal>` (with --auth for a login file) puts it back. A sudoers line naming whiteteam or a DataDog account, or someone that cannot be resolved, is refused."),
+    v("remediate --pam", &["remediate", "--pam"], &[L], R, &["mod-enf-persistence"], &[]),
+    v("remediate --log", &["remediate", "--log"], &[L], R, &["mod-enf-persistence"], &[]),
+    act("remediate --restore-pam", &["remediate", "--restore-pam"], &[L], &["mod-enf-persistence"], &[
+        pos("PATH", Live("path"), "the module path, from `remediate --pam`"),
+    ], "The distribution's stock module is written back atomically (owner, mode and SELinux label kept); the current file goes to the vault and `hemostat undo <journal>` restores it. Armed, a throwaway login is tried from an unprivileged account before and after the swap, with the right password and a wrong one; if it got in before and not after, or a wrong password is taken after but was refused before, the swap is rolled back."),
+
+    VerbSpec {
+        name: "remediate --seal-binaries",
+        argv: &["remediate", "--seal-binaries"],
+        platforms: &[L],
+        kind: Kind::Write,
+        needs: &["mod-enf-persistence"],
+        fields: &[switch("--replace", "re-seal over an existing vault (only if the binaries are still known-clean)")],
+        arm: None,
+        commit: None,
+        warn: "Copies this host's critical binaries (scored daemons + su/sudo/sshd/passwd) into /var/lib/hemostat/arrival-bin at arrival — the reliable offline source for a later restore, since the snapshot keeps only hashes and the package cache is usually empty. There is no dry run: Run seals at once, and with --replace overwrites the arrival copies. Read-only on the system; writes only the vault, and refuses a vault that is a link or not root's alone. One that is there and could not be sealed (not a regular file, over the size cap) is listed [skipped] and the run exits 7.",
+    },
+    act("remediate --restore-binary", &["remediate", "--restore-binary"], &[L], &["mod-enf-persistence"], &[
+        pos("PATH", Live("path"), "the absolute path of the tampered binary to restore"),
+    ], "Writes the arrival copy back over a tampered binary, atomically and attribute-preserving, after sha-verifying the sealed copy against its manifest (a tampered vault is refused). The current file goes to the vault and `hemostat undo <journal>` restores it."),
     VerbSpec {
         name: "network",
         argv: &["network"],
@@ -166,7 +205,7 @@ pub const REGISTRY: &[VerbSpec] = &[
             fixed: &["--block-pid", "--block-dest"],
             fixed_secs: 120,
         }),
-        warn: "The ruleset rolls itself back at the end of the window unless kept. Open a SECOND connection and check it works before [Keep].",
+        warn: "The ruleset rolls itself back at the end of the window unless kept. Open a SECOND connection and check it works before [Keep]. Refused, with nothing applied, if /var/lib/hemostat is a link or anyone but root can write it.",
     },
     change("network --confirm", &["network", "--confirm"], &[L], &[], &[], "Keeps an armed ruleset: its scheduled rollback will not fire."),
     change("network --revert", &["network", "--revert"], &[L], &[], &[], "Puts the ruleset saved before the arm back now."),
@@ -174,14 +213,52 @@ pub const REGISTRY: &[VerbSpec] = &[
         pos_opt("PATH", Live("path"), "the binary to stop starting again"),
         opt("--pid", "N", Live("pid"), "the binary this process runs"),
         switch("--lift", "remove a block instead"),
-    ], "The file is left byte-identical (a bind mount of /dev/null over it); the journal undoes it."),
+    ], "The file is left byte-identical (a bind mount of /dev/null over it); the journal undoes it. Refused for sshd, a listening process's binary, or anything a declared service starts."),
     act("account", &["account"], &[L], &["mod-enf-account"], &[
         pos("USER", Live("user"), "the account"),
         switch("--end-sessions", "end its sessions"),
         switch("--purge-tickets", "purge its Kerberos tickets"),
         switch("--expire-password", "expire its password"),
         opt("--drop-group", "GROUP", Live("group"), "take it out of this group"),
-    ], "Account changes are only ever made by you, here or at the CLI: no rule fires them. Name one of the four flags."),
+        switch("--lock", "lock it: disable password and key auth, shell to nologin (reversible)"),
+    ], "Account changes are only ever made by you, here or at the CLI: no rule fires them. Name one of the five flags. whiteteam and the DataDog accounts (dd-agent, ddagentuser, datadog) are always refused."),
+    act("account --disable", &["account", "--disable"], &[W], &["mod-enf-account"], &[
+        pos("USER", Live("user"), "the rogue local user to disable (reversible: net user /active:yes)"),
+    ], "Windows only: disables a rogue local user (net user /active:no). Refuses a protected (whiteteam/datadog) or built-in Windows account, the account this session runs as (by SID), and the last enabled administrator."),
+    act("kill", &["kill"], &[W], &["mod-enf-proc"], &[
+        opt("--pid", "N", Typed, "the PID to terminate"),
+        switch("--allow-listener", "it listens and it is the red team's (a bind shell); every other refusal still holds"),
+    ], "Windows: terminates a process. Refuses System/Idle, the critical Windows processes, a shared svchost, a scored service's image, DataDog, this session's own processes, one whose image cannot be read, and a listener unless --allow-listener. Irreversible — acquire it first if it is wanted as evidence."),
+    act("quarantine", &["quarantine"], &[W], &["mod-enf-file"], &[
+        pos("PATH", Live("path"), "the malicious file to move into the vault"),
+    ], "Windows: moves a file into the vault, reversible (it prints the command to move it back). Refuses a file under a system or program directory or DataDog's, judged where it really is, and anything but one regular file."),
+    act("remediate --remove-task", &["remediate", "--remove-task"], &[W], &["mod-enf-persistence"], &[
+        pos("NAME", Typed, "the rogue scheduled task to delete"),
+    ], "Windows: deletes a rogue scheduled task after exporting its XML to the vault (reversible: schtasks /create /xml). Refuses Microsoft/system tasks."),
+    act("remediate --remove-run", &["remediate", "--remove-run"], &[W], &["mod-enf-persistence"], &[
+        pos("NAME", Typed, "the rogue autostart Run value to delete (from `drift`)"),
+    ], "Windows: deletes a rogue HKLM/HKCU Run autostart value (reversible: its type and exact data are kept first in an admin-only .reg file, and `reg import` of that file is the undo; a value that cannot be kept exactly is not removed). Refuses a DataDog value."),
+    act("remediate --remove-wmi", &["remediate", "--remove-wmi"], &[W], &["mod-enf-persistence"], &[
+        pos("NAME", Typed, "the WMI event consumer to remove (from `wmi`)"),
+    ], "Windows: removes a permanent-WMI subscription from root\\subscription: the __EventConsumer named exactly NAME, the __FilterToConsumerBinding instances that reference it, and each bound __EventFilter no other binding uses. Killing the payload does not stop it re-firing; this does. Every property and the MOF of each object is written to the fix log first, and nothing is removed if that fails (WMI has no one-command undo). Refuses a NAME with a quote, backtick, $ or control character, and any object that mentions DataDog."),
+
+    VerbSpec {
+        name: "remediate --seal-binaries",
+        argv: &["remediate", "--seal-binaries"],
+        platforms: &[W],
+        kind: Kind::Write,
+        needs: &["mod-enf-persistence"],
+        fields: &[
+            pos_many("PATH", false, Live("path"), "extra binaries to seal beyond the present standalone scored-service exes"),
+            switch("--replace", "re-seal over an existing vault (only if the binaries are still known-clean)"),
+        ],
+        arm: None,
+        commit: None,
+        warn: "Windows: copies this host's present standalone scored-service binaries (DNS, Telnet, IIS, OpenSSH) and any extra PATHs into the admin-only %ProgramData%\\hemostat\\arrival-bin vault at arrival — the offline source for a later restore. There is no dry run: Run seals at once, and with --replace overwrites the arrival copies. Read-only on the system; writes only the vault, and refuses a vault directory it did not make admin-only.",
+    },
+    act("remediate --restore-binary", &["remediate", "--restore-binary"], &[W], &["mod-enf-persistence"], &[
+        pos("PATH", Live("path"), "the absolute path of the tampered binary to restore"),
+    ], "Windows: writes the arrival copy back over a tampered binary after sha-verifying the sealed copy against its manifest, and checking again that the vault is admin-only (a tampered or user-owned vault is refused). The tampered binary is renamed aside (kept, not deleted); restart the service to run the clean bytes."),
     v("harden-boot", &["harden-boot"], &[L], R, &[], &[]),
     act("harden-boot --set", &["harden-boot", "--set"], &[L], &["mod-harden-reboot"], &[
         pos("PARAM", Live("boot-param"), "a kernel parameter from the listing"),
@@ -214,7 +291,7 @@ pub const REGISTRY: &[VerbSpec] = &[
         switch("--persist", "also a supervisor that survives a reboot"),
     ], "Starts one sentinel per usable mechanism (transient units, runit); --persist makes one boot-persistent."),
 
-    v("fw rules", &["fw", "rules"], &[F], R, &[], &[STORE]),
+    v("fw rules", &["fw", "rules"], &[F], R, &[], &[MANIFEST, STORE]),
     v("fw flows", &["fw", "flows"], &[F], R, &[], &[
         MANIFEST,
         opt("--dst", "ADDR", Typed, "only flows to this address"),
@@ -247,16 +324,17 @@ pub const REGISTRY: &[VerbSpec] = &[
             marker: "hemostat fw confirm ",
             deadline: "--deadline",
             default_secs: 120,
-            keep: &["fw", "confirm"],
+            keep: &["fw", "confirm", "--arm"],
             revert: &["undo"],
+            carry: &["--manifest", "--meta"],
         }),
         warn: "The block goes live in pf's table and a watcher lifts it at the deadline unless kept. It needs a v2 ticket bound to this alias and range.",
     },
-    change("fw confirm", &["fw", "confirm"], &[F], &["mod-enf-perimeter"], &[
+    act("fw confirm", &["fw", "confirm"], &[F], &["mod-enf-perimeter"], &[
         pos("ID", Live("block-id"), "the block `fw block` printed"),
         MANIFEST,
         META,
-    ], "Makes a live block persistent: one config.xml revision through pfSense's own PHP, and a filter reload."),
+    ], "Makes a live block persistent: one config.xml revision through pfSense's own PHP, and a filter reload. The deadline no longer lifts it; `undo` with its id does."),
     VerbSpec {
         name: "fw statekill",
         argv: &["fw", "statekill"],
@@ -278,7 +356,7 @@ pub const REGISTRY: &[VerbSpec] = &[
     v("etw --watch", &["etw"], &[W], Wa, &[], &[req("--watch", "SECS", SECS, "open a session and count what arrives")]),
     v("streams", &["streams"], &[W], R, &[], &[pos_many("PATH", false, Live("path"), "where to look")]),
     v("dll-hijack", &["dll-hijack"], &[W], R, &[], &[]),
-    v("signature", &["signature"], &[W], R, &[], &[pos_many("PATH", true, Live("path"), "the files")]),
+    v("signature", &["signature"], &[W], R, &[], &[pos_many("PATH", true, Live("path"), "the files, on a local drive (a share is not opened)")]),
     v("com", &["com"], &[W], R, &[], &[]),
     v("usn", &["usn"], &[W], R, &["mod-sensor-usn"], &[opt("--volume", "DRIVE", Fixed(&["C:", "D:", "E:"]), "the volume (default C:)")]),
     v("sysmon", &["sysmon"], &[W], R, &["mod-sensor-sysmon"], &[]),
@@ -386,6 +464,9 @@ pub const NOT_OFFERED: &[(&str, &str)] = &[
     ("fw --manifest-pubkey", "the watcher's own flag"),
     ("fw block --dry-run", "every run from here is a dry run until [a Arm]; the flag would only say so twice"),
     ("fw statekill --dry-run", "every run from here is a dry run until [a Arm]; the flag would only say so twice"),
+    ("fw confirm --dry-run", "every run from here is a dry run until [a Arm]; the flag would only say so twice"),
+    ("--allow-subnet", "a block of more than one address is typed at a terminal, on purpose: the view blocks one address at a time"),
+    ("network --plan", "the view carries the digest its own dry run printed to the armed run; there is nothing to type"),
     ("selfprotect --arm", "it holds a deny over the process that runs it; run from here that is a child that does nothing else. Run it at a terminal"),
     ("sentinel --guard", "the process that runs it becomes the supervisor; `sentinel --register` from here starts proper ones"),
     ("sentinel --watch", "what a registered supervisor runs, written by `--register`: an agent identity, not an operator flag"),

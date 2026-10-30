@@ -375,14 +375,20 @@ pub(crate) fn collector(args: &[String], json: bool) -> u8 {
                 println!("collector ingest {} -> {}", h(source), h(&layout.base().display().to_string()));
                 for o in &report.outcomes {
                     match o.verdict {
-                        Verdict::Accepted => println!(
-                            "  ACCEPTED  {}  {} store, {} record(s), pin {} -> {}",
-                            h(&o.name),
-                            o.shape.unwrap_or("?"),
-                            o.records,
-                            o.pin.unwrap_or("?"),
-                            h(&o.kept)
-                        ),
+                        Verdict::Accepted => {
+                            println!(
+                                "  ACCEPTED  {}  {} store, {} record(s), pin {} -> {}",
+                                h(&o.name),
+                                o.shape.unwrap_or("?"),
+                                o.records,
+                                o.pin.unwrap_or("?"),
+                                h(&o.kept)
+                            );
+
+                            if let Some(a) = o.alert {
+                                println!("            ALERT {} ({}): {}", a.kind, a.severity, h(&o.reason));
+                            }
+                        }
                         Verdict::AlreadyHeld => println!("  HELD      {}  {}", h(&o.name), h(&o.reason)),
                         Verdict::Rejected => {
                             println!("  REJECTED  {}  kept at {}", h(&o.name), h(&o.kept));

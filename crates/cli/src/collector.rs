@@ -55,6 +55,8 @@ pub(crate) struct Clock {
     pub(crate) offset: i64,
 
     pub(crate) floor: Option<i64>,
+
+    pub(crate) unmeasured: Option<String>,
 }
 
 impl Clock {
@@ -214,9 +216,19 @@ fn sock_text(s: &HostSocket) -> String {
     format!("{} {} -> {} {}{ns}, {who}", s.proto, ep(s.local, s.lport), remote, s.state)
 }
 
+fn before(now: Option<i64>, secs: u64) -> Option<i64> {
+    now?.checked_sub(i64::try_from(secs).ok()?)
+}
+
 pub(crate) fn correlate(ev: &Evidence, host: &HostFlows, skew: u64, offset: i64, elsewhere: &BTreeSet<IpAddr>) -> Report {
 
-    let hn = i64::try_from(host.now).unwrap_or(0).saturating_add(offset);
+    let fw_now = i64::try_from(ev.now).ok();
+    let hn = i64::try_from(host.now).ok().and_then(|n| n.checked_add(offset));
+    let mut unmeasured = match (fw_now, hn) {
+        (None, _) => Some(format!("the firewall's capture time ({}) is not a time this can compare", ev.now)),
+        (_, None) => Some(format!("the host's sweep time ({}, moved {offset:+} s) is not a time this can compare", host.now)),
+        _ => None,
+    };
     let mut unknowns = Vec::new();
 
     let mut seen: BTreeSet<IpAddr> = BTreeSet::new();
@@ -333,12 +345,18 @@ pub(crate) fn correlate(ev: &Evidence, host: &HostFlows, skew: u64, offset: i64,
             continue;
         }
         if let Some(age) = f.age() {
-            let made = i64::try_from(ev.now).unwrap_or(i64::MAX) - i64::try_from(age).unwrap_or(0);
-            let lb = made - hn;
-            floor = Some(floor.map_or(lb, |x: i64| x.max(lb)));
+            match before(fw_now, age).zip(hn).and_then(|(made, hn)| made.checked_sub(hn)) {
+                Some(lb) => floor = Some(floor.map_or(lb, |x: i64| x.max(lb))),
+
+                None => {
+                    unmeasured.get_or_insert_with(|| {
+                        format!("an agreed flow's age ({age} s) does not compute against the two clocks, so the bound is not checked")
+                    });
+                }
+            }
         }
     }
-    let clock = Clock { fw_now: ev.now, host_now: host.now, skew, offset, floor };
+    let clock = Clock { fw_now: ev.now, host_now: host.now, skew, offset, floor, unmeasured };
 
     let mut hidden = Vec::new();
     for n in host.unread_namespaces() {
@@ -393,29 +411,35 @@ pub(crate) fn correlate(ev: &Evidence, host: &HostFlows, skew: u64, offset: i64,
             match (f.age(), f.idle(ev)) {
                 (None, _) => (Grade::Unknown, "pf printed no age for it".to_string(), "no-age"),
                 (_, Err(e)) => (Grade::Unknown, format!("no socket on the host for it, but {e}"), "no-idle"),
-                (Some(age), Ok(idle)) => {
-                    let now = i64::try_from(ev.now).unwrap_or(i64::MAX);
-                    let made = now - i64::try_from(age).unwrap_or(0);
-                    let last = now - i64::try_from(idle).unwrap_or(0);
-                    let hb = i64::try_from(host.boot).unwrap_or(0);
-                    if hb > 0 && hb.saturating_add(offset) > made + s {
-                        (Grade::Unknown, format!("the host booted at {} (on the box's clock), after the state was made at {made}: it may be the connection of a host that went away", hb.saturating_add(offset)), "booted")
-                    } else if clock.violated() {
-                        (Grade::Unknown, format!("the clock bound of ±{skew} s is contradicted by the agreed flows (see clocks), so no flow can be shown alive across the host's sweep"), "clock")
-                    } else if made + s < hn && last > hn + s {
-                        let mut b = format!(
-                            "no socket on the host accounts for it, and it was live across the host's sweep: made at {made} and last carried a packet at {last} by the box's clock, the host's sweep at {hn} on it, ±{skew} s"
-                        );
-                        if hidden.is_empty() {
-                            b.push_str(". The host's export claims full coverage: every table, every namespace it knows of, every socket in a table — the socket is hidden from all of them");
+                (Some(age), Ok(idle)) => match (clock.unmeasured.as_deref(), before(fw_now, age).zip(before(fw_now, idle)).zip(hn)) {
+                    (Some(why), _) => (Grade::Unknown, format!("no socket on the host for it, but the clocks are NOT MEASURED: {why}"), "unmeasured"),
+                    (None, None) => (
+                        Grade::Unknown,
+                        format!("no socket on the host for it, but its age ({age} s) and idle time ({idle} s) do not compute against the clocks"),
+                        "unmeasured",
+                    ),
+                    (None, Some(((made, last), hn))) => {
+                        let hb = i64::try_from(host.boot).unwrap_or(0);
+
+                        if hb > 0 && hb.saturating_add(offset) > made.saturating_add(s) {
+                            (Grade::Unknown, format!("the host booted at {} (on the box's clock), after the state was made at {made}: it may be the connection of a host that went away", hb.saturating_add(offset)), "booted")
+                        } else if clock.violated() {
+                            (Grade::Unknown, format!("the clock bound of ±{skew} s is contradicted by the agreed flows (see clocks), so no flow can be shown alive across the host's sweep"), "clock")
+                        } else if made.saturating_add(s) < hn && last > hn.saturating_add(s) {
+                            let mut b = format!(
+                                "no socket on the host accounts for it, and it was live across the host's sweep: made at {made} and last carried a packet at {last} by the box's clock, the host's sweep at {hn} on it, ±{skew} s"
+                            );
+                            if hidden.is_empty() {
+                                b.push_str(". The host's export claims full coverage: every table, every namespace it knows of, every socket in a table — the socket is hidden from all of them");
+                            }
+                            (Grade::Contradiction, b, "contradiction")
+                        } else {
+                            (Grade::Unknown, format!(
+                                "no socket on the host for it, but it is not shown alive across the host's sweep: made at {made}, last packet at {last} (the box's clock), the sweep at {hn} on the same clock, ±{skew} s"
+                            ), "not-alive")
                         }
-                        (Grade::Contradiction, b, "contradiction")
-                    } else {
-                        (Grade::Unknown, format!(
-                            "no socket on the host for it, but it is not shown alive across the host's sweep: made at {made}, last packet at {last} (the box's clock), the sweep at {hn} on the same clock, ±{skew} s"
-                        ), "not-alive")
                     }
-                }
+                },
             }
         };
         basis.insert(0, why);
@@ -468,10 +492,14 @@ pub(crate) fn correlate(ev: &Evidence, host: &HostFlows, skew: u64, offset: i64,
     if let Err(e) = &ev.timeouts {
         unknowns.push(format!("firewall: pf's timeouts were not read ({e}): no state can be shown alive, so no host flow is a CONTRADICTION"));
     }
-    if i64::try_from(ev.now + skew).unwrap_or(i64::MAX) < hn {
+    if let Some(why) = &clock.unmeasured {
         unknowns.push(format!(
-            "the firewall's capture ({}) is older than the host's sweep ({}) by more than ±{skew} s: no state in it can be shown alive after the sweep, so none can be a CONTRADICTION. Capture the firewall after the host",
-            ev.now, hn
+            "clocks NOT MEASURED: {why}. No state can be shown alive across the host's sweep, so none is a CONTRADICTION"
+        ));
+    }
+    if let Some((now, hn)) = fw_now.zip(hn).filter(|(now, hn)| now.saturating_add(s) < *hn) {
+        unknowns.push(format!(
+            "the firewall's capture ({now}) is older than the host's sweep ({hn}) by more than ±{skew} s: no state in it can be shown alive after the sweep, so none can be a CONTRADICTION. Capture the firewall after the host"
         ));
     }
     unknowns.push(
@@ -534,6 +562,7 @@ fn class_text(c: &str) -> &'static str {
         "no-idle" => "no socket on the host for them, and their expiry does not say when they last carried a packet",
         "booted" => "the host booted after their states were made",
         "clock" => "the clock bound is contradicted by the agreed flows",
+        "unmeasured" => "the clocks are NOT MEASURED: a time in one of the stores does not compute",
         "agreement" => "a socket on the host accounts for each",
         _ => "as their basis says",
     }
@@ -548,12 +577,23 @@ pub(crate) fn render(st: &Stores, r: &Report) -> String {
     let _ = writeln!(o, "             judged again here against {}", h(&st.manifest));
     let _ = writeln!(o, "  host       {} · seal {} ({}) · host {}", h(&st.host_dir), hex32(&st.host_seal), pin(st.host_pinned), hex32(&st.host_host_id).get(..16).unwrap_or(""));
     let c = &r.clock;
-    let d = i64::try_from(c.fw_now).unwrap_or(0) - i64::try_from(c.host_now).unwrap_or(0) - c.offset;
+
+    let d = i64::try_from(c.fw_now)
+        .ok()
+        .zip(i64::try_from(c.host_now).ok())
+        .and_then(|(f, h)| f.checked_sub(h)?.checked_sub(c.offset))
+        .map_or_else(
+            || "the two captures are NOT MEASURED on one clock".to_string(),
+            |d| format!("the firewall's capture is {d:+} s after the host's on one clock"),
+        );
     let _ = writeln!(
         o,
-        "  clocks     firewall {} · host {} · box − host taken as {:+} s (--offset) · the firewall's capture is {d:+} s after the host's on one clock; bound ±{} s (--skew)",
+        "  clocks     firewall {} · host {} · box − host taken as {:+} s (--offset) · {d}; bound ±{} s (--skew)",
         c.fw_now, c.host_now, c.offset, c.skew
     );
+    if let Some(why) = &c.unmeasured {
+        let _ = writeln!(o, "             NOT MEASURED: {} — no CONTRADICTION is called", h(why));
+    }
     if let Some(f) = c.floor {
         let _ = writeln!(
             o,
@@ -771,7 +811,8 @@ pub(crate) fn run(args: &[String], json: bool) -> u8 {
         manifest: format!("{} ({} paths)", manifest.release, manifest.paths()),
     };
     let r = correlate(&ev, &host, ask.skew, ask.offset, &BTreeSet::new());
-    let code = exit_code(&st, &ev, &host);
+
+    let code = if r.clock.unmeasured.is_some() { crate::EXIT_PARTIAL } else { exit_code(&st, &ev, &host) };
     if json {
         jprintln!("{}", render_json(&st, &r, code == crate::EXIT_OK));
     } else {

@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
+use hemostat_sensor_linux::services::{normalise_unit, unit_names};
+
 use crate::outcome::ProtectReason;
 use crate::paths::{read_declared_protections, read_declared_users};
 
@@ -72,7 +74,7 @@ pub struct ProtectSet {
 impl ProtectSet {
 
     pub fn holds_user(&self, user: &str) -> bool {
-        self.protected_users.contains(user)
+        hs_core::accounts::is_hard_protected(user) || self.protected_users.contains(user)
     }
 
     pub fn gather() -> ProtectSet {
@@ -95,16 +97,25 @@ impl ProtectSet {
             let cg = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
             listener_units.extend(units_in_cgroup(&cg));
         }
+
+        let declared_protected = with_unit_names(read_declared_protections());
+        for set in [&mut listener_units, &mut session_units] {
+            let units: Vec<String> = set.iter().cloned().collect();
+            set.extend(unit_names(&units));
+        }
+
+        let mut protected_users = read_declared_users();
+        protected_users.extend(hs_core::accounts::HARD_PROTECT.iter().map(|u| (*u).to_string()));
         ProtectSet {
             infra_role,
             declarations_unreadable: crate::paths::declarations_unreadable(),
-            protected_users: read_declared_users(),
+            protected_users,
             listener_pids,
             session_pids,
             session_units,
             listener_units,
             modules,
-            declared_protected: read_declared_protections(),
+            declared_protected,
             allow_listener_units: BTreeSet::new(),
             agent_pid,
             listener_map_complete: complete,
@@ -113,7 +124,7 @@ impl ProtectSet {
 
     #[must_use]
     pub fn declaring_protected(mut self, entries: impl IntoIterator<Item = String>) -> ProtectSet {
-        self.declared_protected.extend(entries);
+        self.declared_protected.extend(with_unit_names(entries));
         self
     }
 
@@ -134,7 +145,9 @@ impl ProtectSet {
     }
 
     pub fn user_reason(&self, user: &str) -> Option<ProtectReason> {
-        if self.holds_user(user) {
+        if hs_core::accounts::is_hard_protected(user) {
+            Some(ProtectReason::OutOfScopeAccount)
+        } else if self.holds_user(user) {
             Some(ProtectReason::OperatorDeclared)
         } else if self.declarations_unreadable {
             Some(ProtectReason::DeclarationsUnreadable)
@@ -144,11 +157,14 @@ impl ProtectSet {
     }
 
     pub(crate) fn declared(&self, subject: &str) -> bool {
+
+        let unit = (!subject.starts_with('/')).then(|| normalise_unit(subject));
         self.declared_protected.iter().any(|d| {
             d == subject
                 || (d.starts_with('/')
                     && subject.starts_with(d.as_str())
                     && (d.ends_with('/') || subject[d.len()..].starts_with('/')))
+                || unit.as_ref().is_some_and(|u| !d.starts_with('/') && normalise_unit(d) == *u)
         })
     }
 
@@ -189,6 +205,10 @@ impl ProtectSet {
         self.declarations_unreadable.then_some(ProtectReason::DeclarationsUnreadable)
     }
 
+    pub(crate) fn owner_reason<'a>(&self, owners: &'a [String]) -> Option<(&'a str, ProtectReason)> {
+        owners.iter().find_map(|o| self.user_reason(o).map(|r| (o.as_str(), r)))
+    }
+
     pub(crate) fn infrastructure_kill_reason(&self, name: Option<&str>) -> Option<ProtectReason> {
         if name.is_some_and(is_infrastructure_process) {
             return Some(ProtectReason::InfrastructureProcess);
@@ -197,14 +217,17 @@ impl ProtectSet {
     }
 
     pub(crate) fn unit_reason(&self, unit: &str) -> Option<ProtectReason> {
-        if unit_is_ssh(unit) || self.session_units.contains(unit) {
+
+        let named = normalise_unit(unit);
+        let held = |set: &BTreeSet<String>| set.contains(unit) || set.contains(&named);
+        if unit_is_ssh(unit) || held(&self.session_units) {
             return Some(ProtectReason::OperatorSession);
         }
 
         if let Some(r) = self.declared_reason(unit) {
             return Some(r);
         }
-        if self.listener_units.contains(unit) && !self.allow_listener_units.contains(unit) {
+        if held(&self.listener_units) && !self.allow_listener_units.contains(unit) {
             return Some(ProtectReason::ServiceListener);
         }
 
@@ -251,6 +274,15 @@ impl ProtectSet {
     }
 }
 
+fn with_unit_names(entries: impl IntoIterator<Item = String>) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = entries.into_iter().collect();
+    let units: Vec<String> =
+        out.iter().filter(|d| !d.starts_with('/')).map(|d| normalise_unit(d)).collect();
+    out.extend(unit_names(&units));
+    out.extend(units);
+    out
+}
+
 pub(crate) fn unit_is_ssh(unit: &str) -> bool {
     let base = unit
         .strip_suffix(".service")
@@ -278,7 +310,7 @@ pub(crate) fn units_in_cgroup(text: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for line in text.lines() {
 
-        let Some(path) = line.rsplit(':').next() else { continue };
+        let Some(path) = hemostat_sensor_linux::watchdog::cgroup_path(line) else { continue };
         for comp in path.split('/') {
             if comp.ends_with(".service") || comp.ends_with(".scope") {
                 out.insert(comp.to_string());

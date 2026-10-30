@@ -1,4 +1,5 @@
 use hemostat_broker::perimeter::{Decision, Policy, Signed, Stage};
+use hemostat_enforce_pf::protect::Width;
 use hemostat_enforce_pf::{Alias, DryRun};
 use hs_core::cidr::Cidr;
 
@@ -70,7 +71,24 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Asked, String> {
             protect.push(Cidr::parse(v).map_err(|e| format!("--protect {}: {e}", h(v)))?);
         }
     }
-    Ok(Asked { cidr, enrolled: hemostat_enforce_pf::Enrolled { alias, tracker, protect }, dry, deadline })
+    let width = width_asked(args);
+    Ok(Asked { cidr, enrolled: hemostat_enforce_pf::Enrolled { alias, tracker, protect, width }, dry, deadline })
+}
+
+pub(crate) fn width_asked(args: &[String]) -> Width {
+    if args.iter().any(|a| a == "--allow-subnet") {
+        Width::Subnet
+    } else {
+        Width::Single
+    }
+}
+
+pub(crate) fn golden_refusal(width: Width, golden: bool) -> Option<String> {
+    (golden && width == Width::Subnet).then(|| {
+        "--allow-subnet is refused while HEMOSTAT_GOLDEN is set: the IRSeC packet (rule 15) allows \
+         firewall blocks of single IP addresses only. Block each address on its own"
+            .to_string()
+    })
 }
 
 pub(crate) fn exit_code(d: &DryRun) -> u8 {
@@ -290,6 +308,10 @@ pub(crate) fn block(args: &[String], json: bool) -> u8 {
             return crate::EXIT_USAGE;
         }
     };
+    if let Some(why) = golden_refusal(asked.enrolled.width, crate::golden::active()) {
+        eprintln!("hemostat fw block: REFUSED — {why}. Nothing was read or applied");
+        return EXIT_POLICY;
+    }
     let path = args.iter().position(|a| a == "--manifest").and_then(|i| args.get(i + 1));
     let open = |p: &std::path::Path| saferead::open_regular(p, saferead::NOT_REGULAR);
     let loaded = match crate::vendor_manifest::load_in_place(path.map(String::as_str), &open) {
@@ -318,6 +340,12 @@ pub(crate) fn block(args: &[String], json: bool) -> u8 {
     let config = saferead::read_bytes(std::path::Path::new(configxml::CONFIG_PATH), configxml::MAX_BYTES)
         .map_err(|e| e.to_string())
         .and_then(|b| configxml::parse(&b).map_err(|e| e.to_string()));
+
+    let own = config.as_ref().map(crate::golden::own_addrs_of).unwrap_or_default();
+    if let Some(why) = crate::golden::block_scope_here(&asked.cidr, &own) {
+        eprintln!("hemostat fw block: REFUSED — {}. Nothing was applied", h(&why));
+        return EXIT_POLICY;
+    }
     let inc = hemostat_enforce_pf::preflight::hash_incs(std::path::Path::new("/"));
     let resolv = saferead::read_text(std::path::Path::new("/etc/resolv.conf")).map_err(|e| e.to_string());
     let ssh = std::env::var("SSH_CONNECTION").ok();

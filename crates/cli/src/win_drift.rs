@@ -170,14 +170,18 @@ pub(crate) fn image_digest(p: &str) -> Result<String, String> {
     if !local {
         return Err("not a path on a local drive: a network or device path is not read".into());
     }
-    let md = std::fs::metadata(p).map_err(|e| e.to_string())?;
+
+    #[cfg(target_os = "windows")]
+    let f = hemostat_sensor_win::localpath::open(p)?;
+    #[cfg(not(target_os = "windows"))]
+    let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
+    let md = f.metadata().map_err(|e| e.to_string())?;
     if !md.is_file() {
         return Err("not a regular file".into());
     }
     if md.len() > MAX_IMAGE {
         return Err(format!("{} bytes, over the {MAX_IMAGE}-byte cap", md.len()));
     }
-    let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
     let mut r = f.take(MAX_IMAGE + 1);
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -230,12 +234,11 @@ mod verbs {
     fn place(dir: &str) -> Result<(), String> {
         let parent = Path::new(dir).parent().and_then(Path::to_str).filter(|p| !p.is_empty()).ok_or("the store needs a parent directory")?;
         let default_parent = Path::new(DEFAULT_STORE).parent().and_then(Path::to_str).unwrap_or_default();
+        if parent.eq_ignore_ascii_case(default_parent) {
+            return crate::win_private::ensure_dir(Path::new(parent));
+        }
         if !Path::new(parent).exists() {
-            if parent.eq_ignore_ascii_case(default_parent) {
-                acl::create_private_dir(parent)?;
-            } else {
-                return Err(format!("{parent} does not exist"));
-            }
+            return Err(format!("{parent} does not exist"));
         }
         match acl::dacl_of_read(parent) {
             Ok(aces) if acl::grants_unprivileged_write(&aces) => Err(format!(
@@ -249,8 +252,20 @@ mod verbs {
 
     fn add_images(snap: &mut hs_core::snapshot::Snapshot) {
         let host = drift::LiveHost::default();
-        let files: std::collections::BTreeSet<String> = drift::run_commands(snap).iter().filter_map(|c| drift::resolve(c, &host)).collect();
-        let mut refused = Vec::new();
+        let mut files = std::collections::BTreeSet::new();
+        let mut not_opened = std::collections::BTreeSet::new();
+        for c in drift::run_commands(snap) {
+            match drift::locate(&c, &host) {
+                drift::Located::File(p) => {
+                    files.insert(p);
+                }
+                drift::Located::Refused(p, why) => {
+                    not_opened.insert(format!("{p}: not opened: {why}"));
+                }
+                drift::Located::Nothing => {}
+            }
+        }
+        let mut refused: Vec<String> = not_opened.into_iter().collect();
         for p in files {
             match image_digest(&p) {
                 Ok(d) => {

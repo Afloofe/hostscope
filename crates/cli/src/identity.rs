@@ -230,8 +230,12 @@ pub(crate) fn rand32() -> std::io::Result<[u8; 32]> {
     Ok(b)
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom")?.read_exact(buf)
+    hemostat_sensor_linux::rng::fill(buf)
+}
+
+#[cfg(target_os = "freebsd")]
+pub(crate) fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
+    getrandom::getrandom(buf).map_err(|e| std::io::Error::other(format!("getrandom(2): {e}")))
 }

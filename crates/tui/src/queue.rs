@@ -336,7 +336,7 @@ pub(crate) fn render_body(model: &QueueModel, area: Rect, buf: &mut Buffer, live
     let crit = model.rows.iter().filter(|r| r.severity == Sev::Critical).count();
     let warn = model.rows.iter().filter(|r| r.severity == Sev::Warn).count();
     let note = model.rows.len() - crit - warn;
-    let title = format!(" HEMOSTAT queue · {} · {} ", sanitize(&model.title).text, sanitize(&model.actor).text);
+    let title = format!(" Mahoraga queue · {} · {} ", sanitize(&model.title).text, sanitize(&model.actor).text);
     let head = Rect::new(area.x, area.y, area.width, 3);
     frame(buf, head, &title, bold, dim(), area);
     let mut cx = area.x + 2;

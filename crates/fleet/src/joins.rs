@@ -428,24 +428,43 @@ pub fn run(seen: &[Seen], info: &BTreeMap<[u8; 32], HostInfo>, judge: &dyn Rejud
     out
 }
 
+pub const MAX_OFFSET_NS: i64 = 100 * 366 * 86_400 * NS;
+
 fn flow_clock(info: &BTreeMap<[u8; 32], HostInfo>, fw: &[u8; 32], host: &[u8; 32]) -> (i64, u64, String) {
     let c = |h: &[u8; 32]| info.get(h).and_then(|i| i.clock);
+    let plausible = |m: &Measured| m.offset_ns.checked_abs().is_some_and(|o| o <= MAX_OFFSET_NS);
+
+    let measured = |f: &Measured, h: &Measured| {
+        h.offset_ns.checked_sub(f.offset_ns).filter(|_| plausible(f) && plausible(h))
+    };
     match (c(fw), c(host)) {
-        (Some(f), Some(h)) => {
-            let off = h.offset_ns - f.offset_ns;
-            let spread = u64::try_from(f.spread_ns.saturating_add(h.spread_ns).max(0)).unwrap_or(0);
-            let skew = spread.div_ceil(1_000_000_000) + MARGIN_S;
-            (
-                off,
-                skew,
+        (Some(f), Some(h)) => match measured(&f, &h) {
+            Some(off) => {
+                let spread = u64::try_from(f.spread_ns.saturating_add(h.spread_ns).max(0)).unwrap_or(0);
+                let skew = spread.div_ceil(1_000_000_000) + MARGIN_S;
+                (
+                    off,
+                    skew,
+                    format!(
+                        "measured: box − host = {} from both agents' heartbeats (collector − host {}, collector − box {}); bound ±{skew} s (their spreads plus {MARGIN_S} s)",
+                        crate::heartbeat::secs(off),
+                        crate::heartbeat::secs(h.offset_ns),
+                        crate::heartbeat::secs(f.offset_ns)
+                    ),
+                )
+            }
+            None => (
+                0,
+                ASSUMED_SKEW_S,
                 format!(
-                    "measured: box − host = {} from both agents' heartbeats (collector − host {}, collector − box {}); bound ±{skew} s (their spreads plus {MARGIN_S} s)",
-                    crate::heartbeat::secs(off),
+                    "NOT MEASURED: the heartbeats put collector − host at {} and collector − box at {}, and an offset of \
+                     more than a century is not a clock this can use, so the two clocks are compared as they read, with \
+                     S11's assumed bound of ±{ASSUMED_SKEW_S} s; the agreed flows still check it",
                     crate::heartbeat::secs(h.offset_ns),
                     crate::heartbeat::secs(f.offset_ns)
                 ),
-            )
-        }
+            ),
+        },
         (f, h) => {
             let who: Vec<String> = [(fw, f.is_none(), "the firewall"), (host, h.is_none(), "the host")]
                 .iter()

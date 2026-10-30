@@ -11,6 +11,39 @@ pub struct Module {
     pub name: String,
 
     pub path: String,
+
+    pub mapped: Mapped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mapped {
+
+    Local(String),
+
+    Elsewhere {
+
+        kernel: String,
+
+        why: String,
+    },
+
+    Unread(String),
+}
+
+impl Mapped {
+
+    pub fn from_kernel(kernel: &str, drives: &[(char, String)]) -> Self {
+        if drives.is_empty() {
+            return Mapped::Unread(format!(
+                "no fixed drive's device could be read, so the kernel's name for it, {kernel}, \
+                 could not be placed on a drive"
+            ));
+        }
+        match crate::localpath::on_drive(kernel, drives) {
+            Ok(p) => Mapped::Local(p),
+            Err(why) => Mapped::Elsewhere { kernel: kernel.to_string(), why },
+        }
+    }
 }
 
 const SYSTEM_LOAD_DIRS: &[&str] = &[
@@ -120,6 +153,11 @@ pub fn judge(m: &Module, ident: Option<&Identified>) -> Option<Finding> {
 
     if let Some(id) = ident {
         if sysproc && matches!(id.toolchain, Toolchain::Go | Toolchain::Nim) {
+
+            let read = match &m.mapped {
+                Mapped::Local(p) => p.as_str(),
+                _ => m.path.as_str(),
+            };
             return Some(Finding {
                 severity: Severity::Critical,
                 subject: format!("module:{}:{}", m.process, m.name),
@@ -135,7 +173,34 @@ pub fn judge(m: &Module, ident: Option<&Identified>) -> Option<Finding> {
                       toolchains inside a system process was brought here, whatever directory it \
                       is sitting in"
                     .into(),
-                fix: Some(format!("capture {} and identify what loaded it", m.path)),
+                fix: Some(format!("capture {read} and identify what loaded it")),
+            });
+        }
+    }
+
+    if let Mapped::Elsewhere { kernel, why } = &m.mapped {
+        if sysproc && crate::localpath::is_network(kernel) {
+            let claimed = if m.path.trim().is_empty() {
+                "gives no path".to_string()
+            } else {
+                format!("says {}", m.path)
+            };
+            return Some(Finding {
+                severity: Severity::Warn,
+                subject: format!("module:{}:{}", m.process, m.name),
+                what: format!(
+                    "{} (pid {}) has {} mapped from {kernel}, another machine (its own module list \
+                     {claimed})",
+                    m.process, m.pid, m.name
+                ),
+                why: format!(
+                    "code inside a Windows process served from a share is not Windows' own, and \
+                     its file was not read: {why}"
+                ),
+                fix: Some(format!(
+                    "find which host serves {kernel} and what made {} load from it",
+                    m.process
+                )),
             });
         }
     }
@@ -176,6 +241,8 @@ pub fn modules_of(pid: u32, process: &str) -> Result<Vec<Module>, u32> {
         TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
     };
 
+    let mut kernel = Kernel::open(pid);
+
     let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
     if snap == INVALID_HANDLE_VALUE {
 
@@ -191,13 +258,80 @@ pub fn modules_of(pid: u32, process: &str) -> Result<Vec<Module>, u32> {
     while ok != 0 {
         let name = from_wide(&e.szModule);
         let path = from_wide(&e.szExePath);
-        out.push(Module { process: process.to_string(), pid, name, path });
+        let mapped = kernel.mapped(e.modBaseAddr.cast_const().cast());
+        out.push(Module { process: process.to_string(), pid, name, path, mapped });
 
         ok = unsafe { Module32NextW(snap, core::ptr::addr_of_mut!(e)) };
     }
 
     unsafe { CloseHandle(snap) };
     Ok(out)
+}
+
+#[cfg(target_os = "windows")]
+struct Kernel {
+    process: windows_sys::Win32::Foundation::HANDLE,
+
+    refused: Option<String>,
+
+    drives: Vec<(char, String)>,
+
+    buf: Vec<u16>,
+}
+
+#[cfg(target_os = "windows")]
+impl Kernel {
+
+    fn open(pid: u32) -> Self {
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+        };
+
+        let mut process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+        if process.is_null() {
+
+            process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        }
+        let refused = process.is_null().then(|| {
+
+            let code = unsafe { GetLastError() };
+            format!("the process could not be opened to ask the kernel what it maps (error {code})")
+        });
+        Kernel { process, refused, drives: crate::localpath::fixed_drives(), buf: vec![0; 32_768] }
+    }
+
+    fn mapped(&mut self, base: *const core::ffi::c_void) -> Mapped {
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::System::ProcessStatus::GetMappedFileNameW;
+        if let Some(why) = &self.refused {
+            return Mapped::Unread(why.clone());
+        }
+
+        let n = unsafe {
+            GetMappedFileNameW(self.process, base, self.buf.as_mut_ptr(), self.buf.len() as u32)
+        } as usize;
+        if n == 0 {
+
+            let code = unsafe { GetLastError() };
+            return Mapped::Unread(format!("the kernel's name for it could not be read (error {code})"));
+        }
+        if n >= self.buf.len().saturating_sub(1) {
+            return Mapped::Unread("the kernel's name for it did not fit any path".into());
+        }
+        let name = String::from_utf16_lossy(self.buf.get(..n).unwrap_or_default());
+        Mapped::from_kernel(&name, &self.drives)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for Kernel {
+    fn drop(&mut self) {
+        if !self.process.is_null() {
+
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.process) };
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -439,13 +573,21 @@ pub struct IdentCache {
     pub reads: usize,
 
     pub hits: usize,
+
+    pub unread: std::collections::BTreeMap<String, usize>,
 }
 
 impl IdentCache {
 
-    pub fn identify(&mut self, path: &str) -> Option<Identified> {
+    pub fn identify(&mut self, m: &Module) -> Option<Identified> {
         use std::io::Read as _;
-        let f = std::fs::File::open(path).ok()?;
+        let (path, f) = match &m.mapped {
+            Mapped::Local(p) => match open_mapped(p) {
+                Ok(f) => (p, f),
+                Err(why) => return self.not_read(m, &format!("{p}: {why}")),
+            },
+            Mapped::Elsewhere { why, .. } | Mapped::Unread(why) => return self.not_read(m, why),
+        };
         let key = file_key(&f);
         if let Some(k) = key {
             if let Some(answer) = self.answers.get(&k) {
@@ -455,16 +597,30 @@ impl IdentCache {
         }
         self.reads += 1;
         let mut bytes = Vec::new();
-        let answer = f
-            .take(MAX_MODULE_BYTES)
-            .read_to_end(&mut bytes)
-            .ok()
-            .map(|_| hs_core::toolchain::identify(&bytes));
+        let answer = match f.take(MAX_MODULE_BYTES).read_to_end(&mut bytes) {
+            Ok(_) => Some(hs_core::toolchain::identify(&bytes)),
+            Err(e) => self.not_read(m, &format!("{path}: it could not be read: {e}")),
+        };
         if let Some(k) = key {
             self.answers.insert(k, answer.clone());
         }
         answer
     }
+
+    fn not_read(&mut self, m: &Module, why: &str) -> Option<Identified> {
+        *self.unread.entry(format!("{} in {}: {why}", m.name, m.process)).or_default() += 1;
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_mapped(path: &str) -> Result<std::fs::File, String> {
+    crate::localpath::open(path)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_mapped(path: &str) -> Result<std::fs::File, String> {
+    std::fs::File::open(path).map_err(|e| e.to_string())
 }
 
 #[cfg(not(target_os = "windows"))]

@@ -8,6 +8,7 @@ pub mod authenticode;
 pub mod com;
 pub mod dllhijack;
 pub mod drift;
+pub mod localpath;
 pub mod modules;
 pub mod reg;
 pub mod rng;

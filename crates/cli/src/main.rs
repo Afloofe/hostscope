@@ -21,9 +21,54 @@ mod render;
 mod actions;
 mod analysis;
 mod authz;
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "freebsd"))]
+mod golden;
+
+#[cfg(target_os = "linux")]
+mod pam_golden;
+
+#[cfg(target_os = "linux")]
+mod service_health;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod uptime;
+
+#[cfg(target_os = "linux")]
+mod compose;
+
+#[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
+mod binvault;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod winservice;
+
+#[cfg(target_os = "windows")]
+mod win_restore;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod win_firewall;
+
+#[cfg(any(target_os = "windows", test))]
+mod win_accounts;
+
+#[cfg(any(target_os = "windows", test))]
+mod win_private;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod win_respond;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod win_binvault;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod win_wmi;
 mod kernel;
 #[cfg(target_os = "linux")]
 mod remediate_verb;
+
+#[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
+mod pam_verb;
 #[cfg(target_os = "linux")]
 use crate::remediate_verb::undo_verb;
 #[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
@@ -41,6 +86,8 @@ mod remedy;
 mod sensors_win;
 mod sentinel;
 mod sweeps;
+
+mod brief;
 mod coverage;
 mod views;
 
@@ -73,7 +120,7 @@ use crate::kernel::print_kmod;
 #[cfg(target_os = "linux")]
 use crate::kernel::{
     arm_selfprotect, print_bpfprog, print_crossview, print_ftrace_hooks, print_hooks,
-    print_kernposture, print_kptrhooks, print_kwalk, print_rootkit, print_selfprotect,
+    print_kernposture, print_kground, print_kptrhooks, print_kwalk, print_rootkit, print_selfprotect,
     print_syscall_hooks, print_sysmap,
 };
 
@@ -217,13 +264,13 @@ pub(crate) const EXIT_FAILED: u8 = 1;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) const EXIT_AUTHZ: u8 = 3;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 pub(crate) const EXIT_POLICY: u8 = 4;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 pub(crate) const EXIT_DRYRUN: u8 = 5;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const EXIT_ENFORCER: u8 = 6;
 
 pub(crate) const EXIT_PARTIAL: u8 = 7;
@@ -326,14 +373,25 @@ fn flags_for(verb: &str) -> &'static [&'static str] {
             "--last-admin-key",
             "--anchors",
             "--remove-anchor",
+            "--pam",
+            "--restore-pam",
+            "--log",
+            "--seal-binaries",
+            "--restore-binary",
+            "--replace",
+            "--remove-task",
+            "--remove-run",
+            "--remove-wmi",
         ],
         "network" => &[
             "--arm",
+            "--plan",
             "--confirm",
             "--revert",
             "--egress",
             "--block-pid",
             "--block-dest",
+            "--allow-subnet",
         ],
         "exec-block" => &["--arm", "--pid", "--lift"],
         "harden-boot" => &["--arm", "--set"],
@@ -369,8 +427,13 @@ fn flags_for(verb: &str) -> &'static [&'static str] {
             "--purge-tickets",
             "--expire-password",
             "--drop-group",
+            "--lock",
+            "--disable",
         ],
-        "services" => &["--service", "--baseline", "--store", "--start", "--arm"],
+        "services" => &["--service", "--baseline", "--store", "--start", "--restore", "--compose-up", "--every", "--install-watchdog", "--uninstall-watchdog", "--arm"],
+        "firewall" => &["--allow", "--arm"],
+        "kill" => &["--pid", "--allow-listener", "--arm"],
+        "quarantine" => &["--arm"],
 
         "console" => if cfg!(target_os = "windows") { &["--once", "--rules"] } else { &["--once", "--every"] },
         "watchdog" => &["--watch"],
@@ -397,7 +460,7 @@ fn flags_for(verb: &str) -> &'static [&'static str] {
 
         "fw" => &[
             "--store", "--manifest", "--src", "--dst", "--limit", "--alias", "--tracker", "--protect",
-            "--meta", "--dry-run", "--arm", "--deadline", "--manifest-pubkey",
+            "--meta", "--dry-run", "--arm", "--deadline", "--manifest-pubkey", "--allow-subnet",
         ],
 
         #[cfg(target_os = "freebsd")]
@@ -419,6 +482,7 @@ fn flags_for(verb: &str) -> &'static [&'static str] {
         "etw" => &["--watch"],
         "ad" => &[],
         "export" => &[],
+        "brief" => &[],
         "streams" => &[],
         "dll-hijack" => &[],
         "modules" => &[],
@@ -522,7 +586,7 @@ fn dispatch(positional: &[&str], args: &[String], json: bool) -> ExitCode {
         return code;
     }
     #[cfg(target_os = "windows")]
-    if let Some(code) = dispatch_windows(verb, args, json) {
+    if let Some(code) = dispatch_windows(verb, positional, args, json) {
         return code;
     }
     #[cfg(target_os = "linux")]
@@ -548,7 +612,14 @@ fn dispatch(positional: &[&str], args: &[String], json: bool) -> ExitCode {
                 if args.is_empty() && std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
                     eprintln!("hemostat: sweeping this host…");
                     let verbs = crate::tui_verbs::verbs(crate::tui_verbs::this_platform());
-                    return match hemostat_tui::run_console(live_console_model(), live_console_model, apply_remedy, verbs) {
+
+                    #[cfg(target_os = "linux")]
+                    let ran = hemostat_tui::run_console_live(live_console_model(), live_console_model, apply_remedy, crate::evidence::console_seal_tick, verbs);
+                    #[cfg(any(target_os = "windows", target_os = "freebsd"))]
+                    let ran = hemostat_tui::run_console(live_console_model(), live_console_model, apply_remedy, verbs);
+                    #[cfg(target_os = "linux")]
+                    crate::evidence::console_seal_finish();
+                    return match ran {
                         Ok(()) => ExitCode::from(EXIT_OK),
                         Err(e) => {
                             eprintln!("hemostat: terminal error: {e}");
@@ -565,9 +636,19 @@ fn dispatch(positional: &[&str], args: &[String], json: bool) -> ExitCode {
 
 #[cfg(feature = "mod-tui")]
 fn live_console_model() -> hemostat_tui::ConsoleModel {
+    #[cfg(target_os = "linux")]
+    crate::evidence::console_seal_request();
     let m = console_model();
     #[cfg(target_os = "linux")]
-    let m = crate::evidence::console_sealed(m);
+    let m = crate::evidence::with_seal_rows(m);
+    m
+}
+
+#[cfg(all(feature = "mod-tui", not(all(target_os = "windows", feature = "mod-detect-sigma"))))]
+fn periodic_console_model() -> hemostat_tui::ConsoleModel {
+    let m = console_model();
+    #[cfg(target_os = "linux")]
+    let m = crate::evidence::with_seal_rows(m);
     m
 }
 
@@ -634,17 +715,24 @@ fn dispatch_portable(verb: Option<&str>, positional: &[&str], args: &[String], j
                     };
                     let verbs = crate::tui_verbs::verbs(crate::tui_verbs::this_platform());
                     match every {
+
                         Some(secs) => hemostat_tui::run_console_every(
                             live_console_model(),
                             live_console_model,
-                            console_model,
+                            periodic_console_model,
                             apply_remedy,
                             std::time::Duration::from_secs(secs.max(5)),
                             verbs,
                         ),
+                        #[cfg(target_os = "linux")]
+                        None => hemostat_tui::run_console_live(live_console_model(), live_console_model, apply_remedy, crate::evidence::console_seal_tick, verbs),
+                        #[cfg(not(target_os = "linux"))]
                         None => hemostat_tui::run_console(live_console_model(), live_console_model, apply_remedy, verbs),
                     }
                 };
+
+                #[cfg(target_os = "linux")]
+                crate::evidence::console_seal_finish();
                 match ran {
                     Ok(()) => ExitCode::from(EXIT_OK),
                     Err(e) => {
@@ -689,6 +777,8 @@ fn dispatch_portable(verb: Option<&str>, positional: &[&str], args: &[String], j
             );
             ExitCode::from(EXIT_NOT_BUILT)
         }),
+
+        Some("brief") => Some(ExitCode::from(crate::brief::print_brief(json))),
 
         Some("verify") => Some(ExitCode::from(verify_store(positional, json))),
 
@@ -804,7 +894,7 @@ fn dispatch_freebsd(verb: Option<&str>, args: &[String], json: bool) -> Option<E
 }
 
 #[cfg(target_os = "windows")]
-fn dispatch_windows(verb: Option<&str>, args: &[String], json: bool) -> Option<ExitCode> {
+fn dispatch_windows(verb: Option<&str>, positional: &[&str], args: &[String], json: bool) -> Option<ExitCode> {
     match verb {
 
         Some("probe") => Some(ExitCode::from(print_win_probe(json))),
@@ -881,7 +971,118 @@ fn dispatch_windows(verb: Option<&str>, args: &[String], json: bool) -> Option<E
         Some("snapshot") => Some(ExitCode::from(crate::win_drift::take_snapshot(args, json))),
         Some("drift") => Some(ExitCode::from(crate::win_drift::drift(args, json))),
         Some("trust") => Some(ExitCode::from(crate::trust_verb::print_win_trust(args, json))),
+
+        Some("services") => Some(ExitCode::from(if args.iter().any(|a| a == "--uninstall-watchdog") {
+            crate::win_restore::uninstall_watchdog(args)
+        } else if args.iter().any(|a| a == "--install-watchdog") {
+            let every = args.iter().position(|a| a == "--every").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(30);
+            gated("services --install-watchdog", || crate::win_restore::install_watchdog(args, every))
+        } else if args.iter().any(|a| a == "--restore") {
+
+            gated("services --restore", || {
+                match args.iter().position(|a| a == "--every").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok()) {
+                    Some(secs) => crate::win_restore::watch(args, json, secs),
+                    None => crate::win_restore::restore_scored(args, json),
+                }
+            })
+        } else {
+            eprintln!("hemostat services --restore|--install-watchdog [--arm] [--every SECS]: the Windows build restarts DOWN scored services (needs HEMOSTAT_GOLDEN)");
+            EXIT_USAGE
+        })),
+
+        Some("firewall") => Some(ExitCode::from(if args.iter().any(|a| a == "--allow") {
+            gated("firewall --allow", || crate::win_firewall::allow(args, json))
+        } else {
+            eprintln!("hemostat firewall --allow <port> [--arm]: the Windows build opens a scored port Windows Firewall is blocking");
+            EXIT_USAGE
+        })),
+
+        Some("account") => Some(ExitCode::from(if args.iter().any(|a| a == "--disable") {
+            gated("account --disable", || crate::win_accounts::disable(args, json))
+        } else {
+            eprintln!("hemostat account --disable <user> [--arm]: the Windows build disables a rogue local user");
+            EXIT_USAGE
+        })),
+
+        Some("kill") => Some(ExitCode::from(gated("kill", || crate::win_respond::kill(args, json)))),
+        Some("quarantine") => Some(ExitCode::from(gated("quarantine", || match positional.get(1) {
+            Some(p) => crate::win_respond::quarantine(args, p, json),
+            None => {
+                eprintln!("hemostat quarantine <path> [--arm]: name the file to quarantine");
+                EXIT_USAGE
+            }
+        }))),
+        Some("remediate") => Some(ExitCode::from(gated("remediate", || if let Some(i) = args.iter().position(|a| a == "--remove-task") {
+            match args.get(i + 1) {
+                Some(name) => crate::win_respond::remove_task(args, name, json),
+                None => {
+                    eprintln!("hemostat remediate --remove-task <name> [--arm]: name the scheduled task");
+                    EXIT_USAGE
+                }
+            }
+        } else if let Some(i) = args.iter().position(|a| a == "--remove-run") {
+            match args.get(i + 1) {
+                Some(name) => crate::win_respond::remove_run(args, name, json),
+                None => {
+                    eprintln!("hemostat remediate --remove-run <name> [--arm]: name the Run value");
+                    EXIT_USAGE
+                }
+            }
+        } else if let Some(i) = args.iter().position(|a| a == "--remove-wmi") {
+            match args.get(i + 1) {
+                Some(name) => crate::win_wmi::remove_wmi(args, name, json),
+                None => {
+                    eprintln!("hemostat remediate --remove-wmi <name> [--arm]: name the WMI event consumer");
+                    EXIT_USAGE
+                }
+            }
+        } else if args.iter().any(|a| a == "--seal-binaries") {
+
+            let extra: Vec<String> = operands(args, &[]).into_iter().map(String::from).collect();
+            crate::win_binvault::seal(args, &extra, json)
+        } else if let Some(i) = args.iter().position(|a| a == "--restore-binary") {
+            match args.get(i + 1) {
+                Some(path) => crate::win_binvault::restore(args, path, json),
+                None => {
+                    eprintln!("hemostat remediate --restore-binary <path> [--arm]: give the absolute path of the binary to restore");
+                    EXIT_USAGE
+                }
+            }
+        } else {
+            eprintln!("hemostat remediate [--remove-task <name> | --remove-run <name> | --remove-wmi <name> | --seal-binaries [PATH...] | --restore-binary <path>] [--arm]");
+            EXIT_USAGE
+        }))),
         _ => None,
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_ACTIONS: &[(&str, ActionClass)] = &[
+    ("kill", ActionClass::Kill),
+    ("quarantine", ActionClass::Quarantine),
+    ("remediate", ActionClass::PersistenceNeutralize),
+    ("account --disable", ActionClass::AccountDisable),
+    ("firewall --allow", ActionClass::IsolateInbound),
+    ("services --restore", ActionClass::ServiceStart),
+    ("services --install-watchdog", ActionClass::ServiceStart),
+];
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_gate(mode: &str) -> Result<(), String> {
+    match WINDOWS_ACTIONS.iter().find(|(m, _)| *m == mode) {
+        Some((_, class)) => crate::remedy::require_built(*class),
+        None => Err(format!("no action class is registered for `{mode}`, so nothing was attempted")),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn gated(mode: &str, run: impl FnOnce() -> u8) -> u8 {
+    match windows_gate(mode) {
+        Ok(()) => run(),
+        Err(msg) => {
+            eprintln!("hemostat {mode}: {msg}");
+            EXIT_NOT_BUILT
+        }
     }
 }
 
@@ -889,7 +1090,11 @@ fn dispatch_windows(verb: Option<&str>, args: &[String], json: bool) -> Option<E
 fn dispatch_linux(verb: Option<&str>, positional: &[&str], args: &[String], json: bool) -> Option<ExitCode> {
     match verb {
         Some("probe") => Some(ExitCode::from(print_probe(json))),
-        Some("firewall") => Some(ExitCode::from(print_firewall(json))),
+        Some("firewall") => Some(ExitCode::from(if args.iter().any(|a| a == "--allow") {
+            crate::actions::firewall_allow(args, json)
+        } else {
+            print_firewall(json)
+        })),
         Some("export") => Some({
 
             let fmt = positional.get(1).copied().unwrap_or("report");
@@ -916,7 +1121,8 @@ fn dispatch_linux(verb: Option<&str>, positional: &[&str], args: &[String], json
                 .position(|a| a == "--watch")
                 .map(|i| args.get(i + 1).and_then(|v| hemostat_lifecycle::watch::decode_argv(v)));
             match (spec, pid_after("--guard"), pid_after("--register")) {
-                (Some(Some(argv)), _, _) => ExitCode::from(watch_agent(&argv, json)),
+
+                (Some(Some(argv)), _, _) => ExitCode::from(watch_agent(&argv, crate::sentinel::registered_env(), json)),
                 (Some(None), _, _) => {
                     eprintln!(
                         "sentinel: --watch needs an agent spec from `--register`, not a pid"
@@ -961,6 +1167,7 @@ fn dispatch_linux(verb: Option<&str>, positional: &[&str], args: &[String], json
             ExitCode::from(EXIT_OK)
         }),
         Some("kwalk") => Some(ExitCode::from(print_kwalk(json))),
+        Some("kground") => Some(ExitCode::from(print_kground(json))),
         #[cfg(feature = "mod-enf-persistence")]
         Some("kmod") => Some({
             let name = args
@@ -993,18 +1200,26 @@ fn dispatch_linux(verb: Option<&str>, positional: &[&str], args: &[String], json
             let armed = args.iter().any(|a| a == "--arm");
             let secs = arg("--arm").and_then(|v| v.parse::<u64>().ok()).unwrap_or(120);
 
+            let plan = arg("--plan").map(String::as_str);
+            let subnet = args.iter().any(|a| a == "--allow-subnet");
+
             match narrowing_request(args) {
                 Err(msg) => {
                     eprintln!("hemostat network: {msg}");
                     ExitCode::from(EXIT_USAGE)
                 }
-                Ok(Some((pid, dest))) => print_narrow(pid, dest.as_deref(), armed),
+                Ok(Some((pid, dest))) => print_narrow(pid, dest.as_deref(), armed, subnet, plan),
+                Ok(None) if subnet => {
+                    eprintln!("hemostat network: --allow-subnet widens a --block-dest, and there is none. Nothing was changed");
+                    ExitCode::from(EXIT_USAGE)
+                }
                 Ok(None) => print_network(
                     armed,
                     secs,
                     args.iter().any(|a| a == "--confirm"),
                     args.iter().any(|a| a == "--revert"),
                     args.iter().any(|a| a == "--egress"),
+                    plan,
                 ),
             }
         }),
@@ -1333,7 +1548,7 @@ fn usage() {
 
 fn usage_text() -> String {
     format!(
-        "hemostat {} — incident-response agent\n\n\
+        "mahoraga {} — incident-response agent\n\n\
          USAGE:\n    \
          hemostat <verb> [--json]\n\nEXIT CODES (design §13):\n    \
          0   the sweep ran\n    \
@@ -1366,16 +1581,18 @@ fn usage_text() -> String {
          syscall-hooks Read kernel text (/proc/kcore): inline hooks + table redirection (Linux, root)\n    \
          ftrace-hooks  Read tracefs: ftrace/BPF-based syscall hooks the inline scan can't see (Linux, root)\n    \
          selfprotect   Prove the task_kill deny refuses a SIGKILL; --arm holds it over\n                   this process so a red-team kill is refused (Linux, root)\n                   flags: --arm\n    \
-         firewall      Host firewall ruleset, with its trust tag (Linux)\n    \
+         firewall      Host firewall ruleset, with its trust tag; `--allow PORT --arm`\n                   opens a scored port the firewall is blocking — an additive accept\n                   at the top of the input chain (nftables), reversible with `undo`\n                   (Linux)\n                   flags: --allow <PORT>, --arm\n    \
+         kill          Terminate a process. `--pid N` names it. Refuses System/Idle, the\n                   critical Windows processes, a shared svchost, a scored service's\n                   image, DataDog, this session's own processes, and a process whose\n                   image cannot be read; a listener too, unless `--allow-listener`\n                   says it is the red team's (a bind shell). Irreversible. Dry run by\n                   default; `--arm` applies (Windows, needs mod-enf-proc)\n                   flags: --allow-listener, --arm, --pid <N>\n    \
+         quarantine    Move a malicious file into the vault, reversible (it prints the\n                   command to put it back). Refuses a file under a system or program\n                   directory or DataDog's, judged where it really is (8.3 names,\n                   verbatim paths and links resolved first), and anything but one\n                   regular file. Dry run by default; `--arm` applies (Windows, needs\n                   mod-enf-file)\n                   flags: --arm\n    \
          posture       The operator posture view, printed once (Linux). On FreeBSD the\n                   \
          sweep: every process image and kernel file hashed against the signed\n                   \
          manifest, every listener checked against pfSense's own services, the\n                   \
          raw input sealed before the verdict\n                   \
          flags: --manifest <PATH> (FreeBSD)\n    \
          tui           The operator posture view, live (Linux)\n    \
-     console       Every detection sweep in one live findings view; --once dumps a frame,\n                   every finding in it, and exits 7 if a sweep did not run in full.\n                   On Windows `--rules DIR` (default: rules\\ beside the executable)\n                   feeds its detect row, and the live view adds a detect-live\n                   row for process starts written while it is open\n                   flags: --once, --rules <DIR> (Windows)\n    \
+     console       Every detection sweep in one live findings view; --once dumps a frame,\n                   every finding in it, and exits 7 if a sweep did not run in full.\n                   On Linux each sweep the live view shows is sealed into\n                   /var/lib/hemostat/evidence, one at a time in the background: the\n                   evidence rows name the recovery key (a minted one in full, and\n                   again at exit) and every seal that failed. Quitting waits up to\n                   10 s for a seal in progress, then names the store it left\n                   incomplete.\n                   On Windows `--rules DIR` (default: rules\\ beside the executable)\n                   feeds its detect row, and the live view adds a detect-live\n                   row for process starts written while it is open\n                   flags: --once, --rules <DIR> (Windows)\n    \
      sysctl        Kernel tunables against their hardened values, read from the\n                   running kernel. Fixes write ONE key at a time to /proc/sys —\n                   never `sysctl --system` (Linux)\n    \
-     network       The inbound surface, and a default-deny plan that keeps every\n                   port something is listening on plus whatever you named in\n                   /etc/hemostat/network-allow (a port named there with a source\n                   range is open from that range only). Shows the plan; `--arm N`\n                   applies it with an automatic rollback in N seconds unless you\n                   `--confirm`. `--block-pid N` or `--block-dest ADDR` narrows\n                   egress instead of isolating: NEW connections from that process\n                   (or to that address) are refused without taking the host off\n                   the network. Connections already open stay up, so stop the\n                   process to end a live shell (Linux, root)\n                   flags: --arm <N>, --block-dest <ADDR>, --block-pid <N>, --confirm, --egress, --revert\n    \
+     network       The inbound surface, and a default-deny plan that keeps every\n                   port something is listening on plus whatever you named in\n                   /etc/hemostat/network-allow (a port named there with a source\n                   range is open from that range only). Shows the plan and its\n                   digest; `--arm N --plan HEX` applies exactly that plan, with an\n                   automatic rollback in N seconds unless you `--confirm`, and is\n                   refused if the plan built at arm time is not the one shown.\n                   The arm is also refused unless /var/lib/hemostat, where it\n                   keeps its state, is a real directory nobody but root can write.\n                   `--egress` denies outbound too, keeping DNS, DHCP, syslog\n                   (514, 6514) and the DataDog agent. `--block-pid N` or\n                   `--block-dest ADDR` narrows egress instead of isolating:\n                   NEW connections from that process (or to that address) are\n                   refused without taking the host off the network. ADDR is one\n                   address unless `--allow-subnet` (at most /24 or /56), and never\n                   a syslog server this host forwards to; with HEMOSTAT_GOLDEN set,\n                   one address in your team's in-scope ranges that is none of the\n                   packet's hosts, as `fw block`. Connections that are\n                   already open stay up, so stop the process to end a live shell\n                   (Linux, root)\n                   flags: --allow-subnet, --arm <N>, --block-dest <ADDR>, --block-pid <N>, --confirm, --egress, --plan <HEX>, --revert\n    \
      allowlist     What this host will NOT respond to, and who said so. Reads the\n                   suppression file the broker consults; `--check TARGET` says\n                   whether anything covers it. Never writes: a tool that could\n                   append an exemption is one an intruder could use (Linux)\n                   flags: --check <TARGET>\n    \
      remote        The console link, outbound only: `--beacon HOST:PORT` sends a\n                   heartbeat whose ABSENCE is the durable evidence the agent was\n                   killed. Frames are HPKE-sealed with this tree's own crypto — no\n                   TLS, no certificate authority. The console key is pinned. There\n                   is no listen mode: `--listen` is refused, naming RFC-003 (Linux,\n                   needs mod-remote)\n                   flags: --beacon <HOST:PORT>, --console-key <HEX>, --seconds <N>\n    \
      sidecar       Install a tool you brought with you, verified against a digest\n                   you declared before you arrived. The digest is not optional:\n                   every path on a compromised host is under somebody else's\n                   control. Fetches nothing (Linux, root, needs mod-sidecar)\n                   flags: --arm, --from <DIR>, --install <NAME>, --sha256 <HEX>\n    \
@@ -1384,54 +1601,56 @@ fn usage_text() -> String {
      uninstall     Take the agent off this host. Removes its binary and service\n                   and deliberately LEAVES the evidence store, the undo journals\n                   and the snapshots they point at. Dry run by default (Linux)\n                   flags: --arm\n    \
      query         A SQL subset over live host state: `query 'SELECT pid, exe FROM\n                   processes WHERE uid = 0'`. `--tables` lists what there is.\n                   Says when a table could not be read in full, so an empty\n                   result is not mistaken for a clean host (Linux, needs\n                   mod-query)\n                   flags: --tables\n    \
      correlate     Which findings are about the same things. Six rows from six\n                   sweeps can be one intrusion; this groups them by what they\n                   share, and names the entities that appear in too much of the\n                   sweep to link anything (Linux, needs mod-correlation). On the\n                   collector: the firewall's sealed `fw` store against a host's\n                   `overview --export`, joined by host and flow — a live flow the\n                   host has no socket for is a CONTRADICTION, and so is a state on\n                   the firewall its own sockets do not hold (needs mod-collector)\n                   flags: --fw <DIR>, --fw-pin <HEX>, --host <DIR>, --host-pin <HEX>,\n                   --manifest <PATH>, --offset <SECS>, --skew <SECS> (collector)\n    \
-     detect        Sigma rules over what this agent can see. `--rules DIR` points\n                   at a rule repository; none is compiled in (rules/sigma in the\n                   source tree is a starting set). Says how many rules did NOT\n                   run and why — a rule that could not be evaluated is never\n                   counted as one that found nothing. On Linux, one sample of\n                   the processes running now; on Windows, the Security 4688 and\n                   Sysmon 1 records already in the log, or with `--watch SECS`\n                   (Windows) those written during the next SECS seconds, with\n                   each subscription's health; exits 7 if a source faulted or\n                   records were dropped (needs mod-detect-sigma)\n                   flags: --rules <DIR>, --watch <SECS> (Windows)\n    \
+     detect        Sigma rules over what this agent can see. `--rules DIR` points\n                   at a rule repository; none is compiled in (rules/sigma in the\n                   source tree is a starting set). Says how many rules did NOT\n                   run and why — a rule that could not be evaluated is never\n                   counted as one that found nothing. A field over 8 KiB keeps\n                   its head and tail only; a sample run over such an event says\n                   so and exits 7 (`--watch` does not yet). On Linux, one sample of\n                   the processes running now; on Windows, the Security 4688 and\n                   Sysmon 1 records already in the log, or with `--watch SECS`\n                   (Windows) those written during the next SECS seconds, with\n                   each subscription's health; exits 7 if a source faulted or\n                   records were dropped (needs mod-detect-sigma)\n                   flags: --rules <DIR>, --watch <SECS> (Windows)\n    \
      audit         Can this host's audit trail be believed? Asks the kernel\n                   directly: is anything collecting, how many records has it\n                   already dropped, are the rules on disk still loaded, and can\n                   they still be wiped without a reboot. Exits 7 if the kernel\n                   would not answer (Linux, root, needs mod-sensor-audit)\n    \
      fswatch       Live filesystem sensor with no eBPF behind it: writes and\n                   executions under the persistence directories, as they happen.\n                   Closes the gap every scan has — a boot rule that re-plants\n                   after the sweep. `--seconds N` (Linux, root, needs\n                   mod-sensor-fanotify)\n                   flags: --all, --seconds <N>\n    \
      harden-boot   Kernel parameters that only take effect after a restart, and\n                   what each costs on THIS host — including which loaded modules\n                   would stop loading under module.sig_enforce. Lists by default;\n                   `--set P --arm` edits the bootloader config, regenerates it\n                   and reads it back (Linux, root)\n                   flags: --arm, --set <PARAM>\n    \
-     exec-block    Stop one binary from starting again. Bind-mounts /dev/null over\n                   it, which leaves the file byte-identical for an examiner;\n                   clears the execute bits only where no bind mount is possible.\n                   `--pid N` resolves the path from a process. Dry run by\n                   default; `--arm` applies, `--lift` removes (Linux, root)\n                   flags: --arm, --lift, --pid <N>\n    \
-     account       The four account containment classes, one per flag:\n                   `--end-sessions`, `--purge-tickets`, `--expire-password`,\n                   `--drop-group G`. Dry run by default; `--arm` applies. The two\n                   that change what an account IS are never fired by a rule —\n                   an operator types the flag (Linux, root)\n                   flags: --arm, --drop-group <GROUP>, --end-sessions, --expire-password, --purge-tickets\n    \
+     exec-block    Stop one binary from starting again. Bind-mounts /dev/null over\n                   it, which leaves the file byte-identical for an examiner;\n                   clears the execute bits only where no bind mount is possible.\n                   `--pid N` resolves the path from a process. Dry run by\n                   default; `--arm` applies, `--lift` removes (Linux, root).\n                   Refused (exit 4) for sshd and its session helpers, the binary\n                   of any process holding a listening socket, and anything a unit\n                   declared in /etc/hemostat/critical starts\n                   flags: --arm, --lift, --pid <N>\n    \
+     account       The account containment classes, one per flag:\n                   `--end-sessions`, `--purge-tickets`, `--expire-password`,\n                   `--drop-group G`, `--lock`. Dry run by default; `--arm` applies. The three\n                   that change what an account IS are never fired by a rule —\n                   an operator types the flag (Linux, root). whiteteam and the\n                   DataDog accounts (dd-agent, ddagentuser, datadog) are always\n                   refused (exit 4). On Windows,\n                   `--disable USER` disables a rogue local user (`net user /active:no`,\n                   reversible); it refuses the account this session runs as and the\n                   last enabled administrator (needs mod-enf-account)\n                   flags: --arm, --disable <USER>, --drop-group <GROUP>, --end-sessions, --expire-password, --lock, --purge-tickets\n    \
      sshd          The SSH daemon's EFFECTIVE config, from `sshd -T` rather than\n                   from the file — first-value-wins and Include order make the file\n                   misleading — plus what overrides it, which a bare `sshd -T` does\n                   not apply: each Match block, and each `-o` from the unit's\n                   environment file or a running root daemon's command line. A\n                   daemon started with `-f` on another config is judged on that\n                   file. Needs root (Linux)\n    \
      watchdog      What would put an implant back: mutual guard pairs and restart\n                   loops. `--watch N` also waits N seconds and reports what\n                   actually respawned in that window (Linux)\n                   flags: --watch <SECS>\n    \
      trust         The TLS trust store: every CA this host believes about any name,\n                   where each one came from, and whether its vendor ships it. A CA\n                   nothing vendor-shipped explains is WARN — an enterprise CA is that,\n                   and is shown with that said — and CRITICAL when it can sign for any\n                   name and was added since the arrival snapshot, was issued days ago,\n                   is short-lived, or is shaped like an interception proxy's root.\n                   Reads the store's sources, its bundles and hashed directories, NSS\n                   databases and SSL_CERT_FILE-style redirections (Linux); the OS store\n                   and config.xml's CAs, sealed first (FreeBSD); the machine and user\n                   certificate stores (Windows). Detection only; on Linux\n                   `remediate --anchors` offers a removal for a person to arm\n                   flags: --all, --store <DIR>, --manifest <PATH> (FreeBSD)\n    \
      suid          SUID/SGID, file-capability and immutable-attribute backdoor scan (Linux)\n    \
      scan          Content-match files against YARA rules. With no paths: every running\n                   process's executable plus /etc/ld.so.preload, which is where the\n                   shape sensors already point. `--rules DIR` adds a feed you trust\n                   (Linux, needs mod-scan-yara)\n                   flags: --rules <DIR>\n    \
-     inventory     Package integrity, unpackaged binaries, suspicious services (Linux)\n    \
+     inventory     Package integrity, unpackaged binaries, suspicious services. A\n                   vendor manifest $HEMOSTAT_MANIFEST names that does not verify\n                   is a CRITICAL finding and exits 7; with none named, package\n                   integrity rests on the host's own database (Linux)\n    \
      vendor        Every file a signed vendor manifest covers, hashed and checked\n                   against what the vendor shipped at that path. The reference\n                   was built off this host, so nothing here can edit it (Linux;\n                   on FreeBSD also every file under the RFC-002 roots, graded\n                   with the signed sidecar `--meta`, default beside the manifest)\n                   flags: --manifest <PATH>, --meta <PATH>\n    \
      snapshot      Record the host on arrival — accounts, password fingerprints,\n                   groups, sudoers, authorized_keys, sshd, PAM, cron, units,\n                   listeners, the firewall (from the kernel), declared services —\n                   into its own sealed store,\n                   and print the seal key to keep off-host (Linux). On FreeBSD:\n                   config.xml, sealed raw, into /root/hemostat/snapshot. On Windows:\n                   services, tasks, autostarts, WMI subscriptions, accounts and\n                   privileged groups, listeners, shares and security settings,\n                   into C:\\ProgramData\\hemostat\\snapshot\n                   flags: --replace, --store <DIR>\n    \
-     drift         Every change since the arrival snapshot, graded: a new user, a\n                   reset password, a key added, a sudoers line, a new listener (Linux).\n                   On FreeBSD: config.xml, sealed before it is judged — a boot\n                   command, noantilockout, a moved rule, a new WAN pass rule. On Windows:\n                   a new service, task, Run value or WMI binding is CRITICAL unless\n                   its binary is signed and its signer named (WARN); a new\n                   Administrators or Remote Desktop member is CRITICAL (advice only)\n                   flags: --store <DIR>\n    \
-     fw rules      Every rule pf is running, in every anchor, traced to config.xml or\n                   to pfSense's own ridentifier ranges: a rule loaded by hand into\n                   userrules/*, a tracker the config does not have. The listings\n                   are sealed before they are judged (FreeBSD)\n                   flags: --store <DIR>\n    \
+     drift         Every change since the arrival snapshot, graded: a new user, a\n                   reset password, a key added, a sudoers line, a new listener (Linux).\n                   On FreeBSD: config.xml, sealed before it is judged — a boot\n                   command, noantilockout, a moved rule, a new WAN pass rule. On Windows:\n                   a new service, task, Run value or WMI binding is CRITICAL unless\n                   its binary is signed and its signer named (WARN), and a binary on a\n                   share, a device or behind a link is never opened and stays CRITICAL;\n                   a new Administrators or Remote Desktop member is CRITICAL (advice only)\n                   flags: --store <DIR>\n    \
+     fw rules      Every rule pf is running, in every anchor, traced to config.xml or\n                   to pfSense's own ridentifier ranges: a rule loaded by hand into\n                   userrules/*, a tracker the config does not have. The listings\n                   are sealed before they are judged, and pfctl is verified\n                   against the manifest (FreeBSD)\n                   flags: --store <DIR>, --manifest <PATH>\n    \
      fw flows      What is leaving an outward interface now, what filter.log recorded\n                   passing and blocking, leases the neighbour table disagrees\n                   with, and the box's own states against its own sockets (a live\n                   one no socket holds is a CONTRADICTION). filter.log is followed by inode and offset across rotation;\n                   the raw input is sealed before anything is judged (FreeBSD)\n                   flags: --manifest <PATH>, --dst <ADDR>, --limit <N>\n    \
      fw verdict    `fw verdict ADDR[:PORT][/PROTO]`: LEFT, BLOCKED or UNKNOWN for that\n                   destination and each flow to it, with the evidence and its limits.\n                   UNKNOWN is not \"did not leave\": pfSense's LAN rule logs nothing,\n                   so a passed flow lasts only as long as its state (FreeBSD)\n                   flags: --manifest <PATH>, --src <ADDR>\n    \
-     fw block      `fw block CIDR --alias NAME --tracker N`: every stage a block\n                   passes — preflight (alias, rule, anti-lockout, table, CARP, the\n                   .inc files), the protect-set, the signed policy's scope, the v2\n                   ticket — then the evidence sealed, the ticket spent, the entry\n                   live in pf's table, and a watcher that lifts it at the deadline\n                   (120 s) unless confirmed. A dry run that stops before the write\n                   unless `--arm` (FreeBSD)\n                   flags: --alias <HEMOSTAT_OUT|HEMOSTAT_IN>, --tracker <N>, --protect <CIDR>, --manifest <PATH>, --meta <PATH>, --deadline <SECS>, --arm, --dry-run\n    \
-     fw confirm    `fw confirm ID`: make a live block persistent — the stages again,\n                   the same ticket, then config.xml through pfSense's own PHP (one\n                   revision, \"HEMOSTAT block CIDR ID\"), a filter reload, the\n                   re-add, and the proof from disk (FreeBSD, not observe-only)\n                   flags: --manifest <PATH>, --meta <PATH>\n    \
+     fw block      `fw block CIDR --alias NAME --tracker N`: every stage a block\n                   passes — preflight (alias, rule, anti-lockout, table, CARP, the\n                   .inc files), the protect-set, the signed policy's scope, the v2\n                   ticket — then the evidence sealed, the ticket spent, the entry\n                   live in pf's table, and a watcher that lifts it at the deadline\n                   (120 s) unless confirmed. The CIDR is one address unless\n                   `--allow-subnet` (then at most /24 or /56; refused while\n                   HEMOSTAT_GOLDEN is set), and never the box's own NTP or syslog\n                   server. With HEMOSTAT_GOLDEN set the packet's scope holds too\n                   (rules 14, 15): one address in your team's 10.x.1.0/24 or\n                   192.168.x.0/24 that is none of the packet's own hosts, x from\n                   $HEMOSTAT_TEAM or the box's own addresses. A dry run that stops\n                   before the write unless `--arm` (FreeBSD)\n                   flags: --alias <HEMOSTAT_OUT|HEMOSTAT_IN>, --tracker <N>, --protect <CIDR>, --manifest <PATH>, --meta <PATH>, --deadline <SECS>, --allow-subnet, --arm, --dry-run\n    \
+     fw confirm    `fw confirm ID --arm`: make a live block persistent — the stages\n                   again, the same ticket, then config.xml through pfSense's own\n                   PHP (one revision, \"HEMOSTAT block CIDR ID\"), a filter reload,\n                   the re-add, and the proof from disk. A dry run that writes\n                   nothing unless `--arm`. A confirm that fails after the write\n                   says the block is persistent, and that `undo ID` lifts it\n                   (FreeBSD, not observe-only)\n                   flags: --manifest <PATH>, --meta <PATH>, --arm, --dry-run\n    \
      fw status     HEMOSTAT's containment journal: each block's state, deadline,\n                   revision, and whether pf's table holds it now (FreeBSD)\n                   flags: --manifest <PATH>, --meta <PATH>\n    \
      fw watch      The watcher `fw block` starts under daemon(8); not run by hand\n                   (FreeBSD)\n    \
-     fw statekill  `fw statekill CIDR --alias NAME`: kill every pf state to the CIDR\n                   (HEMOSTAT_OUT) or from it (HEMOSTAT_IN) — its own class and v2\n                   ticket, the protect-set first, the matching states sealed before\n                   `pfctl -k`. Cannot be undone; refused under the ot profile. A dry\n                   run unless `--arm` (FreeBSD, not ot-safe or observe-only)\n                   flags: --alias <HEMOSTAT_OUT|HEMOSTAT_IN>, --protect <CIDR>, --manifest <PATH>, --meta <PATH>, --arm, --dry-run\n    \
+     fw statekill  `fw statekill CIDR --alias NAME`: kill every pf state to the CIDR\n                   (HEMOSTAT_OUT) or from it (HEMOSTAT_IN) — its own class and v2\n                   ticket, the protect-set first, the matching states sealed before\n                   `pfctl -k`. Cannot be undone; refused under the ot profile. One\n                   address unless `--allow-subnet`, as for `fw block`. A dry run\n                   unless `--arm` (FreeBSD, not ot-safe or observe-only)\n                   flags: --alias <HEMOSTAT_OUT|HEMOSTAT_IN>, --protect <CIDR>, --manifest <PATH>, --meta <PATH>, --allow-subnet, --arm, --dry-run\n    \
      manifest-sign Sign a vendor manifest on the signing host with the key in\n                   $HEMOSTAT_MANIFEST_KEY_FILE, writing <PATH>.sig and printing the key\n                   to pin; `--new-key PATH` creates that key; a meta sidecar is signed\n                   only with `--manifest PATH`, the manifest it is bound to (Linux)\n                   flags: --in <PATH>, --new-key <PATH>, --manifest <PATH>\n    \
-     services      The services THIS host must keep, named by you, and whether\n                   anything has touched them. Declare them in /etc/hemostat/critical;\n                   their files are compared against the arrival snapshot (`snapshot`);\n                   `--start UNIT --arm` enables and starts a declared\n                   unit that is down (dry run without `--arm`; `undo` restores its prior\n                   state); `--baseline` is retired (Linux)\n                   flags: --arm, --baseline, --service <NAME>, --start <UNIT>, --store <DIR>\n    \
+     services      The services THIS host must keep, named by you, and whether\n                   anything has touched them (a named vendor manifest that does not\n                   verify is a CRITICAL finding and exits 7). Declare them in\n                   /etc/hemostat/critical (a name without a unit suffix means NAME.service;\n                   a declared unit is protected under every name systemd knows it by);\n                   their files are compared against the arrival snapshot (`snapshot`);\n                   `--start UNIT --arm` enables and starts a declared\n                   unit that is down (dry run without `--arm`; `undo` restores its prior\n                   state); `--restore --arm` brings up every DOWN scored service this\n                   box owns per the IRSeC packet (needs HEMOSTAT_GOLDEN), resolving each\n                   to its installed unit — the uptime auto-recovery path. A start counts\n                   only once the scored port answers; a unit already running with its\n                   port shut is left to a human, not restarted; a box it cannot check (a\n                   hostname that names no packet role, an unreadable socket table) is\n                   NOT CHECKED and exits 7. The role is the hostname's first label, or the\n                   one role among its `-`/`_` parts (`team5-garage`);\n                   HEMOSTAT_ROLE=<role> names it outright. Add\n                   `--every SECS` to run it as a watchdog that keeps them up every SECS\n                   (dry without --arm); `--install-watchdog [--every SECS] --arm` installs\n                   that watchdog as a systemd service that survives reboot/logout and\n                   runs under the policy environment it was installed with, and\n                   `--uninstall-watchdog --arm` removes it. `--compose-up PROJECT|FILE... --arm`\n                   brings up only the Docker Compose projects you name (grandstand's IRC),\n                   or recreates one `compose down` removed from its compose file; with\n                   none named it lists what is down and changes nothing; reversible with\n                   `compose down`; `--baseline` is retired (Linux)\n                   flags: --arm, --baseline, --compose-up, --every <SECS>, --install-watchdog, --restore, --service <NAME>, --start <UNIT>, --store <DIR>, --uninstall-watchdog\n    \
      sysmap        Corroborate /proc/kallsyms against on-disk System.map, KASLR-aware (Linux, root)\n    \
      kptr-hooks    Kernel seq_file/VFS function-pointer integrity via /proc/kcore (Linux, root)\n    \
      watch         Live eBPF exec sensor: alert on reverse-shell-shaped execs (Linux, root)\n    \
      crossview     Cheap /proc cross-views: DKOM hidden-task, raw/AF_PACKET C2, io_uring (Linux)\n    \
      kernel-posture Can a rootkit LKM load, and is a privileged agent being blinded? (Linux)\n    \
      kwalk         Ground truth: walk the kernel's task/module lists via /proc/kcore (Linux, root)\n    \
+     kground       Kernel task ground truth: the kernel's own bpf_iter task set vs /proc,\n                   catching a process the kernel runs but /proc hides (Linux, root)\n    \
      kmod          What the kernel says is loaded, cross-checked against /proc/modules.\n                   `--unload <name> --arm` removes a module that is hiding (Linux, root)\n                   flags: --arm, --unload <NAME>\n    \
      bpf-progs     Enumerate loaded eBPF programs: census + interception/LSM classes (Linux, root)\n    \
          ps            Processes seen through the procfs floor (Linux)\n    \
-     remediate     Offer a reversible removal for every catalogued persistence\n                   finding. A unit systemd holds with no catalogued file (a\n                   transient one) is listed as left to you, never removed.\n                   Dry run by default; `--arm` applies and writes an undo\n                   journal. The authentication surface is never removed\n                   automatically (Linux). A finding that is one line in a\n                   shared file is offered as that line: `--lines <FILE>` lists a\n                   file's lines with tokens, `--strip-line <TOKEN>` removes the\n                   one chosen (dry run until --arm; sudoers, PAM, sshd and\n                   authorized_keys also need --auth). A TLS trust anchor `trust`\n                   found is offered the same way: `--anchors` lists them with\n                   tokens, `--remove-anchor <TOKEN>` takes one out and rebuilds\n                   the store (dry run until --arm)\n                   flags: --allow-listener <UNIT>, --arm, --protect <UNIT>,\n                   --lines <FILE>, --strip-line <TOKEN>, --auth, --operator-key\n                   <SHA256:FP>, --session-key-unknown, --last-admin-key,\n                   --anchors, --remove-anchor <TOKEN>\n    \
+     remediate     Offer a reversible removal for every catalogued persistence\n                   finding. A unit systemd holds with no catalogued file (a\n                   transient one) is listed as left to you, never removed.\n                   Dry run by default; `--arm` applies and writes an undo\n                   journal. The authentication surface is never removed\n                   automatically (Linux). A finding that is one line in a\n                   shared file is offered as that line: `--lines <FILE>` lists a\n                   file's lines with tokens, `--strip-line <TOKEN>` removes the\n                   one chosen (dry run until --arm; sudoers, PAM, sshd and\n                   authorized_keys also need --auth). A TLS trust anchor `trust`\n                   found is offered the same way: `--anchors` lists them with\n                   tokens, `--remove-anchor <TOKEN>` takes one out and rebuilds\n                   the store (dry run until --arm). A PAM module the baked\n                   known-good marks tampered is offered the same way: `--pam`\n                   lists them (an /etc/os-release it cannot read is distro unknown:\n                   said so, exit 7), `--restore-pam <PATH>` puts the distribution's\n                   stock build back (version-gated, dry run until --arm; armed, a\n                   throwaway login is tried from an unprivileged account before and\n                   after, with the right password and a wrong one, and if it got in\n                   before and not after, or a wrong password is taken after but was\n                   refused before, the swap is rolled back). `--log` prints\n                   the response-action timeline for the IR report, read-only.\n                   `--seal-binaries` copies this host's critical binaries (scored\n                   daemons + su/sudo/sshd) at arrival into a root-only vault (a vault\n                   that is a link or not root's alone is refused; exit 7 if one that\n                   is present could not be sealed); `--restore-binary\n                   <PATH> --arm` writes a tampered one back from that sealed, sha-\n                   verified copy (dry run until --arm). On Windows, `--remove-task <NAME>\n                   --arm` deletes a rogue scheduled task (its XML is exported first, so\n                   `undo` is one command), and `--remove-run <NAME> --arm` deletes a\n                   rogue autostart Run value (its type and exact data are kept first in\n                   an admin-only .reg file, and `reg import` of it is the undo), and\n                   `--remove-wmi <NAME> --arm` removes a permanent-WMI\n                   subscription from root\\subscription: the consumer named exactly\n                   NAME, the bindings that reference it and each bound filter no\n                   other binding uses (every property and MOF is logged, as WMI\n                   has no one-command undo; a NAME with a quote, backtick, $ or\n                   control character is refused). All three write the fix log first\n                   and remove nothing if they cannot; DataDog is refused by the last two\n                   flags: --allow-listener <UNIT>, --arm, --protect <UNIT>,\n                   --lines <FILE>, --strip-line <TOKEN>, --auth, --operator-key\n                   <SHA256:FP>, --session-key-unknown, --last-admin-key,\n                   --anchors, --remove-anchor <TOKEN>,\n                   --pam, --restore-pam <PATH>, --log,\n                   --seal-binaries, --restore-binary <PATH>, --replace, --remove-task <NAME>,\n                   --remove-run <NAME>, --remove-wmi <NAME>\n    \
      streams       Alternate data streams: content a directory listing does not\n                   show and a file's size does not include (Windows)\n    \
      dll-hijack    Where the loader could be made to find the wrong library:\n                   writable PATH entries, KnownDLLs, SafeDllSearchMode (Windows)\n    \
-     signature     Is this file signed, and how was that established: embedded\n                   Authenticode or a system catalog (Windows)\n    \
+     signature     Is this file signed, and how was that established: embedded\n                   Authenticode or a system catalog. Local files only: a share, a\n                   network drive, a device or a path through a link is not opened (a\n                   share is a connection that authenticates as you) and reads\n                   unchecked, exit 7 (Windows)\n    \
      com           What the registered shell and COM handlers actually load, and\n                   per-user registrations shadowing machine ones (Windows)\n    \
      usn           The NTFS change journal: what was on this volume and is not\n                   any more. The only record of a payload that deleted itself,\n                   and of the journal having been deleted to hide one.\n                   `--volume D:` (Windows, Administrator, needs mod-sensor-usn)\n                   flags: --volume <DRIVE>\n    \
      etw           Which ETW providers this host can be asked to report, and what each\n                   buys. `--watch <SECS>` opens a session and counts what actually arrives\n                   (Windows)\n                   flags: --watch <SECS>\n    \
      sysmon        Is Sysmon there, and is it recording? A service whose driver\n                   has been unloaded still reports RUNNING and sees nothing, so\n                   the loaded-driver list is asked directly (Windows,\n                   needs mod-sensor-sysmon)\n    \
      evtlog        Whether this host's event log can be believed: cleared logs,\n                   holes in the record numbering where individual records were\n                   deleted, channels shrunk until they roll over, and whether\n                   4688 carries command lines. `--quick` skips the record count\n                   (Windows, needs mod-sensor-evtlog)\n                   flags: --quick\n    \
      wmi           Persistent WMI event subscriptions: persistence that writes no\n                   file and creates no registry autorun (Windows)\n    \
-     modules       What is actually mapped into system processes — the cross-view\n                   that needs no registry key to be honest (Windows)\n    \
+     modules       What is actually mapped into system processes — the cross-view\n                   that needs no registry key to be honest. A module's file is read\n                   only as the kernel maps it, from a local fixed drive; one the kernel\n                   maps from a share is WARN, and is not opened (Windows)\n    \
      export        Hand the persistence findings to the rest of the response:\n                   `export jsonl|stix|misp|report`. Covers the persistence\n                   catalogue only — `collect` sweeps the other nine. Every\n                   format names that surface beside its coverage, so\n                   `complete` is never read as a clean host (Linux)\n    \
+     brief         One read-only technical report — host posture, a user audit,\n                   what autostarts, and the firewall — the body an operator pastes\n                   into a Race-Control directive (inject). Gathers facts only; the\n                   operator writes the narrative and submits (packet rule 21). It is\n                   deterministic, so it is not an AI writing the inject. Ignores\n                   --json (a human report; use the sweeps' own --json) (Linux/Windows)\n    \
      ad            Domain credentials this host holds: Kerberos keytabs, ticket\n                   caches, and whether the KDC belongs to the realm (Linux)\n    \
-     sentinel      What would put THIS agent back if it were killed: which launch\n                   routes this host offers under systemd, runit or neither, and how\n                   many survive a cgroup kill. `--register PID` starts one sentinel\n                   per usable mechanism; `--guard PID` makes this process one.\n                   `--watch SPEC` is what a registered supervisor runs, written by\n                   `--register` — an agent identity, not a duration (Linux)\n                   flags: --guard <PID>, --persist, --register <PID>, --watch <SPEC>\n    \
+     sentinel      What would put THIS agent back if it were killed: which launch\n                   routes this host offers under systemd, runit or neither, and how\n                   many survive a cgroup kill. `--register PID` starts one sentinel\n                   per usable mechanism; `--guard PID` makes this process one.\n                   `--watch SPEC` is what a registered supervisor runs, written by\n                   `--register` — an agent identity, not a duration. Only a process\n                   running this image as the same user (real and effective uid) is\n                   guarded or adopted: another user's copy is refused (exit 2) or\n                   reported as a P0, and every relaunch carries the configuration\n                   recorded at `--register`/`--guard` (Linux)\n                   flags: --guard <PID>, --persist, --register <PID>, --watch <SPEC>\n    \
      ticket        Mint an authorization ticket for a responder key:\n                   `ticket --op <OP> --ttl <SECS> --out <FILE>`. An armed verb checks\n                   one when $HEMOSTAT_TICKET names it; with none it still runs, and\n                   says the authorization stage was not performed (Linux)\n                   A perimeter class (PerimeterBlock) mints version 2, bound to\n                   --alias and --cidr: the one range it may block\n                   flags: --alias <HEMOSTAT_OUT|HEMOSTAT_IN>, --cidr <NET/LEN>, --class <CLASS>, --engagement <ID>, --host <HOST>, --op <OP>, --out <FILE>, --ttl <SECS>\n    \
      policy        Mint a signed engagement policy with the root seed in\n                   $HEMOSTAT_ENGAGEMENT_KEY: which classes, which host ids, until\n                   when, under which profile and epoch. The firewall's perimeter\n                   stage needs one whose scope lists its host id (Linux)\n                   flags: --allow <CLASS[,CLASS]>, --bulk <N>, --engagement <ID>, --epoch <N>, --out <FILE>, --profile <it|ot>, --scope <HOST[,HOST]>, --ttl <SECS>\n    \
      undo          Reverse an armed remediation: `undo <JOURNAL>` (Linux). On the\n                   firewall, `undo [ID]` lifts what `fw block` applied — only\n                   entries the journal and the box show are HEMOSTAT's — in every\n                   variant, observe-only included (FreeBSD). `--auth` lets a stripped\n                   line go back into a login or privilege file (Linux)\n                   flags: --manifest <PATH>, --meta <PATH> (FreeBSD), --auth (Linux)\n    \
@@ -1452,7 +1671,9 @@ fn usage_text() -> String {
          which, and why, in the collector's sealed ledger; `collector ledger`\n                   \
          audits the ledger and lists it; `collector read-key` makes the\n                   \
          engagement read key once and prints the public half for `collect`'s\n                   \
-         $HEMOSTAT_READ_PUBKEY. Exits 1 if any parcel was rejected.\n                   \
+         $HEMOSTAT_READ_PUBKEY. Exits 1 if any parcel was rejected. A store\n                   \
+         its run never announced is kept with an ALERT, CRITICAL when the host's\n                   \
+         announced store never arrived (a re-seal under a fresh run's shape).\n                   \
          `collector keys` makes the link and receipt keys; `collector listen\n                   \
          <ADDR:PORT>` is the listener role, opening only enrolled agents' frames;\n                   \
          `collector ingest --spool [--follow]` judges what it spooled and signs\n                   \
@@ -1491,7 +1712,7 @@ fn print_build_info(json: bool) {
         return;
     }
 
-    println!("hemostat {}", env!("CARGO_PKG_VERSION"));
+    println!("mahoraga {}", env!("CARGO_PKG_VERSION"));
     println!("  variant:   {}", MANIFEST.variant);
     println!("  toolchain: {}", MANIFEST.toolchain);
     println!(
@@ -1569,10 +1790,18 @@ fn print_build_info(json: bool) {
         .map(|c| match c {
             ActionClass::PersistenceNeutralize => "`remediate` neutralises persistence",
             ActionClass::Lift => "`undo` lifts what was applied",
+
+            ActionClass::Kill if cfg!(target_os = "windows") => {
+                "`kill` ends one process, never one the box or the score depends on"
+            }
             ActionClass::Kill | ActionClass::Suspend => {
                 "`console` freezes and removes a watchdog group"
             }
+            ActionClass::Quarantine if cfg!(target_os = "windows") => "`quarantine` moves a file into the vault",
             ActionClass::Quarantine => "`console` clears a set-user-ID bit",
+            ActionClass::AccountDisable if cfg!(target_os = "windows") => {
+                "`account --disable` disables a rogue local user"
+            }
             ActionClass::AccountDisable => "`console` locks an account",
             ActionClass::SessionKill => "`account --end-sessions` ends a user's logins",
             ActionClass::TicketPurge => "`account --purge-tickets` destroys their Kerberos caches",
@@ -1582,6 +1811,10 @@ fn print_build_info(json: bool) {
 
             ActionClass::Collect if cfg!(target_os = "freebsd") => {
                 "`snapshot`, `drift` and `fw rules` seal what they read into their own stores"
+            }
+
+            ActionClass::Collect if cfg!(target_os = "windows") => {
+                "`snapshot` seals the host on arrival into its own store"
             }
             ActionClass::Collect => "`collect` writes the sealed evidence store",
             ActionClass::Allowlist => "`allowlist` reads what will not be responded to",
@@ -1594,6 +1827,9 @@ fn print_build_info(json: bool) {
                 "`console` sets WDigest off or the vulnerable-driver blocklist on"
             }
             ActionClass::Harden => "`console` applies a kernel tunable or an sshd drop-in",
+            ActionClass::IsolateInbound if cfg!(target_os = "windows") => {
+                "`firewall --allow` opens a scored port Windows Firewall is blocking"
+            }
             ActionClass::IsolateInbound => {
                 "`network --arm` applies a default-deny inbound ruleset with a rollback window"
             }
@@ -1609,6 +1845,9 @@ fn print_build_info(json: bool) {
             }
             ActionClass::PerimeterStateKill => "`fw statekill` kills the matching pf states, sealed first",
 
+            ActionClass::ServiceStart if cfg!(target_os = "windows") => {
+                "`services --restore` restarts a DOWN scored service"
+            }
             ActionClass::ServiceStart => "`service --start` enables and starts a declared unit that is down",
 
         })

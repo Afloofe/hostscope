@@ -350,16 +350,17 @@ pub const CONTROLS: &[Control] = &[
     },
 ];
 
-pub fn proc_path(key: &str) -> PathBuf {
-    PathBuf::from("/proc/sys").join(key.replace('.', "/"))
+pub fn proc_path(key: &str) -> Option<PathBuf> {
+    let leads = key.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+    (leads && !key.contains('/')).then(|| PathBuf::from("/proc/sys").join(key.replace('.', "/")))
 }
 
 pub fn read(key: &str) -> Option<String> {
-    std::fs::read_to_string(proc_path(key)).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(proc_path(key)?).ok().map(|s| s.trim().to_string())
 }
 
 pub fn write(key: &str, value: &str) -> Result<(), String> {
-    let p = proc_path(key);
+    let p = proc_path(key).ok_or_else(|| format!("{key:?} is not a sysctl key"))?;
     if !p.exists() {
         return Err(format!("{key} does not exist on this kernel"));
     }
@@ -495,8 +496,23 @@ pub fn apply(c: &Control) -> Result<Applied, String> {
     Ok(Applied { was: done, now: c.want.to_string(), persisted, persist_error })
 }
 
+const SYSCTL_D: &str = "/etc/sysctl.d";
+
+fn drop_in_name(path: &str) -> Result<&str, String> {
+    let p = std::path::Path::new(path);
+    match (p.parent(), p.file_name().and_then(|n| n.to_str())) {
+        (Some(dir), Some(name)) if dir == std::path::Path::new(SYSCTL_D) => Ok(name),
+        _ => Err(format!("{path} is not a drop-in in {SYSCTL_D}")),
+    }
+}
+
 pub fn persist(c: &Control) -> Result<(), String> {
-    let existing = crate::saferead::read_scan_target(std::path::Path::new(DROP_IN))
+    let name = drop_in_name(DROP_IN)?;
+    let dir = crate::safewrite::Pinned::create(std::path::Path::new(SYSCTL_D), 0o755)
+        .map_err(|e| format!("{SYSCTL_D}: {e}"))?;
+    let existing = dir
+        .read_own(name, crate::saferead::MAX_SCAN_BYTES)
+        .map_err(|e| format!("{DROP_IN}: {e}"))?
         .unwrap_or_default();
     let mut lines: Vec<String> = existing
         .lines()
@@ -513,15 +529,13 @@ pub fn persist(c: &Control) -> Result<(), String> {
     for k in recorded_keys(c, read) {
         lines.push(format!("{k} = {}", c.want));
     }
-    let dir = PathBuf::from(DROP_IN);
-    let dir = dir.parent().ok_or("bad drop-in path")?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    std::fs::write(DROP_IN, format!("{}\n", lines.join("\n")))
+    dir.replace(name, format!("{}\n", lines.join("\n")).as_bytes(), 0o644)
         .map_err(|e| format!("{DROP_IN}: {e}"))?;
 
-    if let Some(old_text) =
-        crate::saferead::read_scan_target(std::path::Path::new(LEGACY_DROP_IN))
-    {
+    let legacy = drop_in_name(LEGACY_DROP_IN).ok();
+    if let Some((legacy, old_text)) = legacy.and_then(|l| {
+        dir.read_own(l, crate::saferead::MAX_SCAN_BYTES).ok().flatten().map(|t| (l, t))
+    }) {
         let kept: Vec<&str> = old_text
             .lines()
             .filter(|l| {
@@ -534,9 +548,9 @@ pub fn persist(c: &Control) -> Result<(), String> {
             !t.is_empty() && !t.starts_with('#')
         });
         let _ = if meaningful {
-            std::fs::write(LEGACY_DROP_IN, format!("{}\n", kept.join("\n")))
+            dir.replace(legacy, format!("{}\n", kept.join("\n")).as_bytes(), 0o644)
         } else {
-            std::fs::remove_file(LEGACY_DROP_IN)
+            dir.remove(legacy)
         };
     }
 
@@ -566,17 +580,23 @@ pub fn persist(c: &Control) -> Result<(), String> {
 }
 
 pub fn unpersist(keys: &[&str]) -> Result<(), String> {
-    let Some(text) = crate::saferead::read_scan_target(std::path::Path::new(DROP_IN)) else {
+    let name = drop_in_name(DROP_IN)?;
+    let dir = match crate::safewrite::Pinned::open(std::path::Path::new(SYSCTL_D)) {
+        Ok(d) => d,
+
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{SYSCTL_D}: {e}")),
+    };
+    let Some(text) = dir
+        .read_own(name, crate::saferead::MAX_SCAN_BYTES)
+        .map_err(|e| format!("{DROP_IN}: {e}"))?
+    else {
 
         return Ok(());
     };
     match without_keys(&text, keys) {
-        Some(body) => std::fs::write(DROP_IN, body).map_err(|e| format!("{DROP_IN}: {e}")),
-        None => match std::fs::remove_file(DROP_IN) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("{DROP_IN}: {e}")),
-        },
+        Some(body) => dir.replace(name, body.as_bytes(), 0o644).map_err(|e| format!("{DROP_IN}: {e}")),
+        None => dir.remove(name).map_err(|e| format!("{DROP_IN}: {e}")),
     }
 }
 

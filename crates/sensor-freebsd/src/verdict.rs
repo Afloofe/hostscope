@@ -258,7 +258,8 @@ pub fn limits(ev: &Evidence) -> Vec<String> {
         ));
     }
     if !ev.unread_history.is_empty() {
-        let bytes: u64 = ev.unread_history.iter().map(|(_, b)| b).sum();
+
+        let bytes: u64 = ev.unread_history.iter().fold(0u64, |n, (_, b)| n.saturating_add(*b));
         let names: Vec<&str> = ev.unread_history.iter().map(|(p, _)| p.rsplit('/').next().unwrap_or(p)).collect();
         out.push(format!(
             "{} older rotation(s) are compressed and were not read ({}, {bytes} bytes): history before the oldest line \

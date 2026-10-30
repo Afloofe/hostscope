@@ -539,16 +539,20 @@ pub fn undo_restore(
             prefer_instead: None,
         });
     }
-    if let Err(reason) = crate::revert::restore_in_place(vault, original) {
-        return Outcome::Failed(Failure { action: format!("restore {}", original.display()), reason });
-    }
+    let kept = match crate::revert::restore_in_place(vault, original) {
+        Ok(kept) => kept,
+        Err(reason) => {
+            return Outcome::Failed(Failure { action: format!("restore {}", original.display()), reason })
+        }
+    };
     let gen_path = PathBuf::from(generator);
     match run_tool(&gen_path, &generator_args(&gen_path, output)) {
         Ok(()) => Outcome::Applied(UndoRecord {
             did: format!(
-                "restored {} and regenerated {} — the parameter is gone from the next boot",
+                "restored {} and regenerated {} — the parameter is gone from the next boot{}",
                 original.display(),
-                output.display()
+                output.display(),
+                crate::revert::kept_note(kept.as_deref())
             ),
             undo: UndoKind::Irreversible { note: "restoring is the undo".into() },
             reversible: false,

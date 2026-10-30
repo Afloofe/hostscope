@@ -52,9 +52,57 @@ pub const PID: FieldName = fields::PROCESS_ID;
 
 pub const PPID: FieldName = fields::PARENT_PROCESS_ID;
 
+const MAX_STAT_BYTES: u64 = 64 * 1024;
+
+const NOT_PROCFS: &str = "not a regular file on procfs — something is mounted over this process's \
+     entry, and it is neither opened nor read";
+
+fn read_pid_file(path: &Path, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::os::fd::AsRawFd as _;
+    let refuse = || std::io::Error::new(std::io::ErrorKind::InvalidInput, NOT_PROCFS);
+    let at = crate::saferead::open_o_path(path)?;
+    let md = at.metadata()?;
+    if !md.is_file() {
+        return Err(refuse());
+    }
+    let asked = match on_procfs(&at) {
+        Ok(true) => true,
+        Ok(false) => return Err(refuse()),
+        Err(e) if e.raw_os_error() == Some(libc::EBADF) => false,
+        Err(e) => return Err(e),
+    };
+    let pinned = format!("/proc/self/fd/{}", at.as_raw_fd());
+    let (f, _) = crate::saferead::open_regular(Path::new(&pinned), NOT_PROCFS)?;
+    if !asked && !on_procfs(&f)? {
+        return Err(refuse());
+    }
+
+    crate::saferead::read_bounded(&f, cap)
+}
+
+fn on_procfs(f: &fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+
+    let rc = unsafe { libc::fstatfs(f.as_raw_fd(), &mut sfs) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(is_proc_magic(sfs.f_type))
+}
+
+fn is_proc_magic(f_type: impl Into<i128>) -> bool {
+    f_type.into() == i128::from(libc::PROC_SUPER_MAGIC)
+}
+
 pub fn read_process(pid: u32) -> Option<ProcSnapshot> {
     let base = format!("/proc/{pid}");
-    let stat = String::from_utf8_lossy(&fs::read(Path::new(&base).join("stat")).ok()?).into_owned();
+    let (stat, cut) = read_pid_file(&Path::new(&base).join("stat"), MAX_STAT_BYTES).ok()?;
+    if cut {
+        return None;
+    }
+    let stat = String::from_utf8_lossy(&stat).into_owned();
 
     let close = stat.rfind(')')?;
     let rest: Vec<&str> = stat.get(close + 1..)?.split_whitespace().collect();
@@ -62,7 +110,8 @@ pub fn read_process(pid: u32) -> Option<ProcSnapshot> {
     let ppid = rest.first().and_then(|_| rest.get(1))?.parse().ok()?;
     let starttime_ticks = rest.get(19).and_then(|v| v.parse().ok()).unwrap_or(0);
 
-    let status = String::from_utf8_lossy(&fs::read(Path::new(&base).join("status")).ok()?).into_owned();
+    let (status, _) = read_pid_file(&Path::new(&base).join("status"), MAX_STAT_BYTES).ok()?;
+    let status = String::from_utf8_lossy(&status).into_owned();
     let uid = status
         .lines()
         .find_map(|l| l.strip_prefix("Uid:"))
@@ -72,7 +121,7 @@ pub fn read_process(pid: u32) -> Option<ProcSnapshot> {
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
 
-    let cmdline = crate::saferead::read_proc(&Path::new(&base).join("cmdline"), crate::saferead::MAX_PROC_BYTES)
+    let cmdline = read_pid_file(&Path::new(&base).join("cmdline"), crate::saferead::MAX_PROC_BYTES)
         .ok()
         .map(|(raw, _)| raw)
         .map(|raw| {

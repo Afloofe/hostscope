@@ -1,4 +1,7 @@
 use std::collections::BTreeSet;
+use std::net::IpAddr;
+
+use hs_core::cidr::Cidr;
 
 pub fn cgroup_of(text: &str) -> Result<String, String> {
     let mut v2: Option<&str> = None;
@@ -130,12 +133,32 @@ pub fn render_proc_block(o: &Occupancy) -> Result<String, String> {
     ))
 }
 
-pub fn render_dest_block(dest: &str, why: &str) -> Result<String, String> {
+pub const WIDEST_V4: u8 = 24;
+
+pub const WIDEST_V6: u8 = 56;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Width {
+
+    #[default]
+    Single,
+
+    Subnet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+
+    pub addr: IpAddr,
+
+    pub what: String,
+}
+
+pub fn parse_dest(dest: &str, width: Width) -> Result<Cidr, String> {
     let d = dest.trim();
     if d.is_empty() {
         return Err("no destination was given".into());
     }
-
     let looks_numeric = d
         .chars()
         .all(|c| c.is_ascii_hexdigit() || c == '.' || c == ':' || c == '/');
@@ -147,8 +170,135 @@ pub fn render_dest_block(dest: &str, why: &str) -> Result<String, String> {
              the answer, and pass the address"
         ));
     }
-    let family = if d.contains(':') { "ip6" } else { "ip" };
-    Ok(format!("    {family} daddr {d} drop  # {why}\n"))
+    let c = Cidr::parse(d).map_err(|e| format!("`{d}` is not one address or range: {e}"))?;
+    if c.is_everything() {
+        return Err(format!(
+            "{c} is every address: that is egress isolation, not a narrowing. `hemostat network \
+             --arm N --egress` isolates, and keeps DNS, DHCP, syslog and the DataDog agent while \
+             it does"
+        ));
+    }
+    let (single, widest) = if c.is_v4() { (32, WIDEST_V4) } else { (128, WIDEST_V6) };
+    match width {
+        Width::Single if c.prefix() < single => Err(format!(
+            "{c} is more than one address. --block-dest names one address: a range can hold a \
+             scoring engine, a log host or a monitoring intake nobody listed, and the IRSeC packet \
+             allows blocks of single IP addresses only. Name the address you mean, or — where the \
+             rules of engagement allow ranges — pass --allow-subnet (up to /{WIDEST_V4} or \
+             /{WIDEST_V6})"
+        )),
+        Width::Subnet if c.prefix() < widest => Err(format!(
+            "{c} is wider than /{widest}, the widest --allow-subnet takes: name the narrower ranges \
+             you mean"
+        )),
+        _ => Ok(c),
+    }
+}
+
+pub fn kept_by(c: &Cidr, keep: &[Kept]) -> Option<String> {
+    let hits: Vec<String> =
+        keep.iter().filter(|k| c.contains(&k.addr)).map(|k| format!("{} ({})", k.addr, k.what)).collect();
+    (!hits.is_empty()).then(|| {
+        format!(
+            "{c} covers {}: this host's log forwarding is never a block target. Block the \
+             address you mean on its own",
+            hits.join(", ")
+        )
+    })
+}
+
+pub fn render_dest_block(c: &Cidr, why: &str) -> String {
+    let family = if c.is_v4() { "ip" } else { "ip6" };
+    let single = if c.is_v4() { 32 } else { 128 };
+    let to = if c.prefix() == single { c.addr().to_string() } else { c.to_string() };
+    format!("    {family} daddr {to} drop  # {why}\n")
+}
+
+pub const RSYSLOG_CONF: &str = "/etc/rsyslog.conf";
+
+pub const RSYSLOG_DIR: &str = "/etc/rsyslog.d";
+
+fn syslog_host(s: &str) -> Option<IpAddr> {
+    let s = s.trim();
+    let unmapped = |a: IpAddr| match a {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(a, IpAddr::V4),
+        v4 => v4,
+    };
+    if let Ok(a) = s.parse::<IpAddr>() {
+        return Some(unmapped(a));
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        let (a, port) = rest.split_once(']')?;
+        let port_ok = port.is_empty() || port.strip_prefix(':').is_some_and(|p| p.parse::<u16>().is_ok());
+        return if port_ok { a.parse().ok().map(unmapped) } else { None };
+    }
+    let (a, port) = s.rsplit_once(':')?;
+    port.parse::<u16>().ok()?;
+    a.parse().ok().map(unmapped)
+}
+
+pub fn syslog_targets(text: &str) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        for w in line.split_whitespace() {
+            let Some(rest) = w.strip_prefix('@') else { continue };
+            let rest = rest.strip_prefix('@').unwrap_or(rest);
+            let rest = match rest.strip_prefix('(') {
+                Some(r) => r.split_once(')').map_or("", |(_, host)| host),
+                None => rest,
+            };
+            if let Some(a) = rest.split(';').next().and_then(syslog_host) {
+                out.push(a);
+            }
+        }
+        let lower = line.to_ascii_lowercase();
+        let mut at = 0;
+        while let Some(i) = lower.get(at..).and_then(|s| s.find("target")) {
+            at += i + "target".len();
+            let after = lower.get(at..).unwrap_or_default().trim_start();
+            let Some(v) = after.strip_prefix('=').map(str::trim_start).and_then(|v| v.strip_prefix('"')) else {
+                continue;
+            };
+            if let Some(a) = v.split_once('"').and_then(|(v, _)| syslog_host(v)) {
+                out.push(a);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+pub fn read_syslog_targets() -> Result<Vec<Kept>, String> {
+    use std::io::ErrorKind::NotFound;
+    let mut files = vec![std::path::PathBuf::from(RSYSLOG_CONF)];
+    match std::fs::read_dir(RSYSLOG_DIR) {
+        Ok(rd) => {
+            let mut more: Vec<std::path::PathBuf> =
+                rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "conf")).collect();
+            more.sort();
+            more.truncate(256);
+            files.extend(more);
+        }
+        Err(e) if e.kind() == NotFound => {}
+        Err(e) => return Err(format!("{RSYSLOG_DIR}: {e}")),
+    }
+    let mut out = Vec::new();
+    for f in files {
+        match crate::saferead::read_text(&f) {
+            Ok(t) => out.extend(syslog_targets(&t).into_iter().map(|addr| Kept {
+                addr,
+                what: format!("a syslog server this host forwards to, in {}", f.display()),
+            })),
+            Err(e) if e.kind() == NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", f.display())),
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -157,6 +307,10 @@ pub struct Narrowing {
     pub processes: Vec<Occupancy>,
 
     pub destinations: Vec<(String, String)>,
+
+    pub width: Width,
+
+    pub keep: Vec<Kept>,
 }
 
 impl Narrowing {
@@ -202,7 +356,11 @@ impl Narrowing {
         }
 
         for (d, why) in &self.destinations {
-            s.push_str(&render_dest_block(d, why)?);
+            let c = parse_dest(d, self.width)?;
+            if let Some(refusal) = kept_by(&c, &self.keep) {
+                return Err(refusal);
+            }
+            s.push_str(&render_dest_block(&c, why));
         }
         s.push_str("  }\n}\n");
         Ok(s)

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use crate::disk::{create_dir_private, read_regular, stream_dir_name, sync_dir, write_file_synced};
+use crate::disk::{create_dir_private, read_regular_capped, stream_dir_name, sync_dir, write_file_synced};
 use crate::segment::StreamId;
 use crate::store::StoreHeader;
 use crate::STORE_HEADER_FILE;
@@ -137,8 +137,28 @@ fn shown(raw: &[u8]) -> String {
 impl Parcel {
 
     pub fn pack_dir(dir: impl AsRef<Path>) -> std::io::Result<(Parcel, Vec<String>)> {
-        let dir = dir.as_ref();
-        let mut files = vec![ParcelFile { path: STORE_HEADER_FILE.to_string(), bytes: read_regular(&dir.join(STORE_HEADER_FILE))? }];
+        Self::pack_dir_within(dir.as_ref(), MAX_PARCEL_BYTES)
+    }
+
+    fn pack_dir_within(dir: &Path, bound: u64) -> std::io::Result<(Parcel, Vec<String>)> {
+        let mut held: u64 = 0;
+        let mut read = |p: &Path| -> std::io::Result<Vec<u8>> {
+            let so_far = held;
+            let left = bound.saturating_sub(so_far);
+            let bytes = read_regular_capped(p, left).map_err(|e| {
+
+                if so_far == 0 || !fs::symlink_metadata(p).is_ok_and(|m| m.len() > left) {
+                    return e;
+                }
+                std::io::Error::new(
+                    e.kind(),
+                    format!("{e}: a store's files are packed to at most {bound} bytes together, and {so_far} already were"),
+                )
+            })?;
+            held = so_far.saturating_add(bytes.len() as u64);
+            Ok(bytes)
+        };
+        let mut files = vec![ParcelFile { path: STORE_HEADER_FILE.to_string(), bytes: read(&dir.join(STORE_HEADER_FILE))? }];
         let mut skipped = Vec::new();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -168,7 +188,7 @@ impl Parcel {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let path = format!("{sname}/{name}");
                 if valid_path(&path) {
-                    files.push(ParcelFile { bytes: read_regular(&entry.path())?, path });
+                    files.push(ParcelFile { bytes: read(&entry.path())?, path });
                 } else {
                     skipped.push(path);
                 }

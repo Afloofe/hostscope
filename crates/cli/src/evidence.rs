@@ -718,6 +718,53 @@ impl hemostat_evfmt::Clock for BootClock {
 static SESSION_RECOVERY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 
 #[cfg(target_os = "linux")]
+pub(crate) enum Recovery {
+
+    Held {
+
+        public: [u8; 32],
+
+        #[cfg_attr(not(feature = "mod-tui"), allow(dead_code))]
+        from: &'static str,
+    },
+
+    Minted {
+
+        public: [u8; 32],
+
+        secret: hemostat_evcrypto::secret::Secret32,
+    },
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn recovery_from(
+    runtime: Option<&str>,
+    baked: Option<&str>,
+    mint: impl FnOnce() -> Result<[u8; 32], String>,
+) -> Result<Recovery, String> {
+    let named = |v: Option<&str>| v.filter(|v| !v.trim().is_empty()).map(str::to_string);
+    let (v, from) = match (named(runtime), named(baked)) {
+        (Some(v), _) => (v, "$HEMOSTAT_RECOVERY_PUBKEY"),
+        (None, Some(v)) => (v, "this build"),
+        (None, None) => {
+            let kp = hemostat_evcrypto::envelope::KeyPair::from_seed(mint()?);
+            return Ok(Recovery::Minted { public: kp.public_bytes(), secret: kp.secret_bytes() });
+        }
+    };
+    match parse_hex32(&v) {
+        Some(public) => Ok(Recovery::Held { public, from }),
+        None => Err(format!(
+            "$HEMOSTAT_RECOVERY_PUBKEY is set but is not 64 hex characters (got {} \
+             usable hex digit(s)). Nothing was collected. Fix the value, or unset it \
+             to have a recovery key minted here — but note that minting it here puts \
+             the only key that can read this store on the host you are collecting \
+             from",
+            v.chars().filter(char::is_ascii_hexdigit).count()
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn collect_inner(dir: &str) -> std::result::Result<CollectSummary, String> {
     use hemostat_evcrypto::seal::HeaderKeys;
     use hemostat_evfmt::{RecType, RunContext, StoreHeader, StoreWriter, StreamCrypto, StreamId};
@@ -744,33 +791,16 @@ pub(crate) fn collect_inner(dir: &str) -> std::result::Result<CollectSummary, St
 
     hemostat_evcrypto::secret::wipe_bytes(&mut seal_seed);
 
-    let asked = std::env::var("HEMOSTAT_RECOVERY_PUBKEY")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| option_env!("HEMOSTAT_RECOVERY_PUBKEY").map(str::to_string).filter(|v| !v.trim().is_empty()));
-    let (recovery_pub, generated_recovery) = match asked {
-        Some(v) => match parse_hex32(&v) {
-            Some(pk) => (pk, None),
-            None => {
-                return Err(format!(
-                    "$HEMOSTAT_RECOVERY_PUBKEY is set but is not 64 hex characters (got {} \
-                     usable hex digit(s)). Nothing was collected. Fix the value, or unset it \
-                     to have a recovery key minted here — but note that minting it here puts \
-                     the only key that can read this store on the host you are collecting \
-                     from",
-                    v.chars().filter(char::is_ascii_hexdigit).count()
-                ));
+    let (recovery_pub, generated_recovery) = match SESSION_RECOVERY.get() {
+        Some(pk) => (*pk, None),
+        None => {
+            let runtime = std::env::var("HEMOSTAT_RECOVERY_PUBKEY").ok();
+            let mint = || rand32().map_err(|e| format!("cannot read entropy for the recovery key: {e}"));
+            match recovery_from(runtime.as_deref(), option_env!("HEMOSTAT_RECOVERY_PUBKEY"), mint)? {
+                Recovery::Held { public, .. } => (public, None),
+                Recovery::Minted { public, secret } => (public, Some(secret)),
             }
-        },
-        None => match SESSION_RECOVERY.get() {
-            Some(pk) => (*pk, None),
-            None => {
-                let kp = hemostat_evcrypto::envelope::KeyPair::from_seed(
-                    rand32().map_err(|e| format!("cannot read entropy for the recovery key: {e}"))?,
-                );
-                (kp.public_bytes(), Some(kp.secret_bytes()))
-            }
-        },
+        }
     };
     let store = hemostat_evcrypto::envelope::KeyPair::from_seed(
         rand32().map_err(|e| format!("cannot read entropy for the store key: {e}"))?,
@@ -865,17 +895,20 @@ pub(crate) fn collect_inner(dir: &str) -> std::result::Result<CollectSummary, St
 
     let suid_r = hemostat_sensor_linux::suid::report();
 
-    let manifest_load = crate::vendor::load_manifest(None);
-    let manifest = manifest_load.as_ref().ok().and_then(Option::as_deref);
-    let inventory_r = hemostat_sensor_linux::inventory::report_with(manifest);
+    let integrity = crate::vendor::reference();
+    let manifest = integrity.manifest();
+    let mut inventory_r = hemostat_sensor_linux::inventory::report_with(manifest);
+    if let Some(f) = integrity.finding() {
+        inventory_r.findings.insert(0, f);
+    }
 
-    let reference = match &manifest_load {
-        Ok(Some(m)) => format!(
+    let reference = match (manifest, integrity.refused()) {
+        (Some(m), _) => format!(
             "{{\"event\":\"integrity-reference\",\"reference\":\"vendor-manifest\",\"release\":\"{}\"}}",
             jesc(&m.release)
         ),
-        Ok(None) => "{\"event\":\"integrity-reference\",\"reference\":\"host-package-database\"}".to_string(),
-        Err(e) => format!(
+        (None, None) => "{\"event\":\"integrity-reference\",\"reference\":\"host-package-database\"}".to_string(),
+        (None, Some(e)) => format!(
             "{{\"event\":\"integrity-reference\",\"reference\":\"host-package-database\",\"manifest_refused\":\"{}\"}}",
             jesc(e)
         ),
@@ -885,6 +918,7 @@ pub(crate) fn collect_inner(dir: &str) -> std::result::Result<CollectSummary, St
     let sysmap_r = hemostat_sensor_linux::sysmap::report();
     let kptr_r = hemostat_sensor_linux::kptrhooks::report();
     let kwalk_r = hemostat_sensor_linux::kwalk_report();
+    let kground_r = hemostat_sensor_linux::kground_report();
     let kernposture_r = hemostat_sensor_linux::kernposture_report();
 
     let accounts_r = hemostat_sensor_linux::account_report();
@@ -907,10 +941,11 @@ pub(crate) fn collect_inner(dir: &str) -> std::result::Result<CollectSummary, St
     let mut gaps = 0usize;
     for (source, covered) in [
         ("suid", coverage::from_flag(suid_r.available, &suid_r.reason)),
-        ("inventory", coverage::from_flag(inventory_r.available, &inventory_r.reason)),
+        ("inventory", integrity.coverage(&inventory_r)),
         ("sysmap", coverage::from_flag(sysmap_r.available, &sysmap_r.reason)),
         ("kptr-hooks", coverage::from_flag(kptr_r.available, &kptr_r.reason)),
         ("kwalk", coverage::kwalk(&kwalk_r)),
+        ("kground", coverage::kground(&kground_r)),
         ("kernel-posture", coverage::kernel_posture(&kernposture_r)),
         ("accounts", coverage::accounts(&accounts_r)),
         ("overview", coverage::overview(&overview_r)),
@@ -1004,6 +1039,7 @@ pub(crate) fn collect_inner(dir: &str) -> std::result::Result<CollectSummary, St
         push("trust", &trust_r.findings)?;
         push("kernel-posture", &kernposture_r.findings)?;
         push("kwalk", &kwalk_r.findings)?;
+        push("kground", &kground_r.findings)?;
     }
 
     s.close().map_err(|e| e.to_string())?;
@@ -1201,57 +1237,535 @@ impl hemostat_evfmt::RecordCipher for DekCipher {
 pub(crate) const CONSOLE_EVIDENCE: &str = "/var/lib/hemostat/evidence";
 
 #[cfg(all(target_os = "linux", feature = "mod-tui"))]
-pub(crate) fn console_sealed(mut m: hemostat_tui::ConsoleModel) -> hemostat_tui::ConsoleModel {
-    let (row, note) = console_seal();
-    m.last_result = Some(match m.last_result.take() {
-        Some(r) => format!("{r}  ·  {note}"),
-        None => note,
-    });
-    m.findings.push(row);
+pub(crate) fn console_seal_request() {
+
+    if console_key().is_err() {
+        return;
+    }
+    let mut sealer = lock(&SEALER);
+    if sealer.is_none() {
+        match Sealer::start(console_seal) {
+            Ok(s) => *sealer = Some(s),
+            Err(e) => {
+                let why = format!("the seal thread could not be started ({e})");
+                lock(&SEALS).push(SealOutcome::NotSealed { dir: CONSOLE_EVIDENCE.into(), why });
+                return;
+            }
+        }
+    }
+    if !sealer.as_ref().is_some_and(Sealer::ask) {
+        let why = "the seal thread has stopped".to_string();
+        lock(&SEALS).push(SealOutcome::NotSealed { dir: CONSOLE_EVIDENCE.into(), why });
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+pub(crate) fn with_seal_rows(mut m: hemostat_tui::ConsoleModel) -> hemostat_tui::ConsoleModel {
+    drain_seals();
+    m.add_rows(current_seal_rows());
+    if m.last_result.is_none() {
+        m.last_result = seal_footer(console_key(), lock(&MINTED).as_ref());
+    }
     m
 }
 
 #[cfg(all(target_os = "linux", feature = "mod-tui"))]
-fn console_seal() -> (hemostat_tui::FindingRow, String) {
-    use hemostat_tui::{FindingRow, Sev};
+pub(crate) fn console_seal_tick(m: &mut hemostat_tui::ConsoleModel) -> bool {
+    if !drain_seals() {
+        return false;
+    }
+    replace_seal_rows(m, current_seal_rows());
+    true
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+pub(crate) const SEAL_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+pub(crate) fn console_seal_finish() {
+    let sealer = lock(&SEALER).take();
+    if let Some(s) = sealer {
+        if s.pending() > 0 {
+            eprintln!(
+                "hemostat: finishing the evidence seal in progress before exiting — waiting up to {} s \
+                 (Ctrl-C leaves now); a store cut off mid-write does not verify as complete…",
+                SEAL_EXIT_WAIT.as_secs()
+            );
+        }
+        let f = s.finish_within(SEAL_EXIT_WAIT);
+        let sealing = lock(&SEALING).clone();
+        let mut log = lock(&SEALS);
+        log.extend(f.outcomes);
+        log.extend(left_undone(f.cut, sealing, f.never_begun, SEAL_EXIT_WAIT));
+    }
+    let log = std::mem::take(&mut *lock(&SEALS));
+    let minted = lock(&MINTED).take();
+
+    let Some(key) = CONSOLE_KEY.get() else { return };
+    for line in seal_summary(key, minted.as_ref(), &log) {
+        eprintln!("{line}");
+
+        hemostat_evcrypto::secret::wipe(line.into_bytes());
+    }
+
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn left_undone(cut: usize, sealing: Option<String>, never_begun: usize, waited: std::time::Duration) -> Vec<SealOutcome> {
+    let mut out = Vec::new();
+    if cut > 0 {
+        let (dir, left) = match sealing {
+            Some(dir) => (dir, "this store is INCOMPLETE and will not verify as complete"),
+            None => (CONSOLE_EVIDENCE.to_string(), "it had not yet made its store, and the sweep it was sealing is not kept"),
+        };
+        let why = format!(
+            "its seal was still being written when the console closed, after waiting {} s for it (a slow \
+             or stalled disk under {CONSOLE_EVIDENCE}?): {left}. `hemostat collect` seals the host as it \
+             is now",
+            waited.as_secs()
+        );
+        out.push(SealOutcome::NotSealed { dir, why });
+    }
+    if never_begun > 0 {
+        let why = format!(
+            "{never_begun} sweep(s) asked to be sealed were not: the console closed before their seal \
+             began. `hemostat collect` seals the host as it is now"
+        );
+        out.push(SealOutcome::NotSealed { dir: CONSOLE_EVIDENCE.into(), why });
+    }
+    out
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConsoleKey {
+    public: [u8; 32],
+
+    from: &'static str,
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+static CONSOLE_KEY: std::sync::OnceLock<Result<ConsoleKey, String>> = std::sync::OnceLock::new();
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+static MINTED: std::sync::Mutex<Option<hemostat_evcrypto::secret::Secret32>> = std::sync::Mutex::new(None);
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+static SEALER: std::sync::Mutex<Option<Sealer<SealOutcome>>> = std::sync::Mutex::new(None);
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+static SEALS: std::sync::Mutex<Vec<SealOutcome>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+static SEALING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn console_key() -> &'static Result<ConsoleKey, String> {
+    CONSOLE_KEY.get_or_init(|| {
+        let runtime = std::env::var("HEMOSTAT_RECOVERY_PUBKEY").ok();
+        let mint = || rand32().map_err(|e| format!("cannot read entropy for the recovery key: {e}"));
+        let key = match recovery_from(runtime.as_deref(), option_env!("HEMOSTAT_RECOVERY_PUBKEY"), mint)? {
+            Recovery::Held { public, from } => ConsoleKey { public, from },
+            Recovery::Minted { public, secret } => {
+                *lock(&MINTED) = Some(secret);
+                ConsoleKey { public, from: "minted here" }
+            }
+        };
+        let _ = SESSION_RECOVERY.set(key.public);
+        Ok(key)
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+struct Sealer<T> {
+    ask: Option<std::sync::mpsc::Sender<()>>,
+    done: std::sync::mpsc::Receiver<T>,
+    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    sealing: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    closing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+#[derive(Debug, PartialEq, Eq)]
+struct Finished<T> {
+
+    outcomes: Vec<T>,
+
+    cut: usize,
+
+    never_begun: usize,
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+impl<T: Send + 'static> Sealer<T> {
+
+    fn start(mut seal: impl FnMut() -> T + Send + 'static) -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let (ask, asked) = std::sync::mpsc::channel::<()>();
+        let (tell, done) = std::sync::mpsc::channel::<T>();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let sealing = Arc::new(AtomicUsize::new(0));
+        let closing = Arc::new(AtomicBool::new(false));
+        let (left, now, stop) = (Arc::clone(&pending), Arc::clone(&sealing), Arc::clone(&closing));
+        let thread = std::thread::Builder::new().name("console-seal".into()).spawn(move || {
+
+            while asked.recv().is_ok() {
+                let mut covered = 1;
+                while asked.try_recv().is_ok() {
+                    covered += 1;
+                }
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                now.store(covered, Ordering::SeqCst);
+                let outcome = seal();
+                now.store(0, Ordering::SeqCst);
+                left.fetch_sub(covered, Ordering::SeqCst);
+                if tell.send(outcome).is_err() {
+                    break;
+                }
+            }
+        })?;
+        Ok(Sealer { ask: Some(ask), done, pending, sealing, closing, thread: Some(thread) })
+    }
+
+    fn ask(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let Some(ask) = &self.ask else { return false };
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        if ask.send(()).is_ok() {
+            true
+        } else {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+            false
+        }
+    }
+
+    fn ready(&self) -> Vec<T> {
+        self.done.try_iter().collect()
+    }
+
+    fn pending(&self) -> usize {
+        self.pending.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn close(&mut self) {
+        self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(self.ask.take());
+    }
+
+    fn finish_within(mut self, wait: std::time::Duration) -> Finished<T> {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::RecvTimeoutError;
+        self.close();
+        let start = std::time::Instant::now();
+        let mut outcomes = Vec::new();
+
+        let ended = loop {
+            match self.done.recv_timeout(wait.saturating_sub(start.elapsed())) {
+                Ok(o) => outcomes.push(o),
+                Err(RecvTimeoutError::Timeout) => break false,
+                Err(RecvTimeoutError::Disconnected) => break true,
+            }
+        };
+        if ended {
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+            return Finished { outcomes, cut: 0, never_begun: self.pending() };
+        }
+        let mut cut = self.sealing.load(Ordering::SeqCst);
+        let mut unanswered = self.pending();
+
+        let late: Vec<T> = self.done.try_iter().collect();
+        if !late.is_empty() {
+            cut = self.sealing.load(Ordering::SeqCst);
+            unanswered = self.pending();
+            outcomes.extend(late);
+        }
+        Finished { outcomes, cut, never_begun: unanswered.saturating_sub(cut) }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SealOutcome {
+
+    Sealed {
+        dir: String,
+        findings: usize,
+        custody: usize,
+
+        complete: bool,
+
+        shed: Option<String>,
+        seal_pub: [u8; 32],
+    },
+
+    NotSealed { dir: String, why: String },
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn console_seal() -> SealOutcome {
     use std::os::unix::fs::DirBuilderExt as _;
-    let row = |severity: Sev, subject: String, what: String, why: String, evidence: Vec<String>| FindingRow {
-        severity,
-        source: "evidence".into(),
-        subject,
-        what,
-        why,
-        remedy: None,
-        evidence,
-    };
     if let Err(e) = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(CONSOLE_EVIDENCE) {
-        let what = format!("this sweep was NOT sealed: {CONSOLE_EVIDENCE} could not be made ({e})");
-        let note = "evidence NOT sealed (run the console as root)".to_string();
-        return (row(Sev::Warn, CONSOLE_EVIDENCE.into(), what, "the findings on screen exist nowhere else".into(), vec![]), note);
+        let why = format!("{CONSOLE_EVIDENCE} could not be made ({e}); run the console as root");
+        return SealOutcome::NotSealed { dir: CONSOLE_EVIDENCE.into(), why };
     }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let dir = format!("{CONSOLE_EVIDENCE}/console-{stamp}");
-    match collect_inner(&dir) {
-        Ok(s) => {
-            let partial = if s.complete() { String::new() } else { " — PARTIAL: a sweep did not run in full, and the store says which".into() };
-            let mut what = format!("this sweep sealed: {} finding(s), {} custody record(s){partial}", s.findings, s.custody);
-            let mut evidence = vec![dir.clone(), format!("seal key {}", hex32(&s.seal_pub))];
-            let mut why = "verify it with `hemostat verify` (no key needed); read it with the recovery key".to_string();
-            if let Some(k) = &s.generated_recovery {
-                let _ = SESSION_RECOVERY.set(s.recovery_pub);
-                what.push_str(". A recovery key was minted here, because $HEMOSTAT_RECOVERY_PUBKEY is not set");
-                evidence.push(format!("RECOVERY KEY {}", hex32(k.expose())));
-                why = "WRITE THE RECOVERY KEY DOWN and keep it off this host: it is shown only here, every store \
-                       this session seals uses it, and nothing else can read them"
-                    .into();
-            }
-            (row(Sev::Note, dir.clone(), what, why, evidence), format!("evidence sealed to {dir}"))
-        }
-        Err(e) => {
-            let note = "evidence NOT sealed (see the evidence row)".to_string();
-            (row(Sev::Warn, dir, format!("this sweep was NOT sealed: {e}"), "the findings on screen exist nowhere else".into(), vec![]), note)
-        }
+    *lock(&SEALING) = Some(dir.clone());
+    let collected = collect_inner(&dir);
+    *lock(&SEALING) = None;
+    match collected {
+
+        Ok(s) if s.generated_recovery.is_some() => SealOutcome::NotSealed {
+            dir,
+            why: "it was written, but wrapped to a recovery key minted for it alone that this console \
+                  never showed, so nothing can read it"
+                .into(),
+        },
+        Ok(s) => SealOutcome::Sealed {
+            dir,
+            findings: s.findings,
+            custody: s.custody,
+            complete: s.complete(),
+            shed: s.shed.clone(),
+            seal_pub: s.seal_pub,
+        },
+        Err(why) => SealOutcome::NotSealed { dir, why },
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn drain_seals() -> bool {
+    let sealer = lock(&SEALER);
+    let ready = sealer.as_ref().map(Sealer::ready).unwrap_or_default();
+    if ready.is_empty() {
+        return false;
+    }
+    lock(&SEALS).extend(ready);
+    true
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn current_seal_rows() -> Vec<hemostat_tui::FindingRow> {
+    let pending = lock(&SEALER).as_ref().map_or(0, Sealer::pending);
+    seal_rows(console_key(), lock(&MINTED).as_ref(), &lock(&SEALS), pending)
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+const SEAL_SOURCE: &str = "evidence";
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+const RECOVERY_SUBJECT: &str = "recovery key";
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn seal_rows(
+    key: &Result<ConsoleKey, String>,
+    minted: Option<&hemostat_evcrypto::secret::Secret32>,
+    log: &[SealOutcome],
+    pending: usize,
+) -> Vec<hemostat_tui::FindingRow> {
+    use hemostat_tui::{FindingRow, Sev};
+    let row = |severity: Sev, subject: &str, what: String, why: String, evidence: Vec<String>| FindingRow {
+        severity,
+        source: SEAL_SOURCE.into(),
+        subject: subject.into(),
+        what,
+        why,
+        remedy: None,
+        evidence,
+    };
+    let recovery = match (key, minted) {
+        (Err(why), _) => row(
+            Sev::Warn,
+            RECOVERY_SUBJECT,
+            format!("this console's sweeps are NOT being sealed, because no recovery key could be had: {why}"),
+            "the findings on screen exist nowhere else. Once the reason above is fixed, open the \
+             console again"
+                .into(),
+            vec![],
+        ),
+        (Ok(k), Some(secret)) => row(
+            Sev::Warn,
+            RECOVERY_SUBJECT,
+            "NO RECOVERY KEY WAS SET, so one was minted here: every store this console seals is wrapped \
+             to it, and nothing else can read them"
+                .into(),
+            "WRITE THE RECOVERY KEY DOWN and take it off this host: it is on this screen while the \
+             console is open and printed once more when it closes. Read a store on the machine you \
+             took it to, with HEMOSTAT_RECOVERY_KEY_FILE pointing at a file that holds it. Set \
+             $HEMOSTAT_RECOVERY_PUBKEY before opening the console to seal to a key you already hold"
+                .into(),
+            vec![format!("RECOVERY KEY {}", hex32(secret.expose())), format!("public half {}", hex32(&k.public))],
+        ),
+        (Ok(k), None) => row(
+            Sev::Note,
+            RECOVERY_SUBJECT,
+            format!(
+                "every store this console seals is wrapped to recovery key {} ({})",
+                hex32(&k.public),
+                if k.from == "minted here" { "minted here; its private half has been wiped" } else { k.from }
+            ),
+            "its private half reads them, on a machine other than this one; verify a store with \
+             `hemostat verify` (no key needed)"
+                .into(),
+            vec![format!("recovery public key {}", hex32(&k.public)), format!("stores under {CONSOLE_EVIDENCE}")],
+        ),
+    };
+    let mut rows = vec![recovery];
+
+    let sealed: Vec<&SealOutcome> = log.iter().filter(|o| matches!(o, SealOutcome::Sealed { .. })).collect();
+    let failed: Vec<(&str, &str)> = log
+        .iter()
+        .filter_map(|o| match o {
+            SealOutcome::NotSealed { dir, why } => Some((dir.as_str(), why.as_str())),
+            SealOutcome::Sealed { .. } => None,
+        })
+        .collect();
+    let running = if pending > 0 { "; a seal is running now" } else { "" };
+    let status = match log.last() {
+        None if pending == 0 => None,
+        None => Some((Sev::Note, "sealing this sweep in the background; the result is shown here when it is written".to_string())),
+        Some(SealOutcome::Sealed { dir, findings, custody, complete, shed, .. }) => {
+            let partial = if *complete { "" } else { " — PARTIAL: a sweep did not run in full, and the store says which" };
+            let not = if failed.is_empty() { String::new() } else { format!(", {} NOT sealed", failed.len()) };
+            Some(match shed {
+                Some(why) => (Sev::Warn, format!("the last seal, {dir}, wrote NO FINDINGS: {why}{running}")),
+                None => (
+                    if failed.is_empty() { Sev::Note } else { Sev::Warn },
+                    format!(
+                        "{} sweep(s) sealed this session{not}; the last to {dir}: {findings} finding(s), \
+                         {custody} custody record(s){partial}{running}",
+                        sealed.len()
+                    ),
+                ),
+            })
+        }
+        Some(SealOutcome::NotSealed { why, .. }) => Some((
+            Sev::Warn,
+            format!("the last sweep was NOT sealed: {why}; {} sweep(s) sealed this session{running}", sealed.len()),
+        )),
+    };
+    if let Some((severity, what)) = status {
+        let why = if failed.is_empty() {
+            "verify a store with `hemostat verify` (no key needed); read it with the recovery key, off this host".to_string()
+        } else {
+            "a sweep that was not sealed exists nowhere but on this screen; the reasons are below".to_string()
+        };
+        let mut evidence: Vec<String> = sealed
+            .iter()
+            .rev()
+            .take(10)
+            .filter_map(|o| match o {
+                SealOutcome::Sealed { dir, .. } => Some(dir.clone()),
+                SealOutcome::NotSealed { .. } => None,
+            })
+            .collect();
+        if let Some(SealOutcome::Sealed { seal_pub, .. }) = sealed.last() {
+            evidence.push(format!("seal key of the last store {}", hex32(seal_pub)));
+        }
+        evidence.extend(failed.iter().rev().take(5).map(|(dir, why)| format!("NOT sealed: {dir}: {why}")));
+        rows.push(row(severity, CONSOLE_EVIDENCE, what, why, evidence));
+    }
+    rows
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn seal_footer(key: &Result<ConsoleKey, String>, minted: Option<&hemostat_evcrypto::secret::Secret32>) -> Option<String> {
+    match (key, minted) {
+        (Err(_), _) => Some("evidence NOT sealed: no recovery key could be had (see the evidence row)".into()),
+        (Ok(_), Some(secret)) => Some(format!(
+            "RECOVERY KEY {} — write it down: it alone reads this console's evidence (see the evidence row)",
+            hex32(secret.expose())
+        )),
+        (Ok(_), None) => None,
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn replace_seal_rows(m: &mut hemostat_tui::ConsoleModel, rows: Vec<hemostat_tui::FindingRow>) {
+    let ours = |f: &hemostat_tui::FindingRow| {
+        f.source == SEAL_SOURCE && (f.subject == RECOVERY_SUBJECT || f.subject == CONSOLE_EVIDENCE)
+    };
+    let selected = m.findings.get(m.selected).map(hemostat_tui::FindingRow::identity);
+    m.findings.retain(|f| !ours(f));
+    m.selected = 0;
+    m.add_rows(rows);
+    m.selected = selected
+        .and_then(|id| m.findings.iter().position(|f| f.identity() == id))
+        .unwrap_or(0)
+        .min(m.findings.len().saturating_sub(1));
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn seal_summary(
+    key: &Result<ConsoleKey, String>,
+    minted: Option<&hemostat_evcrypto::secret::Secret32>,
+    log: &[SealOutcome],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let sealed: Vec<&str> = log
+        .iter()
+        .filter_map(|o| match o {
+            SealOutcome::Sealed { dir, .. } => Some(dir.as_str()),
+            SealOutcome::NotSealed { .. } => None,
+        })
+        .collect();
+    let failed: Vec<(&str, &str)> = log
+        .iter()
+        .filter_map(|o| match o {
+            SealOutcome::NotSealed { dir, why } => Some((dir.as_str(), why.as_str())),
+            SealOutcome::Sealed { .. } => None,
+        })
+        .collect();
+    let k = match key {
+        Err(why) => {
+            out.push(format!("hemostat: this console sealed nothing: {}", h(why)));
+            return out;
+        }
+        Ok(k) => k,
+    };
+    if log.is_empty() && minted.is_none() {
+        return out;
+    }
+    out.push(format!(
+        "hemostat: this console sealed {} sweep(s) into {CONSOLE_EVIDENCE}{}",
+        sealed.len(),
+        if failed.is_empty() { String::new() } else { format!("; {} NOT sealed:", failed.len()) }
+    ));
+    for (dir, why) in &failed {
+        out.push(format!("  NOT sealed  {}: {}", h(dir), h(why)));
+    }
+    if let Some(last) = sealed.last() {
+        out.push(format!("  last store  {}   (check it with: hemostat verify {})", h(last), h(last)));
+    }
+    out.push(format!("  recovery    {} ({}) — the public half of the key that reads them", hex32(&k.public), k.from));
+    if let Some(secret) = minted {
+        let store = sealed.last().copied().unwrap_or("<store>");
+        out.push(format!(
+            "\n  ┌─ RECOVERY KEY ─ save this off-host; it is the ONLY key that can read these stores ─┐\n  \
+             │  {}\n  \
+             └────────────────────────────────────────────────────────────────────────────────────┘\n  \
+             Copy it off this host NOW, then read a store on the machine you took it to:\n  \
+             \x20   printf %s <key> > key.hex && chmod 600 key.hex\n  \
+             \x20   HEMOSTAT_RECOVERY_KEY_FILE=key.hex hemostat read {}\n\n  \
+             Do NOT read them back here: root on this host can read the key out of any process\n  \
+             that holds it. It exists at all only because $HEMOSTAT_RECOVERY_PUBKEY was not set —\n  \
+             set it before opening the console to seal to a key you already hold.",
+            hex32(secret.expose()),
+            h(store)
+        ));
+    }
+    out
 }

@@ -19,6 +19,9 @@ hemostat-evfmt = { path = "../evfmt" }
 hemostat-evcrypto = { path = "../evcrypto" }
 sha2 = { version = "0.10", default-features = false }
 libc = "0.2"
+# The accounts no action changes (`hs_core::accounts`), one list shared with
+# the cli's golden baseline. Already in every image through sensor-linux.
+hemostat-core = { path = "../core" }
 
 [dev-dependencies]
 # Only so a test can hold uninstall's runit directory list equal to the one the

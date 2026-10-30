@@ -174,7 +174,8 @@ pub fn continuity(cursor: Option<&Cursor>, spans: &[Span<'_>]) -> Continuity {
     let Some(s) = spans.iter().find(|s| s.file.dev == c.dev && s.file.ino == c.ino) else {
         return Continuity::Rotated;
     };
-    let end = s.from + s.bytes.len() as u64;
+
+    let end = s.from.saturating_add(s.bytes.len() as u64);
     if end < c.offset {
         return Continuity::Truncated { path: s.file.path.clone(), was: c.offset, now: end };
     }

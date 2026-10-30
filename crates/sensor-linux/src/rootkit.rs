@@ -43,7 +43,7 @@ pub struct Report {
     pub did_not_run: Vec<String>,
 }
 
-fn pids_via_readdir() -> Option<BTreeSet<u32>> {
+pub(crate) fn pids_via_readdir() -> Option<BTreeSet<u32>> {
     let mut out = BTreeSet::new();
     for entry in fs::read_dir("/proc").ok()? {
         let entry = entry.ok()?;

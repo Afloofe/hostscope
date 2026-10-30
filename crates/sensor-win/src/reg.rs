@@ -10,11 +10,13 @@ pub fn hklm_values(subkey: &str) -> Vec<(String, String)> {
 
 #[cfg(target_os = "windows")]
 pub fn hklm_values_read(subkey: &str) -> Result<Vec<(String, String)>, u32> {
-    use windows_sys::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegEnumValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
         REG_EXPAND_SZ, REG_MULTI_SZ, REG_SZ,
     };
+
+    const MAX_VALUE_BYTES: u32 = 16 * 1024 * 1024;
 
     let path: Vec<u16> = subkey.encode_utf16().chain(core::iter::once(0)).collect();
     let mut h: HKEY = core::ptr::null_mut();
@@ -35,18 +37,28 @@ pub fn hklm_values_read(subkey: &str) -> Result<Vec<(String, String)>, u32> {
         let mut data_len = data.len() as u32;
         let mut kind: u32 = 0;
 
-        let rc = unsafe {
-            RegEnumValueW(
-                h,
-                i,
-                name.as_mut_ptr(),
-                core::ptr::addr_of_mut!(name_len),
-                core::ptr::null_mut(),
-                core::ptr::addr_of_mut!(kind),
-                data.as_mut_ptr().cast(),
-                core::ptr::addr_of_mut!(data_len),
-            )
-        };
+        let mut rc = ERROR_MORE_DATA;
+        for _ in 0..2 {
+            name_len = name.len() as u32;
+            data_len = data.len() as u32;
+
+            rc = unsafe {
+                RegEnumValueW(
+                    h,
+                    i,
+                    name.as_mut_ptr(),
+                    core::ptr::addr_of_mut!(name_len),
+                    core::ptr::null_mut(),
+                    core::ptr::addr_of_mut!(kind),
+                    data.as_mut_ptr().cast(),
+                    core::ptr::addr_of_mut!(data_len),
+                )
+            };
+            if rc != ERROR_MORE_DATA || data_len > MAX_VALUE_BYTES {
+                break;
+            }
+            data.resize(data_len as usize, 0);
+        }
         if rc == ERROR_NO_MORE_ITEMS {
             break;
         }

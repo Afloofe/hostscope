@@ -42,6 +42,8 @@ pub mod procfs;
 
 pub mod saferead;
 
+pub mod safewrite;
+
 pub mod kprobe;
 pub mod kptrhooks;
 pub mod sysmap;
@@ -50,9 +52,13 @@ pub mod inventory;
 pub mod crossview;
 pub mod ebpf_sensor;
 pub mod sigpipe;
+
+pub mod rng;
 pub mod bpfprog;
 pub mod kernposture;
 pub mod kwalk;
+
+pub mod kground;
 pub mod watchdog;
 pub mod sshd;
 pub mod netnarrow;
@@ -73,6 +79,7 @@ pub use crossview::{report as crossview_report, Report as CrossViewReport};
 pub use audit::{report as audit_report, Report as AuditReport};
 pub use kernposture::{report as kernposture_report, Report as KernPostureReport};
 pub use kwalk::{report as kwalk_report, Report as KwalkReport};
+pub use kground::{report as kground_report, Report as KgroundReport};
 pub use bpfprog::{report as bpfprog_report, ProgSummary, Report as BpfProgReport};
 pub use syscallhook::{report as syscall_hook_report, Report as SyscallHookReport};
 pub use ftracehook::{report as ftrace_hook_report, Report as FtraceHookReport};

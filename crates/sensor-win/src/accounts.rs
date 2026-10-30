@@ -299,6 +299,16 @@ pub fn report() -> Report {
 }
 
 #[cfg(target_os = "windows")]
+pub fn sid_of(name: &str) -> Result<Option<String>, u32> {
+    read::sid_of_name(name)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn sid_of(_name: &str) -> Result<Option<String>, u32> {
+    Err(u32::MAX)
+}
+
+#[cfg(target_os = "windows")]
 mod read {
     use super::{assemble, unavailable, Account, AdminMember, Report};
     use windows_sys::Win32::Foundation::LocalFree;
@@ -537,6 +547,40 @@ mod read {
             return if err == ERROR_NONE_MAPPED { Ok(None) } else { Err(err) };
         }
         Ok(Some(String::from_utf16_lossy(name.get(..name_len as usize).unwrap_or_default())))
+    }
+
+    pub(super) fn sid_of_name(name: &str) -> Result<Option<String>, u32> {
+        use windows_sys::Win32::Security::{LookupAccountNameW, SidTypeUser};
+        const ERROR_NONE_MAPPED: u32 = 1332;
+        let n = wide(name);
+
+        let mut sid = [0u8; 256];
+        let mut sid_len = sid.len() as u32;
+        let mut domain = [0u16; 256];
+        let mut domain_len = domain.len() as u32;
+        let mut kind = SidTypeUser;
+
+        let ok = unsafe {
+            LookupAccountNameW(
+                core::ptr::null(),
+                n.as_ptr(),
+                sid.as_mut_ptr().cast(),
+                core::ptr::addr_of_mut!(sid_len),
+                domain.as_mut_ptr(),
+                core::ptr::addr_of_mut!(domain_len),
+                core::ptr::addr_of_mut!(kind),
+            )
+        };
+        if ok == 0 {
+
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return if err == ERROR_NONE_MAPPED { Ok(None) } else { Err(err) };
+        }
+
+        match unsafe { sid_text(sid.as_mut_ptr().cast()) } {
+            Some(s) => Ok(Some(s)),
+            None => Err(u32::MAX),
+        }
     }
 
     pub(super) fn privileged_groups() -> Vec<super::GroupRead> {

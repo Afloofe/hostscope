@@ -139,11 +139,16 @@ enum CgroupUnit {
     User { manager: String, unit: String },
 }
 
+pub fn cgroup_path(line: &str) -> Option<&str> {
+    line.splitn(3, ':').nth(2)
+}
+
 fn cgroup_unit(text: &str) -> Option<CgroupUnit> {
     let is_manager = |c: &str| c.starts_with("user@") && c.ends_with(".service");
     let mut found = None;
     for line in text.lines() {
-        let path: Vec<&str> = line.rsplit(':').next().unwrap_or("").split('/').collect();
+        let Some(path) = cgroup_path(line) else { continue };
+        let path: Vec<&str> = path.split('/').collect();
         let Some(at) = path.iter().rposition(|c| c.ends_with(".service") || c.ends_with(".scope")) else {
             continue;
         };
@@ -160,8 +165,8 @@ fn cgroup_unit(text: &str) -> Option<CgroupUnit> {
     found
 }
 
-pub fn loop_respawner(cmdline: &str) -> Option<String> {
-    let lower = cmdline.to_ascii_lowercase();
+pub fn loop_respawner(text: &str, own: &[String], is_program: &dyn Fn(&str) -> bool) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
     let looping = lower.contains("while ")
         || lower.contains("until ")
         || lower.contains("for(;;)")
@@ -170,30 +175,122 @@ pub fn loop_respawner(cmdline: &str) -> Option<String> {
     if !(looping && sleeping) {
         return None;
     }
-    cmdline
-        .split_whitespace()
+    text.split_whitespace()
         .map(|t| t.trim_matches(|c| c == '"' || c == '\'' || c == ';' || c == '`' || c == '('))
-        .find(|t| t.starts_with('/') && t.len() > 1 && !t.starts_with("/bin/sh") && !t.starts_with("/bin/bash"))
+        .find(|t| {
+            t.starts_with('/') && t.len() > 1 && !is_interpreter(t) && !own.iter().any(|o| o == t) && is_program(t)
+        })
         .map(|s| s.to_string())
 }
 
-pub fn guard_pairs(procs: &[ProcSnapshot]) -> Vec<(u32, u32)> {
-    pairs_from(&procs.iter().map(|p| (p.pid, identity(p), program_text(p))).collect::<Vec<_>>())
+fn program_check<'a>(procs: &[ProcSnapshot], is_exec: &'a dyn Fn(&str) -> bool) -> impl Fn(&str) -> bool + 'a {
+    let live: BTreeSet<String> = procs.iter().map(identity).collect();
+    move |t: &str| live.contains(t) || live.contains(&format!("{t} (deleted)")) || is_exec(t)
 }
 
-pub fn pairs_from(procs: &[(u32, String, String)]) -> Vec<(u32, u32)> {
+pub fn guard_pairs(procs: &[ProcSnapshot]) -> Vec<(u32, u32)> {
+    pairs_with(procs, &program_text, &is_executable_file)
+}
+
+pub fn pairs_with(
+    procs: &[ProcSnapshot],
+    text: &dyn Fn(&ProcSnapshot) -> String,
+    is_exec: &dyn Fn(&str) -> bool,
+) -> Vec<(u32, u32)> {
+    let read: Vec<(u32, Option<String>, BTreeSet<String>)> = procs
+        .iter()
+        .map(|p| (p.pid, pair_name(p).filter(|n| is_exec(n)), names_in(&text(p), &own_names(p))))
+        .collect();
+    pairs_from(&read)
+}
+
+pub fn pairs_from(procs: &[(u32, Option<String>, BTreeSet<String>)]) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
-    for (i, (apid, aid, atext)) in procs.iter().enumerate() {
-        for (bpid, bid, btext) in procs.iter().skip(i + 1) {
-            if aid == bid {
+    for (i, (apid, aname, anames)) in procs.iter().enumerate() {
+        let Some(aname) = aname else { continue };
+        for (bpid, bname, bnames) in procs.iter().skip(i + 1) {
+            let Some(bname) = bname else { continue };
+            if aname == bname {
                 continue;
             }
-            if atext.contains(bid.as_str()) && btext.contains(aid.as_str()) {
+            if anames.contains(bname) && bnames.contains(aname) {
                 out.push((*apid, *bpid));
             }
         }
     }
     out
+}
+
+pub fn pair_name(p: &ProcSnapshot) -> Option<String> {
+    let name = match script_of(p) {
+        Some(_) if reads_program_elsewhere(p) => return None,
+        Some(script) => script,
+        None => {
+            let exe = p.exe.as_deref()?;
+            if is_interpreter(exe) {
+                return None;
+            }
+            exe.to_string()
+        }
+    };
+    let plain = name.len() > 1
+        && name.starts_with('/')
+        && !name.contains(|c: char| c.is_whitespace() || WORD_BREAKS.contains(&c));
+    plain.then_some(name)
+}
+
+const WORD_BREAKS: &[char] = &['"', '\'', '`', ';', '|', '&', '<', '>', '(', ')', '{', '}', '[', ']', ',', '='];
+
+pub fn names_in(text: &str, own: &[String]) -> BTreeSet<String> {
+    text.split(|c: char| c.is_whitespace() || WORD_BREAKS.contains(&c))
+        .filter(|w| w.len() > 1 && w.starts_with('/') && !own.iter().any(|o| o == w))
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn own_names(p: &ProcSnapshot) -> Vec<String> {
+    let mut own: Vec<String> = Vec::new();
+    if let Some(argv0) = p.cmdline.as_deref().and_then(|c| c.split_whitespace().next()) {
+        own.push(argv0.to_string());
+    }
+    own.extend(p.exe.clone());
+    own.extend(script_of(p));
+    own
+}
+
+fn reads_program_elsewhere(p: &ProcSnapshot) -> bool {
+    let (Some(exe), Some(cmd)) = (p.exe.as_deref(), p.cmdline.as_deref()) else { return false };
+    let full = exe.rsplit('/').next().unwrap_or(exe);
+    let (shell, inline): (bool, &[char]) = match full.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.') {
+        "sh" | "bash" | "dash" | "zsh" | "ksh" => (true, &['s', 'c']),
+        "python" => (false, &['c']),
+        "perl" => (false, &['e', 'E']),
+        "ruby" => (false, &['e']),
+        "php" => (false, &['r']),
+        _ => (false, &[]),
+    };
+    for t in cmd.split_whitespace().skip(1) {
+
+        let Some(flags) = t.strip_prefix('-') else { return false };
+        if flags.is_empty() || (shell && (t == "--rcfile" || t == "--init-file")) {
+            return true;
+        }
+        if !flags.starts_with('-') && flags.contains(inline) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_interpreter(path: &str) -> bool {
+    let full = path.rsplit('/').next().unwrap_or(path);
+    let base = full.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    INTERPRETERS.contains(&base) || INTERPRETERS.contains(&full)
+}
+
+fn is_executable_file(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 pub fn respawns(before: &[ProcSnapshot], after: &[ProcSnapshot]) -> Vec<Respawn> {
@@ -284,7 +381,7 @@ fn attribute_cgroup(p: &ProcSnapshot, cgroup: &str, procs: &[ProcSnapshot]) -> S
 fn user_manager(cgroup: &str) -> Option<String> {
     cgroup
         .lines()
-        .filter_map(|l| l.rsplit(':').next())
+        .filter_map(cgroup_path)
         .flat_map(|p| p.split('/'))
         .find(|c| c.starts_with("user@") && c.ends_with(".service"))
         .map(str::to_string)
@@ -378,6 +475,16 @@ pub fn findings(
 }
 
 pub fn group_for(pid: u32, procs: &[ProcSnapshot], unit: Option<&str>) -> (Vec<u32>, Vec<String>) {
+    group_with(pid, procs, unit, &program_text, &is_executable_file)
+}
+
+pub fn group_with(
+    pid: u32,
+    procs: &[ProcSnapshot],
+    unit: Option<&str>,
+    text: &dyn Fn(&ProcSnapshot) -> String,
+    is_exec: &dyn Fn(&str) -> bool,
+) -> (Vec<u32>, Vec<String>) {
     let mut members: BTreeSet<u32> = BTreeSet::new();
     members.insert(pid);
 
@@ -386,7 +493,7 @@ pub fn group_for(pid: u32, procs: &[ProcSnapshot], unit: Option<&str>) -> (Vec<u
     };
     let target_id = identity(target);
 
-    for (a, b) in guard_pairs(procs) {
+    for (a, b) in pairs_with(procs, text, is_exec) {
         if a == pid {
             members.insert(b);
         } else if b == pid {
@@ -394,11 +501,12 @@ pub fn group_for(pid: u32, procs: &[ProcSnapshot], unit: Option<&str>) -> (Vec<u
         }
     }
 
+    let is_program = program_check(procs, is_exec);
     for p in procs {
         if p.pid == pid || p.pid <= 1 {
             continue;
         }
-        if let Some(relaunches) = loop_respawner(&program_text(p)) {
+        if let Some(relaunches) = loop_respawner(&text(p), &own_names(p), &is_program) {
             if relaunches == target_id {
                 members.insert(p.pid);
             }
@@ -409,6 +517,50 @@ pub fn group_for(pid: u32, procs: &[ProcSnapshot], unit: Option<&str>) -> (Vec<u
     (members.into_iter().collect(), unit.into_iter().map(|s| s.to_string()).collect())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Pinned {
+
+    pub pid: u32,
+
+    pub start: u64,
+}
+
+impl Pinned {
+
+    pub fn seed(procs: &[&ProcSnapshot]) -> Vec<Pinned> {
+        let mut out: Vec<Pinned> = Vec::new();
+        for p in procs {
+            let pin = Pinned { pid: p.pid, start: p.starttime_ticks };
+            if pin.pid > 1 && pin.start > 0 && !out.contains(&pin) {
+                out.push(pin);
+            }
+        }
+        out
+    }
+
+    pub fn is(&self, p: &ProcSnapshot) -> bool {
+        p.pid == self.pid && p.starttime_ticks == self.start
+    }
+
+    pub fn list(seed: &[Pinned]) -> String {
+        seed.iter().map(|s| format!("{}@{}", s.pid, s.start)).collect::<Vec<_>>().join(",")
+    }
+
+    pub fn parse_list(s: &str) -> Option<Vec<Pinned>> {
+        let number = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+        s.split(',')
+            .map(|e| {
+                let (pid, start) = e.split_once('@')?;
+                if !number(pid) || !number(start) {
+                    return None;
+                }
+                let pin = Pinned { pid: pid.parse().ok()?, start: start.parse().ok()? };
+                (pin.pid > 1 && pin.start > 0).then_some(pin)
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Report {
 
@@ -417,6 +569,15 @@ pub struct Report {
     pub reason: Option<String>,
 
     pub findings: Vec<Finding>,
+
+    pub seeds: Vec<Vec<Pinned>>,
+}
+
+impl Report {
+
+    pub fn seed(&self, i: usize) -> Option<&[Pinned]> {
+        self.seeds.get(i).map(Vec::as_slice)
+    }
 }
 
 pub fn report() -> Report {
@@ -431,6 +592,7 @@ pub fn report() -> Report {
                     .into(),
             ),
             findings: Vec::new(),
+            seeds: Vec::new(),
         };
     }
     let packages = crate::pkg::manager();
@@ -438,7 +600,7 @@ pub fn report() -> Report {
         packages.as_ref().is_some_and(|m| m.owns(std::path::Path::new(exe)))
     };
 
-    let mut out = Vec::new();
+    let mut out: Vec<(Finding, Vec<Pinned>)> = Vec::new();
 
     for (a, b) in guard_pairs(&procs) {
         let (Some(pa), Some(pb)) = (
@@ -452,21 +614,14 @@ pub fn report() -> Report {
         if owned(&ia) && owned(&ib) {
             continue;
         }
-        out.push(Finding {
-            severity: Severity::Critical,
-            subject: format!("{ia} + {ib}"),
-            what: format!(
-                "mutual guard pair: pid {a} ({ia}) and pid {b} ({ib}) each name the other, so each will restart the other"
-            ),
-            why: "killing either one alone will not hold — the survivor restarts it, usually within seconds, and a responder who kills them one at a time will be told both times that it worked. Remove them in a single frozen action."
-                .to_string(),
-        });
+        out.push(pair_finding(pa, &ia, pb, &ib));
     }
 
+    let is_program = program_check(&procs, &is_executable_file);
     for p in &procs {
 
         let text = program_text(p);
-        let Some(target) = loop_respawner(&text) else { continue };
+        let Some(target) = loop_respawner(&text, &own_names(p), &is_program) else { continue };
 
         if target == identity(p) {
             continue;
@@ -477,24 +632,48 @@ pub fn report() -> Report {
             continue;
         }
         let unit = supervisor_of(p, &procs);
-        out.push(Finding {
-            severity: if live.is_some() { Severity::Warn } else { Severity::Note },
-            subject: target.clone(),
-            what: match live {
-                Some(q) => format!(
-                    "pid {} is a restart loop for {target}, which is running as pid {}",
-                    p.pid, q.pid
-                ),
-                None => format!("pid {} is a restart loop for {target}, which is not running", p.pid),
-            },
-            why: format!(
-                "supervision that does not go through the service manager. Kept alive by {}. This shape is also used by some vendor wrapper scripts, so confirm what the loop is before removing it — but a loop relaunching an unpackaged binary out of a writable directory is how an implant survives being killed.",
-                describe(&unit)
-            ),
-        });
+        out.push(loop_finding(p, &target, live, &unit));
     }
 
-    Report { available: true, reason: None, findings: out }
+    let (findings, seeds): (Vec<Finding>, Vec<Vec<Pinned>>) = out.into_iter().unzip();
+    Report { available: true, reason: None, findings, seeds }
+}
+
+fn pair_finding(pa: &ProcSnapshot, ia: &str, pb: &ProcSnapshot, ib: &str) -> (Finding, Vec<Pinned>) {
+    let (a, b) = (pa.pid, pb.pid);
+    let finding = Finding {
+        severity: Severity::Critical,
+        subject: format!("{ia} + {ib}"),
+        what: format!(
+            "mutual guard pair: pid {a} ({ia}) and pid {b} ({ib}) each name the other, so each will restart the other"
+        ),
+        why: "killing either one alone will not hold — the survivor restarts it, usually within seconds, and a responder who kills them one at a time will be told both times that it worked. Remove them in a single frozen action."
+            .to_string(),
+    };
+    (finding, Pinned::seed(&[pa, pb]))
+}
+
+fn loop_finding(p: &ProcSnapshot, target: &str, live: Option<&ProcSnapshot>, unit: &Supervisor) -> (Finding, Vec<Pinned>) {
+    let finding = Finding {
+        severity: if live.is_some() { Severity::Warn } else { Severity::Note },
+        subject: target.to_string(),
+        what: match live {
+            Some(q) => format!(
+                "pid {} is a restart loop for {target}, which is running as pid {}",
+                p.pid, q.pid
+            ),
+            None => format!("pid {} is a restart loop for {target}, which is not running", p.pid),
+        },
+        why: format!(
+            "supervision that does not go through the service manager. Kept alive by {}. This shape is also used by some vendor wrapper scripts, so confirm what the loop is before removing it — but a loop relaunching an unpackaged binary out of a writable directory is how an implant survives being killed.",
+            describe(unit)
+        ),
+    };
+    let seed = match live {
+        Some(q) => Pinned::seed(&[p, q]),
+        None => Pinned::seed(&[p]),
+    };
+    (finding, seed)
 }
 
 pub fn watch(secs: u64) -> Vec<Finding> {

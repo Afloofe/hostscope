@@ -57,7 +57,7 @@ fn values(h: HKEY) -> (Vec<(String, String)>, Vec<String>) {
     let mut name = vec![0u16; 16_384];
     let mut data = vec![0u16; 16_384];
 
-    for i in 0..MAX_VALUES_PER_KEY {
+    for i in 0..=MAX_VALUES_PER_KEY {
         let mut name_len = 0u32;
         let mut data_len = 0u32;
         let mut kind: u32 = 0;
@@ -87,6 +87,10 @@ fn values(h: HKEY) -> (Vec<(String, String)>, Vec<String>) {
         if rc == ERROR_NO_MORE_ITEMS {
             break;
         }
+        if i == MAX_VALUES_PER_KEY {
+            unread.push(super::bounds::past_cap("values", MAX_VALUES_PER_KEY));
+            break;
+        }
         if rc != ERROR_SUCCESS {
 
             unread.push(if rc == ERROR_MORE_DATA {
@@ -114,11 +118,12 @@ fn values(h: HKEY) -> (Vec<(String, String)>, Vec<String>) {
     (out, unread)
 }
 
-fn subkeys(h: HKEY) -> Vec<String> {
+fn subkeys(h: HKEY) -> (Vec<String>, Vec<String>) {
     let mut out = Vec::new();
+    let mut unread = Vec::new();
 
     let mut name = vec![0u16; 256];
-    for i in 0..MAX_SUBKEYS_PER_KEY {
+    for i in 0..=MAX_SUBKEYS_PER_KEY {
         let mut len = name.len() as u32;
 
         let rc = unsafe {
@@ -136,12 +141,18 @@ fn subkeys(h: HKEY) -> Vec<String> {
         if rc == ERROR_NO_MORE_ITEMS {
             break;
         }
+        if i == MAX_SUBKEYS_PER_KEY {
+            unread.push(super::bounds::past_cap("subkeys", MAX_SUBKEYS_PER_KEY));
+            break;
+        }
         if rc != ERROR_SUCCESS {
+
+            unread.extend(super::key_refusal(&format!("subkey #{i}"), rc));
             continue;
         }
         out.push(from_wide(name.get(..len as usize).unwrap_or_default()));
     }
-    out
+    (out, unread)
 }
 
 pub(super) fn mechanism(m: &Mechanism) -> (Vec<Entry>, Vec<String>, bool) {
@@ -195,9 +206,10 @@ pub(super) fn mechanism(m: &Mechanism) -> (Vec<Entry>, Vec<String>, bool) {
                 Ok(h) => h,
                 Err(rc) => return unopened(&format!(r"HKLM\{sub}"), rc),
             };
-            let names = subkeys(h);
+            let (names, unlisted) = subkeys(h);
 
             unsafe { RegCloseKey(h) };
+            refused.extend(unlisted.into_iter().map(|v| format!(r"HKLM\{sub}: {v}")));
             for child in names {
                 let path = format!(r"{sub}\{child}");
                 let ch = match open(&path) {
@@ -228,7 +240,9 @@ pub(super) fn mechanism(m: &Mechanism) -> (Vec<Entry>, Vec<String>, bool) {
         }
         Probe::UserValues(sub, wanted) => {
 
-            for sid in subkeys(HKEY_USERS).into_iter().filter(|k| super::is_user_hive(k)) {
+            let (sids, unlisted) = subkeys(HKEY_USERS);
+            refused.extend(unlisted.into_iter().map(|v| format!(r"HKU: {v}")));
+            for sid in sids.into_iter().filter(|k| super::is_user_hive(k)) {
                 let path = format!(r"{sid}\{sub}");
                 let h = match open_in(HKEY_USERS, &path) {
                     Ok(h) => h,
@@ -295,6 +309,12 @@ pub(super) fn mechanism(m: &Mechanism) -> (Vec<Entry>, Vec<String>, bool) {
     (entries, refused, true)
 }
 
+fn task_file(p: &std::path::Path) -> Result<Vec<u8>, String> {
+    let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    super::bounds::read_task(f, len)
+}
+
 fn walk_tasks(
     dir: &std::path::Path,
     m: &Mechanism,
@@ -317,7 +337,7 @@ fn walk_tasks(
         let p = e.path();
         match std::fs::symlink_metadata(&p) {
             Ok(md) if md.is_dir() => walk_tasks(&p, m, entries, refused, depth + 1),
-            Ok(md) if md.is_file() => match std::fs::read(&p) {
+            Ok(md) if md.is_file() => match task_file(&p) {
                 Ok(bytes) => {
                     let text = decode_task(&bytes);
                     for command in task_commands(&text) {

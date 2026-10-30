@@ -16,17 +16,36 @@ pub(crate) fn linux_report(args: &[String]) -> hemostat_sensor_linux::trust::Rep
 }
 
 #[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
-pub(crate) fn removal_command(locus: &str, what: &str) -> Option<String> {
-    let fp = fingerprint_in(what)?;
-    let o = hemostat_enforce_linux::anchor::offer_for(std::path::Path::new(locus), &fp).ok()?;
+pub(crate) fn removal_command(
+    r: &hemostat_sensor_linux::trust::Report,
+    f: &hemostat_sensor_linux::triage::Finding,
+) -> Option<String> {
+    let a = anchor_for(r, f)?.ok()?;
+    let o = hemostat_enforce_linux::anchor::offer_for_anchor(a).ok()?;
     Some(format!("hemostat remediate --remove-anchor '{}'", o.token().replace('\'', "'\\''")))
 }
 
-#[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
-pub(crate) fn fingerprint_in(what: &str) -> Option<String> {
-    let rest = what.split("sha256:").nth(1)?;
-    let fp: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
-    (fp.len() == 64).then_some(fp)
+#[cfg(all(target_os = "linux", any(feature = "mod-tui", feature = "mod-enf-persistence")))]
+pub(crate) fn anchor_for<'a>(
+    r: &'a hemostat_sensor_linux::trust::Report,
+    f: &hemostat_sensor_linux::triage::Finding,
+) -> Option<Result<&'a hemostat_sensor_linux::trust::Anchor, String>> {
+    let fits: Vec<&hemostat_sensor_linux::trust::Anchor> = r
+        .anchors
+        .iter()
+        .filter(|a| a.cert.subject == f.subject && a.locus.display().to_string() == f.locus)
+        .collect();
+    match fits.as_slice() {
+        [] => None,
+        [one] => Some(Ok(*one)),
+        many => Some(Err(format!(
+            "{} certificates in {} carry the subject {:?}, so which one this finding is about is not \
+             something this will guess; take the one meant out by hand",
+            many.len(),
+            f.locus,
+            f.subject
+        ))),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -119,7 +138,7 @@ pub(crate) fn print_trust(args: &[String], json: bool) -> u8 {
             }
             #[cfg(feature = "mod-enf-persistence")]
             if f.severity >= Severity::Warn {
-                if let Some(cmd) = removal_command(&f.locus, &f.what) {
+                if let Some(cmd) = removal_command(&r, f) {
                     println!("      remove (a dry run until --arm): {}", h(&cmd));
                 }
             }

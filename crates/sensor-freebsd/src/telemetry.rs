@@ -418,7 +418,7 @@ impl Raw {
 
     pub fn next_cursor(&self) -> Option<tail::Cursor> {
         let s = self.segments.iter().rev().find(|s| s.file.rotation.is_none())?;
-        Some(tail::Cursor::after(&s.file, s.from + s.bytes.len() as u64, &s.bytes, self.now))
+        Some(tail::Cursor::after(&s.file, s.from.saturating_add(s.bytes.len() as u64), &s.bytes, self.now))
     }
 
     fn run(&self, s: Source) -> Result<&[u8], String> {
@@ -672,17 +672,18 @@ pub fn judge(raw: &Raw, m: &Manifest) -> Evidence {
 
     let cursor_seg = cursor.and_then(|c| raw.segments.iter().position(|s| s.file.dev == c.dev && s.file.ino == c.ino));
     for (si, s) in raw.segments.iter().enumerate() {
+
         let mut off = s.from;
         let mut body: &[u8] = &s.bytes;
 
         if s.from > 0 {
             let cut = body.iter().position(|b| *b == b'\n').map_or(body.len(), |i| i + 1);
-            off += cut as u64;
+            off = off.saturating_add(cut as u64);
             body = body.get(cut..).unwrap_or_default();
         }
         for l in body.split_inclusive(|b| *b == b'\n') {
             let start = off;
-            off += l.len() as u64;
+            off = off.saturating_add(l.len() as u64);
             if l.iter().all(|b| *b == b'\n') {
                 continue;
             }

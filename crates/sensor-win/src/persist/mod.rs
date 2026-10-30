@@ -1,3 +1,4 @@
+mod bounds;
 mod catalogue;
 mod judge;
 #[cfg(target_os = "windows")]

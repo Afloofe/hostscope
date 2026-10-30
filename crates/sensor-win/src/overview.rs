@@ -288,6 +288,36 @@ pub fn report() -> Report {
     read::report()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proc {
+
+    pub pid: u32,
+
+    pub ppid: u32,
+
+    pub name: String,
+}
+
+#[cfg(target_os = "windows")]
+pub fn processes() -> Option<Vec<Proc>> {
+    read::process_entries()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn processes() -> Option<Vec<Proc>> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+pub fn image_path(pid: u32) -> Option<String> {
+    read::full_path(pid)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn image_path(_pid: u32) -> Option<String> {
+    None
+}
+
 #[cfg(target_os = "windows")]
 mod read {
     use super::{assemble, unavailable, Report, Socket};
@@ -361,7 +391,34 @@ mod read {
         (out, complete)
     }
 
-    fn full_path(pid: u32) -> Option<String> {
+    pub(super) fn process_entries() -> Option<Vec<super::Proc>> {
+        let mut out = Vec::new();
+
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+
+        let mut e: PROCESSENTRY32W = unsafe { core::mem::zeroed() };
+        e.dwSize = core::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        let mut ok = unsafe { Process32FirstW(snap, core::ptr::addr_of_mut!(e)) };
+        while ok != 0 {
+            let name = {
+                let raw = &e.szExeFile;
+                let end = raw.iter().position(|c| *c == 0).unwrap_or(raw.len());
+                String::from_utf16_lossy(raw.get(..end).unwrap_or_default())
+            };
+            out.push(super::Proc { pid: e.th32ProcessID, ppid: e.th32ParentProcessID, name });
+
+            ok = unsafe { Process32NextW(snap, core::ptr::addr_of_mut!(e)) };
+        }
+
+        unsafe { CloseHandle(snap) };
+        (!out.is_empty()).then_some(out)
+    }
+
+    pub(super) fn full_path(pid: u32) -> Option<String> {
         if pid == 0 {
             return None;
         }

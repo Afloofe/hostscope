@@ -23,10 +23,14 @@ pub(crate) fn class_of_action(a: &hemostat_enforce_linux::RemovalAction) -> hemo
         | R::DisablePersistence { .. }
         | R::RemoveLdPreload { .. }
         | R::StripLine { .. }
-        | R::RemoveAnchor { .. } => A::PersistenceNeutralize,
+        | R::RemoveAnchor { .. }
+
+        | R::RestoreKnownGood { .. } => A::PersistenceNeutralize,
         R::QuarantineFile { .. } => A::Quarantine,
 
         R::StartService { .. } => A::ServiceStart,
+
+        R::AllowInboundPort { .. } => A::IsolateInbound,
     }
 }
 

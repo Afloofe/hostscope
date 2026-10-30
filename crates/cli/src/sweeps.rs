@@ -133,11 +133,12 @@ pub(crate) fn print_firewall(json: bool) -> u8 {
     if json {
         jprintln!(
             "{{\"backend\":\"{backend}\",\"trust\":\"{}\",\"input_policy\":\"{}\",\
-             \"rule_count\":{},\"accepting_ports\":[{}],\"unreadable\":{}}}",
+             \"rule_count\":{},\"accepting_ports\":[{}],\"dropping_ports\":[{}],\"unreadable\":{}}}",
             r.trust.tag(),
             r.input_policy.as_deref().unwrap_or("unknown"),
             r.rule_count,
             r.accepting_ports.iter().map(u16::to_string).collect::<Vec<_>>().join(","),
+            r.dropping_ports.iter().map(u16::to_string).collect::<Vec<_>>().join(","),
             r.unreadable.as_deref().map_or_else(|| "null".to_string(), |u| format!("\"{}\"", jesc(u))),
         );
         return code;
@@ -152,6 +153,12 @@ pub(crate) fn print_firewall(json: bool) -> u8 {
             if r.accepting_ports.is_empty() { "none explicit".to_string() }
             else { r.accepting_ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ") }
         );
+        if !r.dropping_ports.is_empty() {
+            println!(
+                "  blocking ports:  {} (an explicit drop/reject — on an otherwise-open firewall, the stealthier block)",
+                r.dropping_ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
+            );
+        }
     } else if let Some(reason) = &r.unreadable {
 
         println!("\n  ruleset NOT read: {}", h(reason));
@@ -173,14 +180,16 @@ pub(crate) fn print_suid(json: bool) -> u8 {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn print_inventory(json: bool) -> u8 {
-    let r = hemostat_sensor_linux::inventory::report_with(crate::vendor::manifest_for("inventory").as_deref());
-    print_findings(
+
+    let (r, reference) = crate::vendor::inventory();
+    let code = print_findings(
         "inventory (package integrity + unpackaged + suspicious units)",
         r.available,
         r.reason.as_deref(),
         &r.findings,
         json,
-    )
+    );
+    reference.exit(code)
 }
 
 #[cfg(target_os = "linux")]
@@ -209,7 +218,8 @@ pub(crate) fn services_verb(args: &[String], json: bool) -> u8 {
             eprintln!("hemostat services --start <unit> [--arm]: name the unit to enable and start");
             return EXIT_USAGE;
         };
-        if !declared.iter().any(|d| d.unit.as_str() == unit) {
+
+        if !declared.iter().any(|d| d.unit == services::normalise_unit(unit)) {
             eprintln!(
                 "hemostat services: `{unit}` is not a declared service. Declare it in \
                  /etc/hemostat/critical (or pass --service {unit}) before starting it, so \
@@ -218,6 +228,38 @@ pub(crate) fn services_verb(args: &[String], json: bool) -> u8 {
             return EXIT_POLICY;
         }
         return crate::actions::start_service(unit, args);
+    }
+
+    if args.iter().any(|a| a == "--uninstall-watchdog") {
+        return crate::actions::uninstall_watchdog(args);
+    }
+    if args.iter().any(|a| a == "--install-watchdog") {
+        let every = match crate::window_secs(args, "--every") {
+            Ok(Some(s)) => s,
+            Ok(None) => 30,
+            Err(msg) => {
+                eprintln!("hemostat services: {msg}");
+                return EXIT_USAGE;
+            }
+        };
+        return crate::actions::install_watchdog(args, every);
+    }
+
+    if args.iter().any(|a| a == "--compose-up") {
+
+        return crate::compose::compose_up(args, json);
+    }
+
+    if args.iter().any(|a| a == "--restore") {
+
+        return match crate::window_secs(args, "--every") {
+            Ok(Some(secs)) => crate::actions::watch_restore(args, json, secs),
+            Ok(None) => crate::actions::restore_scored(args, json),
+            Err(msg) => {
+                eprintln!("hemostat services: {msg}");
+                EXIT_USAGE
+            }
+        };
     }
 
     if args.iter().any(|a| a == "--baseline") {
@@ -234,11 +276,23 @@ pub(crate) fn services_verb(args: &[String], json: bool) -> u8 {
         .position(|a| a == "--store")
         .and_then(|i| args.get(i + 1))
         .map_or(crate::snapshot::DEFAULT_STORE, String::as_str);
-    let r = services::check(
-        &declared,
-        &crate::snapshot::service_baseline(store),
-        crate::vendor::manifest_for("services").as_deref(),
-    );
+    let reference = crate::vendor::reference();
+    let mut r = services::check(&declared, &crate::snapshot::service_baseline(store), reference.manifest());
+
+    if r.declared > 0 {
+        if let Some(f) = reference.triage_finding("services") {
+            r.findings.insert(0, f);
+        }
+    }
+
+    let services_exit = |r: &services::Report| {
+        let code = services_exit(r);
+        if r.declared > 0 {
+            reference.exit(code)
+        } else {
+            code
+        }
+    };
 
     if json {
         let roster: Vec<String> = r

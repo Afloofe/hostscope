@@ -25,6 +25,7 @@ pub(crate) use paths::{
 
 pub mod acquire;
 pub mod account;
+pub mod pam_validate;
 pub mod bootparam;
 pub mod deceive;
 pub mod sidecar;
@@ -38,6 +39,8 @@ pub mod anchor;
 
 pub mod journal;
 pub mod modprotect;
+
+pub mod fwallow;
 
 pub mod restore_watch;
 pub mod group;

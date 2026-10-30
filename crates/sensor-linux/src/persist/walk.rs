@@ -258,10 +258,15 @@ pub(super) fn tree_under(
     budget: &mut usize,
     seen: &mut std::collections::HashSet<PathBuf>,
 ) -> Subtree {
+    use std::os::unix::fs::MetadataExt as _;
     const MAX_DEPTH: usize = 6;
+    const SPENT: &str = "the sweep's budget of directory entries ran out";
     let mut found = Subtree::default();
-    let mut stack = vec![(dir.to_path_buf(), 0usize)];
-    while let Some((d, depth)) = stack.pop() {
+
+    let mut walked: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let id = |m: &fs::Metadata| (m.dev(), m.ino());
+    let mut stack = vec![(dir.to_path_buf(), 0usize, fs::metadata(dir).ok().map(|m| id(&m)))];
+    while let Some((d, depth, key)) = stack.pop() {
 
         if depth > MAX_DEPTH {
             found.stopped.get_or_insert_with(|| {
@@ -270,9 +275,10 @@ pub(super) fn tree_under(
             continue;
         }
         if *budget == 0 {
-            found
-                .stopped
-                .get_or_insert_with(|| "the sweep's file budget ran out".to_string());
+            found.stopped.get_or_insert_with(|| SPENT.to_string());
+            continue;
+        }
+        if key.is_some_and(|k| !walked.insert(k)) {
             continue;
         }
         match fs::read_dir(&d) {
@@ -281,29 +287,28 @@ pub(super) fn tree_under(
                 found.read_something = true;
                 for e in entries.flatten() {
                     if *budget == 0 {
-                        found
-                            .stopped
-                            .get_or_insert_with(|| "the sweep's file budget ran out".to_string());
+                        found.stopped.get_or_insert_with(|| SPENT.to_string());
                         break;
                     }
+
+                    *budget -= 1;
                     let p = e.path();
 
-                    let dangling = fs::symlink_metadata(&p)
-                        .is_ok_and(|m| m.file_type().is_symlink())
-                        && fs::metadata(&p).is_err();
-                    if p.is_dir() {
-                        if is_supervisor_runtime(&p) {
-                            continue;
+                    let followed = fs::metadata(&p);
+                    let dangling = followed.is_err()
+                        && fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink());
+                    match &followed {
+                        Ok(m) if m.is_dir() => {
+                            if is_supervisor_runtime(&p) {
+                                continue;
+                            }
+                            if !walked.contains(&id(m)) {
+                                stack.push((p, depth + 1, Some(id(m))));
+                            }
                         }
-                        stack.push((p, depth + 1));
-                    } else if p.is_file() || dangling {
-
-                        let key = p.canonicalize().unwrap_or_else(|_| p.clone());
-                        if !seen.insert(key) {
-                            continue;
-                        }
-                        *budget -= 1;
-                        found.files.push(p);
+                        Ok(m) if m.is_file() => keep_file(p, seen, &mut found),
+                        _ if dangling => keep_file(p, seen, &mut found),
+                        _ => {}
                     }
                 }
             }
@@ -311,6 +316,13 @@ pub(super) fn tree_under(
     }
     found.files.sort();
     found
+}
+
+fn keep_file(p: PathBuf, seen: &mut std::collections::HashSet<PathBuf>, found: &mut Subtree) {
+    let key = p.canonicalize().unwrap_or_else(|_| p.clone());
+    if seen.insert(key) {
+        found.files.push(p);
+    }
 }
 
 pub(super) use crate::saferead::read_scan_target_bounded;

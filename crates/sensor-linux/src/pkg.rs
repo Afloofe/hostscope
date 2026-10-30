@@ -71,6 +71,13 @@ pub fn parse_pacman_owner(out: &str) -> Option<String> {
     (!pkg.is_empty()).then(|| pkg.to_string())
 }
 
+pub fn parse_dpkg_version(out: &str) -> Option<String> {
+    out.lines()
+        .find_map(|l| l.strip_prefix("Version:"))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 impl Manager {
 
     pub fn owner(&self, path: &Path) -> Option<String> {
@@ -110,6 +117,20 @@ impl Manager {
             Kind::Pacman => capture(&self.tool, &["-Qkk", package])
                 .map(|v| v.lines().filter_map(parse_pacman_drift).collect())
                 .unwrap_or_default(),
+        }
+    }
+
+    pub fn installed_version(&self, package: &str) -> Option<String> {
+        match self.kind {
+            Kind::Dpkg => parse_dpkg_version(&capture(&self.tool, &["-s", package])?),
+            Kind::Rpm => {
+                let out = capture(&self.tool, &["-q", "--qf", "%{VERSION}-%{RELEASE}", package])?;
+                let v = out.trim();
+                (!v.is_empty() && !v.contains(' ') && !v.contains("not installed")).then(|| v.to_string())
+            }
+            Kind::Pacman => {
+                capture(&self.tool, &["-Q", package])?.split_whitespace().nth(1).map(str::to_string)
+            }
         }
     }
 }

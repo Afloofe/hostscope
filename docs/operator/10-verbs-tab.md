@@ -19,18 +19,20 @@ Every view has a Verbs tab (v, or click it): every verb this platform has, so no
 - read and watch: [r Run]. A watch prints until it ends or you press [s Stop]. A read can be stopped too.
 - writes: [r Run] asks first, then runs. It writes evidence, a ledger record, a key or a ticket; it changes no setting of the host.
 - ACTS: [d Dry run] runs the verb without arming it. Its plan is the output. [a Arm] is offered only once that dry run ended as a plan (exit 0 or 5), and only for exactly those flags: change one and you have to dry-run again. [a Arm] asks APPLY? and only y, or a click on [Apply], runs it armed. [Apply] is never where the button you pressed was, and a click on it in the first 400 ms is ignored.
-- CHANGES (undo, fw confirm, sentinel --register, network --confirm and --revert): [r Run] shows the exact command and asks APPLY?.
+- The armed run looks at the host again. A dry run that printed its plan's digest (network) has it carried to the armed run as --plan, and the armed run is refused if the plan it builds then is not that one; dry-run again to see the new plan. Any other armed run acts on what it finds then.
+- CHANGES (undo, sentinel --register, network --confirm and --revert): [r Run] shows the exact command and asks APPLY?.
 - An armed run, or one that writes, is never stopped halfway and the view will not quit under it.
 - Nothing is chained. A run ending never starts another one.
 
 ## Rollback windows
 
 - An armed network ruleset rolls itself back at the end of its window unless kept; a pf block is lifted at its deadline unless confirmed. While one is open its countdown is on the tab bar of every tab and on top of the Verbs tab.
-- [p Keep] keeps it (network --confirm, or fw confirm with the block's id) and [u Revert] puts it back now (network --revert, or undo with the id). Each asks APPLY? first. Check a second way in works before you keep a ruleset.
+- [p Keep] keeps it (network --confirm, or fw confirm --arm with the block's id) and [u Revert] puts it back now (network --revert, or undo with the id). Each asks APPLY? first. Check a second way in works before you keep a ruleset. A kept pf block no longer lifts at its deadline: undo with its id lifts it.
 - When the window runs out the view says so and runs nothing: the host's own rollback is what acts then. Quitting while one is open asks twice, and leaving does not keep the change.
 
 ## What is not here
 
 - selfprotect --arm holds a deny over the process that runs it, so it is run at a terminal. sentinel --guard and --watch make the process that runs them a supervisor; sentinel --register starts proper ones from here.
+- --allow-subnet: the tab blocks one address at a time (fw block, fw statekill, network --block-dest). A range, where the rules of engagement allow one, is typed at a terminal.
 - The views themselves: the Findings console, the Posture view and the collector's queue. Each has a print-once entry (console --once, posture, queue --once).
 - The Alerts tab of the queue is where ack, investigating, resolve and note are.

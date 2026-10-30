@@ -2,6 +2,10 @@ use std::process::Command;
 
 use hs_core::Trust;
 
+mod reach;
+
+pub use reach::Reach;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
 
@@ -21,11 +25,25 @@ pub struct Report {
 
     pub accepting_ports: Vec<u16>,
 
+    pub dropping_ports: Vec<u16>,
+
     pub sample: String,
 
     pub trust: Trust,
 
     pub unreadable: Option<String>,
+
+    ruleset: Option<reach::Ruleset>,
+
+    legacy: Option<Legacy>,
+}
+
+#[derive(Debug, Clone)]
+enum Legacy {
+
+    Read(reach::Ruleset),
+
+    Unread(String),
 }
 
 impl Default for Report {
@@ -35,10 +53,73 @@ impl Default for Report {
             input_policy: None,
             rule_count: 0,
             accepting_ports: Vec::new(),
+            dropping_ports: Vec::new(),
             sample: String::new(),
             trust: Trust::Syscall,
             unreadable: None,
+            ruleset: None,
+            legacy: None,
         }
+    }
+}
+
+impl Report {
+
+    pub fn tcp_reach(&self, port: u16) -> Reach {
+        if let Some(why) = &self.unreadable {
+            return Reach::Unknown(format!("the firewall ruleset was not read: {why}"));
+        }
+        let read = match &self.ruleset {
+            Some(rs) => rs.tcp_reach(port),
+            None => return Reach::Unknown("no firewall ruleset was read".into()),
+        };
+        match &self.legacy {
+            None => read,
+            Some(Legacy::Read(rs)) => reach::both(read, rs.tcp_reach(port)),
+            Some(Legacy::Unread(why)) => reach::both(read, Reach::Unknown(why.clone())),
+        }
+    }
+}
+
+fn parse_table_names(text: &str) -> Vec<String> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect()
+}
+
+fn legacy_tables() -> Result<Vec<String>, String> {
+    match std::fs::read_to_string("/proc/net/ip_tables_names") {
+        Ok(text) => Ok(parse_table_names(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!(
+            "/proc/net/ip_tables_names could not be read ({e}), so whether legacy iptables rules \
+             run beside the ruleset read is not known"
+        )),
+    }
+}
+
+const IPTABLES_LEGACY_SAVE_PATHS: &[&str] = &[
+    "/usr/sbin/iptables-legacy-save",
+    "/sbin/iptables-legacy-save",
+    "/usr/bin/iptables-legacy-save",
+    "/bin/iptables-legacy-save",
+];
+
+fn legacy_beside(backend: Option<Backend>) -> Option<Legacy> {
+    let tables = match legacy_tables() {
+        Ok(t) if t.is_empty() => return None,
+        Ok(t) => t.join(", "),
+        Err(why) => return Some(Legacy::Unread(why)),
+    };
+    match run(IPTABLES_LEGACY_SAVE_PATHS, &[]) {
+        RunOutcome::Ok(text) => Some(Legacy::Read(reach::parse_iptables(&text))),
+        RunOutcome::Refused(d) => Some(Legacy::Unread(format!(
+            "legacy iptables tables ({tables}) are loaded beside the ruleset read, and \
+             iptables-legacy-save did not return them ({d})"
+        ))),
+        RunOutcome::NotInstalled if backend == Some(Backend::IptablesLegacy) => None,
+        RunOutcome::NotInstalled => Some(Legacy::Unread(format!(
+            "legacy iptables tables ({tables}) are loaded beside nftables, which does not show \
+             them, and iptables-legacy-save is not installed to read them"
+        ))),
     }
 }
 
@@ -196,6 +277,29 @@ fn accepting_ports(text: &str) -> Vec<u16> {
     ports
 }
 
+fn dropping_ports(text: &str) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for l in input_path_rules(text) {
+        let toks: Vec<&str> = l.split_whitespace().collect();
+        let drops = toks.contains(&"drop")
+            || toks.contains(&"reject")
+            || toks.windows(2).any(|w| w == ["-j", "DROP"] || w == ["-j", "REJECT"]);
+        if !drops {
+            continue;
+        }
+        let Some(at) = toks.iter().position(|t| matches!(*t, "dport" | "--dport" | "--dports")) else {
+            continue;
+        };
+        for p in dport_operand(&toks, at) {
+            if !ports.contains(&p) {
+                ports.push(p);
+            }
+        }
+    }
+    ports.sort_unstable();
+    ports
+}
+
 fn input_policy(text: &str) -> Option<String> {
     let mut in_input = false;
     for line in text.lines() {
@@ -262,6 +366,10 @@ fn run(candidates: &[&str], args: &[&str]) -> RunOutcome {
     }
 }
 
+pub fn from_ruleset(backend: Backend, text: &str) -> Report {
+    build_report(backend, text)
+}
+
 fn build_report(backend: Backend, text: &str) -> Report {
     let rule_count = text
         .lines()
@@ -277,13 +385,27 @@ fn build_report(backend: Backend, text: &str) -> Report {
         input_policy: input_policy(text),
         rule_count,
         accepting_ports: accepting_ports(text),
+        dropping_ports: dropping_ports(text),
         sample,
         trust: Trust::Syscall,
         unreadable: None,
+        ruleset: Some(match backend {
+            Backend::Nftables => reach::parse_nft(text),
+            Backend::IptablesLegacy => reach::parse_iptables(text),
+        }),
+        legacy: None,
     }
 }
 
 pub fn report() -> Report {
+    let mut r = read_ruleset();
+    if r.unreadable.is_none() {
+        r.legacy = legacy_beside(r.backend);
+    }
+    r
+}
+
+fn read_ruleset() -> Report {
     let nft = run(NFT_PATHS, &["list", "ruleset"]);
     if let RunOutcome::Ok(text) = &nft {
         let from_nft = build_report(Backend::Nftables, text);

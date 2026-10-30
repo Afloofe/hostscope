@@ -796,6 +796,32 @@ pub struct Hit {
     pub level: Level,
 
     pub seq: u64,
+
+    pub truncated: bool,
+}
+
+pub fn truncated_events(events: &[Event]) -> usize {
+    events.iter().filter(|e| e.truncated()).count()
+}
+
+impl RuleSet {
+
+    pub fn coverage_over(&self, events: &[Event]) -> String {
+        let rules = self.coverage();
+        match truncated_events(events) {
+            0 => rules,
+            n => format!(
+                "{rules}; {n} event(s) had a field over {} bytes, of which only the head and the \
+                 tail were evaluated — a rule keyed on text in the cut middle could not have \
+                 matched them, so this run is NOT complete",
+                hs_core::MAX_FIELD_BYTES
+            ),
+        }
+    }
+
+    pub fn complete_over(&self, events: &[Event]) -> bool {
+        self.complete() && truncated_events(events) == 0
+    }
 }
 
 pub fn run(set: &RuleSet, events: &[Event]) -> Vec<Hit> {
@@ -808,6 +834,7 @@ pub fn run(set: &RuleSet, events: &[Event]) -> Vec<Hit> {
                     id: r.id.clone(),
                     level: r.level,
                     seq: e.seq,
+                    truncated: e.truncated(),
                 });
             }
         }

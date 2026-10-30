@@ -909,20 +909,60 @@ pub fn diagnostic_runs() -> Result<Vec<crate::usn::DiagnosticRun>, String> {
         }
     }
     let mut runs = pair_diagnostic_runs(events);
+
+    let root = std::env::var("SystemRoot").ok();
+    let mut listed: std::collections::BTreeMap<String, Option<Vec<String>>> = std::collections::BTreeMap::new();
     for r in &mut runs {
         r.temp = r.sid.as_deref().and_then(profile_temp);
-        r.package_files = package_files(&r.package_path);
+        let Some(dir) = root.as_deref().and_then(|root| package_dir(&r.package_path, root).ok()) else {
+            continue;
+        };
+        let key = dir.to_ascii_lowercase();
+        if !listed.contains_key(&key) && listed.len() < MAX_PACKAGES {
+            listed.insert(key.clone(), package_files(&dir));
+        }
+        r.package_files = listed.get(&key).cloned().flatten();
     }
     Ok(runs)
 }
 
+pub const MAX_PACKAGES: usize = 64;
+
+pub const MAX_PACKAGE_NAMES: usize = 4096;
+
+pub fn package_dir(path: &str, system_root: &str) -> Result<String, String> {
+    let root = crate::localpath::local(system_root).map_err(|why| format!("%SystemRoot% is {system_root}: {why}"))?;
+    let diagnostics = format!(r"{}\diagnostics", root.trim_end_matches('\\'));
+    let dir = crate::localpath::local(path)?;
+    if crate::localpath::within(&dir, &diagnostics) {
+        Ok(dir)
+    } else {
+        Err(format!("it is not below {diagnostics}, where Windows keeps its diagnostic packages"))
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn package_files(dir: &str) -> Option<Vec<String>> {
+    match crate::localpath::vet(dir) {
+        Ok(Some((_, md))) if md.is_dir() => {}
+        _ => return None,
+    }
     let mut out = Vec::new();
+
+    let mut seen = 0_usize;
     for e in std::fs::read_dir(dir).ok()?.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            for f in std::fs::read_dir(&p).ok()?.flatten() {
+
+        let kind = e.file_type().ok()?;
+        seen += 1;
+        if kind.is_symlink() || seen > MAX_PACKAGE_NAMES {
+            return None;
+        }
+        if kind.is_dir() {
+            for f in std::fs::read_dir(e.path()).ok()?.flatten() {
+                seen += 1;
+                if f.file_type().ok()?.is_symlink() || seen > MAX_PACKAGE_NAMES {
+                    return None;
+                }
                 out.push(f.file_name().to_string_lossy().to_ascii_lowercase());
             }
         } else {

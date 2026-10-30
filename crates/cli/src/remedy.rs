@@ -1,7 +1,7 @@
 #[cfg(all(target_os = "linux", feature = "mod-tui"))]
 use crate::authz::{current_profile, loaded_sanction, presented_authority};
 #[cfg(all(target_os = "linux", feature = "mod-tui"))]
-use crate::views::{journal_one, pids_in};
+use crate::views::journal_one;
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 use crate::MANIFEST;
 
@@ -87,23 +87,8 @@ pub(crate) fn linux_remedy(
         }
     }
 
-    if source == "watchdog" {
-        let seed: Vec<String> = pids_in(what).iter().map(|p| p.to_string()).collect();
-        if !seed.is_empty() {
-            return Some(Remedy {
-                what: format!("freeze and remove the whole group (pids {})", seed.join(", ")),
-                risk: Risk::MayBreak,
-                note: "every member is SIGSTOPped first, so none can restart another, and only \
-                       then killed. If any member is refused by the protect-set the whole action \
-                       is abandoned and the frozen ones are resumed — it is all of them or none. \
-                       A survivor is reported as a survivor rather than as a success"
-                    .into(),
-                undo: "a killed process cannot be restarted from the journal. If the group is \
-                       frozen but not yet killed, hemostat undo <journal> resumes it"
-                    .into(),
-                id: format!("linux:watchdog:{}", seed.join(",")),
-            });
-        }
+    if source == "accounts" && crate::golden::is_protected(subject) {
+        return None;
     }
 
     if source == "accounts" && what.starts_with("has NO password") && subject != "root" {
@@ -190,19 +175,89 @@ pub(crate) fn linux_remedy(
         if subject.starts_with("TLS redirected") {
             return strip_remedy(locus, what, sev);
         }
-        return anchor_remedy(locus, what);
+
+        return None;
     }
 
     if source == "accounts" {
-        if let Some(quote) = ["grants password-free sudo: ", "disables the sudo password prompt: "]
-            .iter()
-            .find_map(|p| what.strip_prefix(p))
-        {
+        if let Some(quote) = sudo_grant_quote(what) {
+            if sudoers_scope_of(subject, quote).is_some() {
+                return None;
+            }
             return strip_remedy(subject, quote, sev);
         }
     }
 
     None
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+pub(crate) fn watchdog_remedy(seed: &[hemostat_sensor_linux::watchdog::Pinned]) -> Option<hemostat_tui::Remedy> {
+    use hemostat_sensor_linux::watchdog::Pinned;
+    use hemostat_tui::{Remedy, Risk};
+    let list = Pinned::list(seed);
+
+    let seed = Pinned::parse_list(&list)?;
+    let pids: Vec<String> = seed.iter().map(|s| s.pid.to_string()).collect();
+    Some(Remedy {
+        what: format!("freeze and remove the whole group (pids {})", pids.join(", ")),
+        risk: Risk::MayBreak,
+        note: "every member is SIGSTOPped first, so none can restart another, and only \
+               then killed. If any member is refused by the protect-set the whole action \
+               is abandoned and the frozen ones are resumed — it is all of them or none. \
+               A survivor is reported as a survivor rather than as a success"
+            .into(),
+        undo: "a killed process cannot be restarted from the journal. If the group is \
+               frozen but not yet killed, hemostat undo <journal> resumes it"
+            .into(),
+        id: format!("linux:watchdog:{list}"),
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn sudo_grant_quote(what: &str) -> Option<&str> {
+    ["grants password-free sudo: ", "disables the sudo password prompt: "]
+        .iter()
+        .find_map(|p| what.strip_prefix(p))
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn sudoers_scope_of(
+    path: &str,
+    quoted: &str,
+) -> Option<hemostat_enforce_linux::account::SudoersScope> {
+    use hemostat_enforce_linux::account;
+    let file = hemostat_sensor_linux::saferead::read_scan_target(std::path::Path::new(path))
+        .unwrap_or_default();
+    account::sudoers_scope(quoted, &file, &account::name_of_uid, &account::name_of_gid)
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+pub(crate) fn out_of_scope_note(source: &str, subject: &str, what: &str) -> Option<String> {
+    if source != "accounts" {
+        return None;
+    }
+    if crate::golden::is_protected(subject) {
+        return Some(format!(
+            "OUT OF SCOPE, human-only: no fix is offered here and every account action refuses \
+             it — {}",
+            hemostat_enforce_linux::ProtectReason::OutOfScopeAccount.describe()
+        ));
+    }
+    let scope = sudoers_scope_of(subject, sudo_grant_quote(what)?)?;
+    Some(format!(
+        "OUT OF SCOPE, human-only: the one-line strip is not offered, and `remediate \
+         --strip-line` refuses it — {}",
+        scope.describe()
+    ))
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+pub(crate) fn scoped_why(source: &str, subject: &str, what: &str, why: &str) -> String {
+    match out_of_scope_note(source, subject, what) {
+        Some(note) => format!("{why} — {note}"),
+        None => why.to_string(),
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "mod-tui"))]
@@ -268,10 +323,14 @@ fn strip_remedy(path: &str, quoted: &str, sev: hemostat_tui::Sev) -> Option<hemo
 }
 
 #[cfg(all(target_os = "linux", feature = "mod-tui"))]
-fn anchor_remedy(locus: &str, what: &str) -> Option<hemostat_tui::Remedy> {
-    use hemostat_tui::{Remedy, Risk};
-    let fp = what.split("sha256:").nth(1)?.chars().take_while(char::is_ascii_hexdigit).collect::<String>();
-    let offer = hemostat_enforce_linux::anchor::offer_for(std::path::Path::new(locus), &fp).ok()?;
+pub(crate) fn anchor_remedy(a: &hemostat_sensor_linux::trust::Anchor, sev: hemostat_tui::Sev) -> Option<hemostat_tui::Remedy> {
+    use hemostat_tui::{Remedy, Risk, Sev};
+    if !matches!(sev, Sev::Critical | Sev::Warn) {
+        return None;
+    }
+    let offer = hemostat_enforce_linux::anchor::offer_for_anchor(a).ok()?;
+    let locus = offer.path.display().to_string();
+    let fp = a.cert.sha256_hex();
     let rebuilds = !matches!(offer.store, hemostat_enforce_linux::anchor::Store::Bundle);
     Some(Remedy {
         what: if offer.blocks == 1 {
@@ -577,31 +636,37 @@ fn apply_sshd(spelling: &str) -> Result<String, String> {
 #[cfg(all(target_os = "linux", feature = "mod-tui"))]
 fn apply_watchdog(rest: &str) -> Result<String, String> {
     use hemostat_enforce_linux::{ApplyOptions, ProtectSet, journal};
+    use hemostat_sensor_linux::watchdog::Pinned;
 
     require_built(hemostat_buildinfo::ActionClass::Kill)?;
     require_built(hemostat_buildinfo::ActionClass::Suspend)?;
-    let seed: Vec<u32> = rest.split(',').filter_map(|p| p.parse().ok()).collect();
-    if seed.is_empty() {
-        return Err("no pids in the remedy id".into());
-    }
+
+    let Some(seed) = Pinned::parse_list(rest) else {
+        return Err("the remedy id does not name the processes its row was drawn from (PID@START) — re-scan".into());
+    };
 
     let procs = hemostat_sensor_linux::procfs::walk();
     let mut members: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut units: Vec<String> = Vec::new();
-    for pid in &seed {
-        let Some(live) = procs.iter().find(|p| p.pid == *pid) else {
+    for pin in &seed {
+        let Some(live) = procs.iter().find(|p| pin.is(p)) else {
             continue;
         };
         let unit = match hemostat_sensor_linux::watchdog::supervisor_of(live, &procs) {
             hemostat_sensor_linux::watchdog::Supervisor::Unit(u) => Some(u),
             _ => None,
         };
-        let (m, u) = hemostat_sensor_linux::watchdog::group_for(*pid, &procs, unit.as_deref());
+        let (m, u) = hemostat_sensor_linux::watchdog::group_for(live.pid, &procs, unit.as_deref());
         members.extend(m);
         units.extend(u);
     }
     if members.is_empty() {
-        return Err("none of those pids are still running — re-scan".into());
+        return Err("none of those processes is still running as the row named it (a pid reused since is another process) — re-scan".into());
+    }
+
+    let passwd = hemostat_sensor_linux::saferead::read_scan_target(std::path::Path::new("/etc/passwd"));
+    if let Some(why) = hard_protected_member(&members, &procs, passwd.as_deref()) {
+        return Err(format!("{why}, so the group is not taken; nothing was changed"));
     }
     units.sort();
     units.dedup();
@@ -650,6 +715,34 @@ fn apply_watchdog(rest: &str) -> Result<String, String> {
 }
 
 #[cfg(all(target_os = "linux", feature = "mod-tui"))]
+pub(crate) fn hard_protected_member(
+    members: &std::collections::BTreeSet<u32>,
+    procs: &[hemostat_sensor_linux::procfs::ProcSnapshot],
+    passwd: Option<&str>,
+) -> Option<String> {
+    let Some(passwd) = passwd else {
+        return Some(
+            "/etc/passwd could not be read, so whether a member runs as whiteteam or a DataDog account cannot be checked"
+                .into(),
+        );
+    };
+    for pid in members {
+        let Some(p) = procs.iter().find(|p| p.pid == *pid) else {
+            return Some(format!("pid {pid} is not in the process table this removal read, so whose it is cannot be checked"));
+        };
+        let held = passwd.lines().find_map(|l| {
+            let mut f = l.split(':');
+            let (name, _, uid) = (f.next()?, f.next()?, f.next()?);
+            (uid.parse::<u32>().ok() == Some(p.uid) && crate::golden::is_protected(name)).then_some(name)
+        });
+        if let Some(name) = held {
+            return Some(format!("pid {pid} runs as {name} (uid {}), an account the packet puts off-limits", p.uid));
+        }
+    }
+    None
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
 fn apply_ld_preload() -> Result<String, String> {
     use hemostat_enforce_linux::{ApplyOptions, Outcome, ProtectSet, RemovalAction};
     require_built(hemostat_buildinfo::ActionClass::PersistenceNeutralize)?;
@@ -676,6 +769,13 @@ fn lock_refusal(
 
     if user == "root" || user.is_empty() {
         return Some("refusing to lock root".into());
+    }
+
+    if crate::golden::is_protected(user) {
+        return Some(format!(
+            "refusing to lock `{user}`: {}",
+            hemostat_enforce_linux::ProtectReason::OutOfScopeAccount.describe()
+        ));
     }
 
     if session_user == Some(user) {
@@ -712,13 +812,15 @@ fn apply_lock_account(user: &str) -> Result<String, String> {
                 .map(|l| l.split(':').nth(6).unwrap_or("").to_string())
         });
 
+    let previous_locked = hemostat_enforce_linux::account::read_password_locked(user);
+
     let out = std::process::Command::new(&usermod)
         .args(["-L", "-s", "/usr/sbin/nologin", user])
         .env_clear()
         .output()
         .map_err(|e| format!("could not run usermod: {e}"))?;
     if out.status.success() {
-        let did = match &previous_shell {
+        let mut did = match &previous_shell {
             Some(sh) if sh.is_empty() => format!(
                 "locked `{user}` and set its shell to nologin (the field was empty, which is \
                  /bin/sh; `-s ''` puts it back)"
@@ -731,12 +833,23 @@ fn apply_lock_account(user: &str) -> Result<String, String> {
                  /etc/passwd before assuming one"
             ),
         };
+        match previous_locked {
+            Some(true) => did.push_str(
+                ". Its password was already locked before this, so the undo leaves it locked",
+            ),
+            None => did.push_str(
+                ". Whether its password was already locked could not be read, so the undo \
+                 leaves it locked",
+            ),
+            Some(false) => {}
+        }
         Ok(record(
             hemostat_enforce_linux::UndoRecord {
                 did,
                 undo: hemostat_enforce_linux::UndoKind::UnlockAccount {
                     user: user.to_string(),
                     shell: previous_shell,
+                    was_locked: previous_locked,
                 },
                 reversible: true,
             },

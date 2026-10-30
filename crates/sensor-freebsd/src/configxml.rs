@@ -11,6 +11,10 @@ pub const MAX_DEPTH: usize = 32;
 
 pub const MAX_ELEMENTS: usize = 1_000_000;
 
+pub const MAX_NAME_BYTES: usize = 256;
+
+pub const MAX_LEAF_BYTES: usize = 8 * MAX_BYTES as usize;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
 
@@ -23,6 +27,10 @@ pub enum Refusal {
     TooDeep(String),
 
     TooManyElements,
+
+    NameTooLong(String),
+
+    LeavesTooLarge,
 
     Entity(String),
 
@@ -44,6 +52,15 @@ impl fmt::Display for Refusal {
             ),
             Refusal::TooDeep(at) => write!(f, "config.xml nests deeper than {MAX_DEPTH} elements (at <{at}>)"),
             Refusal::TooManyElements => write!(f, "config.xml has more than {MAX_ELEMENTS} elements"),
+            Refusal::NameTooLong(at) => write!(
+                f,
+                "config.xml has a name longer than {MAX_NAME_BYTES} bytes (<{at}…>); no name pfSense writes is that long"
+            ),
+            Refusal::LeavesTooLarge => write!(
+                f,
+                "config.xml's values, each named by its full path, come to more than {MAX_LEAF_BYTES} bytes: \
+                 refused, since reading it value by value would cost that much memory"
+            ),
             Refusal::Entity(e) => write!(f, "config.xml uses an undeclared entity &{e};"),
             Refusal::Malformed(why) => write!(f, "config.xml is not well-formed: {why}"),
             Refusal::Root(name) => write!(f, "config.xml's root element is <{name}>, not <pfsense>"),
@@ -135,6 +152,9 @@ pub fn parse(bytes: &[u8]) -> Result<Config, Refusal> {
         c.expand_empty_elements = false;
     }
     let mut stack: Vec<Element> = Vec::new();
+
+    let mut lens: Vec<usize> = Vec::new();
+    let mut leaf_bytes = 0usize;
     let mut root: Option<Element> = None;
     let mut count = 0usize;
     let malformed = |r: &Reader<&[u8]>, why: String| Refusal::Malformed(format!("{why} (near byte {})", r.buffer_position()));
@@ -147,16 +167,22 @@ pub fn parse(bytes: &[u8]) -> Result<Config, Refusal> {
             }
             Event::Start(s) => {
                 let el = open(&s, &mut count, stack.len())?;
+                let len = leaf_open(&el, &lens, stack.len(), &mut leaf_bytes)?;
                 stack.push(el);
+                lens.push(len);
             }
             Event::Empty(s) => {
                 let el = open(&s, &mut count, stack.len())?;
+                let len = leaf_open(&el, &lens, stack.len(), &mut leaf_bytes)?;
+                leaf_close(&el, len, stack.len(), &mut leaf_bytes)?;
                 close(el, &mut stack, &mut root);
             }
             Event::End(_) => {
                 let Some(el) = stack.pop() else {
                     return Err(malformed(&reader, "an end tag with nothing open".into()));
                 };
+                let len = lens.pop().unwrap_or(0);
+                leaf_close(&el, len, stack.len(), &mut leaf_bytes)?;
                 close(el, &mut stack, &mut root);
             }
             Event::Text(t) => {
@@ -201,6 +227,9 @@ pub fn parse(bytes: &[u8]) -> Result<Config, Refusal> {
 
 fn open(s: &quick_xml::events::BytesStart<'_>, count: &mut usize, depth: usize) -> Result<Element, Refusal> {
     let name = s.name().as_ref().to_string();
+    if name.len() > MAX_NAME_BYTES {
+        return Err(Refusal::NameTooLong(name.chars().take(64).collect()));
+    }
     if depth >= MAX_DEPTH {
         return Err(Refusal::TooDeep(name.chars().take(64).collect()));
     }
@@ -215,9 +244,41 @@ fn open(s: &quick_xml::events::BytesStart<'_>, count: &mut usize, depth: usize) 
             quick_xml::Error::Escape(quick_xml::escape::EscapeError::UnrecognizedEntity(_, ent)) => Refusal::Entity(ent),
             other => Refusal::Malformed(format!("an attribute of <{name}>: {other}")),
         })?;
-        attrs.push((a.key.as_ref().to_string(), v.into_owned()));
+        let key = a.key.as_ref().to_string();
+        if key.len() > MAX_NAME_BYTES {
+            return Err(Refusal::NameTooLong(key.chars().take(64).collect()));
+        }
+        attrs.push((key, v.into_owned()));
     }
     Ok(Element { name, attrs, text: String::new(), children: Vec::new() })
+}
+
+fn leaf_open(el: &Element, lens: &[usize], depth: usize, total: &mut usize) -> Result<usize, Refusal> {
+    let len = match depth {
+        0 => return Ok(0),
+        1 => el.name.len(),
+        _ => lens.last().copied().unwrap_or(0).saturating_add(1).saturating_add(el.name.len()),
+    };
+    for (k, v) in &el.attrs {
+        add_leaf(total, len.saturating_add(1).saturating_add(k.len()).saturating_add(v.len()))?;
+    }
+    Ok(len)
+}
+
+fn leaf_close(el: &Element, len: usize, depth: usize, total: &mut usize) -> Result<(), Refusal> {
+    let text = xml_trim(&el.text).len();
+    if depth > 0 && (el.children.is_empty() || text > 0) {
+        add_leaf(total, len.saturating_add(text))?;
+    }
+    Ok(())
+}
+
+fn add_leaf(total: &mut usize, n: usize) -> Result<(), Refusal> {
+    *total = total.saturating_add(n);
+    if *total > MAX_LEAF_BYTES {
+        return Err(Refusal::LeavesTooLarge);
+    }
+    Ok(())
 }
 
 fn close(mut el: Element, stack: &mut [Element], root: &mut Option<Element>) {

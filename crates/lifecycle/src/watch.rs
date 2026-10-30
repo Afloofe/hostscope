@@ -409,8 +409,79 @@ pub fn environ_of(pid: u32) -> Option<Vec<(String, String)>> {
 
 pub fn image_digest_of(pid: u32) -> Option<String> {
 
-    let bytes = std::fs::read(format!("/proc/{pid}/exe")).ok()?;
-    Some(crate::image::digest(&bytes))
+    let f = std::fs::File::open(format!("/proc/{pid}/exe")).ok()?;
+    let md = f.metadata().ok()?;
+    let cap = read_cap(None, md.is_file(), md.len())?;
+    let (digest, n) = stream_digest(&f, cap)?;
+
+    if n != md.len() {
+        return None;
+    }
+    remember(&digest, n);
+    Some(digest)
+}
+
+pub const MAX_IMAGE_BYTES: u64 = 1 << 30;
+
+static LENGTHS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+
+const MAX_REMEMBERED: usize = 64;
+
+fn remember(digest: &str, len: u64) {
+    let mut known = LENGTHS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !known.iter().any(|(d, _)| d == digest) {
+        if known.len() >= MAX_REMEMBERED {
+            known.remove(0);
+        }
+        known.push((digest.to_string(), len));
+    }
+}
+
+fn known_len(digest: &str) -> Option<u64> {
+    let known = LENGTHS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    known.iter().find(|(d, _)| d == digest).map(|(_, n)| *n)
+}
+
+fn read_cap(known: Option<u64>, regular: bool, len: u64) -> Option<u64> {
+    if !regular {
+        return None;
+    }
+    match known {
+        Some(want) => (len == want).then_some(want),
+        None => (len <= MAX_IMAGE_BYTES).then_some(MAX_IMAGE_BYTES),
+    }
+}
+
+fn stream_digest(r: impl std::io::Read, cap: u64) -> Option<(String, u64)> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    let mut r = r.take(cap.saturating_add(1));
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut n = 0u64;
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(k) => {
+                n = n.saturating_add(k as u64);
+                h.update(buf.get(..k).unwrap_or_default());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    if n > cap {
+        return None;
+    }
+    Some((h.finalize().iter().map(|b| format!("{b:02x}")).collect(), n))
+}
+
+fn runs_image(pid: u32, digest: &str) -> bool {
+    let known = known_len(digest);
+    let Ok(f) = std::fs::File::open(format!("/proc/{pid}/exe")) else { return false };
+    let Ok(md) = f.metadata() else { return false };
+    let Some(cap) = read_cap(known, md.is_file(), md.len()) else { return false };
+    stream_digest(&f, cap).is_some_and(|(d, n)| d == digest && known.is_none_or(|want| n == want))
 }
 
 pub fn find_by(digest: &str, argv: &[String], skip: u32) -> Option<Target> {
@@ -426,7 +497,7 @@ pub fn find_by(digest: &str, argv: &[String], skip: u32) -> Option<Target> {
         if argv_of(pid).as_deref() != Some(argv) {
             continue;
         }
-        if image_digest_of(pid).as_deref() != Some(digest) {
+        if !runs_image(pid, digest) {
             continue;
         }
         if let Some(t) = Target::of(pid) {
@@ -451,7 +522,7 @@ pub fn find_all_where(digest: &str, skip: u32, accept: impl Fn(&[String]) -> boo
         if !argv_of(pid).is_some_and(|a| accept(&a)) {
             continue;
         }
-        if image_digest_of(pid).as_deref() != Some(digest) {
+        if !runs_image(pid, digest) {
             continue;
         }
         if let Some(t) = Target::of(pid) {
