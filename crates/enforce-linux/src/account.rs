@@ -279,7 +279,7 @@ pub(crate) fn owner_names(passwd: &str, uids: &[u32]) -> Result<Vec<String>, u32
     Ok(out)
 }
 
-pub(crate) fn owners_of(pid: u32) -> Result<Vec<String>, String> {
+pub fn owners_of(pid: u32) -> Result<Vec<String>, String> {
     use hemostat_sensor_linux::saferead::{read_proc, read_scan_target, MAX_PROC_BYTES};
     let (status, _) = read_proc(std::path::Path::new(&format!("/proc/{pid}/status")), MAX_PROC_BYTES)
         .map_err(|e| format!("/proc/{pid}/status could not be read ({e})"))?;

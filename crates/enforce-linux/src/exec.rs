@@ -70,6 +70,8 @@ pub struct ServiceImages {
     pub listeners: Vec<(u32, PathBuf)>,
 
     pub declared: Vec<(String, PathBuf)>,
+
+    pub scored: Vec<(String, PathBuf, String)>,
 }
 
 pub fn service_images(protect: &ProtectSet) -> Result<ServiceImages, String> {
@@ -83,7 +85,20 @@ pub fn service_images(protect: &ProtectSet) -> Result<ServiceImages, String> {
     let declared = hemostat_sensor_linux::services::declared_exec_paths(
         &hemostat_sensor_linux::services::declarations(),
     )?;
-    Ok(ServiceImages { listeners, declared })
+
+    let held: Vec<hemostat_sensor_linux::services::Declared> = protect
+        .scored_units
+        .keys()
+        .map(|unit| hemostat_sensor_linux::services::Declared { unit: unit.clone(), paths: Vec::new() })
+        .collect();
+    let scored = hemostat_sensor_linux::services::declared_exec_paths(&held)?
+        .into_iter()
+        .filter_map(|(unit, exe)| {
+            let service = protect.scored_service(&unit)?.to_string();
+            Some((unit, exe, service))
+        })
+        .collect();
+    Ok(ServiceImages { listeners, declared, scored })
 }
 
 pub fn image_name(link: PathBuf) -> PathBuf {
@@ -244,6 +259,22 @@ fn identity_refusal(
             );
         }
     }
+
+    for (unit, exe, service) in &services.scored {
+        if is(exe) {
+            return say(
+                RefuseCause::Protected(crate::ProtectReason::ScoredService(service.clone())),
+                format!(
+                    "refused to block {}: {unit} starts it, and {unit} runs the packet's scored \
+                     service on this box: {service}. The service would fail at its next start, \
+                     `services --restore` included — fix the unit by hand (restore it from its \
+                     package, or take the added line out), then block the file if it is still \
+                     wanted",
+                    path.display()
+                ),
+            );
+        }
+    }
     for (unit, exe) in &services.declared {
         if is(exe) {
             return say(
@@ -289,8 +320,8 @@ pub fn apply(
                 action: format!("block execution of {}", path.display()),
                 cause: RefuseCause::UnverifiedProtectSet,
                 message: format!(
-                    "refused to block {}: {why}, so this cannot be shown not to be a declared \
-                     service's binary",
+                    "refused to block {}: {why}, so this cannot be shown not to be the binary \
+                     of a declared service or of a scored service held under HEMOSTAT_GOLDEN",
                     path.display()
                 ),
                 suggested_alternative: None,

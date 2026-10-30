@@ -56,6 +56,10 @@ pub enum ProtectReason {
 
     OperatorSession,
 
+    HostNetwork,
+
+    ScoredService(String),
+
     AgentSelf,
 
     UnitEnablement,
@@ -79,6 +83,9 @@ pub(crate) fn override_hint(reason: &ProtectReason, unit: &str) -> String {
             "\n        If you have checked {unit} and it is not a service this host is scored \
              on, clear it by name: --allow-listener {unit}"
         ),
+        ProtectReason::ScoredService(service) => {
+            format!("\n        the packet's scored service on this box: {service} (`{unit}` runs it)")
+        }
         _ => String::new(),
     }
 }
@@ -103,6 +110,25 @@ impl ProtectReason {
             ProtectReason::OperatorSession => {
                 "it is part of the operator's own SSH session chain, or the ssh/sshd unit — \
                  acting on it would cut the responder off the host"
+            }
+            ProtectReason::HostNetwork => {
+                "it is one of the units that bring the host's network up (networking, \
+                 systemd-networkd, NetworkManager, network, systemd-resolved, wicked, ifup@), or \
+                 its unit file or a drop-in of it — stopping, disabling or masking it, or moving \
+                 the file away, takes the host off the network, and every scored service and \
+                 remote session with it. No flag or declaration clears this: if it must change, a \
+                 person changes it by hand, from a console that does not need the network"
+            }
+            ProtectReason::ScoredService(_) => {
+                "it runs the packet's scored service on this box, or it is a file of a unit that \
+                 does (HEMOSTAT_GOLDEN is set, and the packet gives this box's role — its \
+                 hostname, or HEMOSTAT_ROLE — that service). Stopping, disabling or masking it, \
+                 moving the file away, or killing or blocking what it runs takes the service \
+                 down, and while it is down no listening socket is there to protect it. No flag \
+                 or declaration clears this: fix it by hand and keep the service up — restore a \
+                 tampered unit from its package (`rpm -V` or `dpkg -V` shows what differs), or \
+                 take an added drop-in or line out — and `services --restore --arm` brings the \
+                 service back if it is down"
             }
             ProtectReason::AgentSelf => "it is HEMOSTAT itself",
             ProtectReason::UnitEnablement => {

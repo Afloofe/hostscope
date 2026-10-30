@@ -1170,7 +1170,7 @@ impl RemovalAction {
             });
         }
 
-        let r = match crate::strip::read_for_edit(path) {
+        let r = match crate::strip::read_for_restore(path) {
             Ok(r) => r,
             Err(why) => {
                 return Outcome::Refused(Refusal {

@@ -3,7 +3,7 @@ use std::path::Path;
 use hemostat_sensor_linux::persist::{Category, Report as PersistReport, CATALOGUE};
 use hemostat_sensor_linux::triage::{Finding, Severity};
 
-use crate::{PersistKind, RemovalAction};
+use crate::{PersistKind, ProtectSet, RemovalAction};
 
 const AUTH_ADVICE: &str = "authentication surface — removing it can lock you out as easily as the \
                            attacker, and a legitimate account looks identical. Review it by hand; \
@@ -57,6 +57,14 @@ fn kind_for(mech_id: &str, category: &Category, name: &str) -> PersistKind {
         _ => PersistKind::Other(name.to_string()),
     }
 }
+
+const HOST_NETWORK_ADVICE: &str =
+    "this belongs to a unit that brings the host's network up (networking, systemd-networkd, \
+     NetworkManager, network, systemd-resolved, wicked, ifup@): its unit file, a file named for \
+     it, or a drop-in of it. Stopping, disabling or masking that unit, or moving the file away, \
+     takes the host off the network, and every scored service and remote session with it — so \
+     nothing is offered here and every unit action refuses it. Read the file, and change it by \
+     hand from a console that does not need the network.";
 
 const ENABLEMENT_LINK_ADVICE: &str =
     "this is an enablement link, not the persistence itself: it only switches on the unit it \
@@ -281,6 +289,10 @@ pub fn disposition_with(
         if is_enablement_link(path) {
             return Disposition::Advise(ENABLEMENT_LINK_ADVICE);
         }
+
+        if crate::guards::host_network_unit_of(path).is_some() {
+            return Disposition::Advise(HOST_NETWORK_ADVICE);
+        }
         if let Some(unit) = unit_name(path) {
 
             return Disposition::Remove(if is_vendor_unit(path) {
@@ -345,4 +357,37 @@ pub fn plan(report: &PersistReport) -> Vec<Candidate> {
         }
     }
     out
+}
+
+pub const SCORED_UNIT_ADVICE: &str =
+    "this belongs to a unit that runs the packet's scored service on this box (HEMOSTAT_GOLDEN): \
+     its unit file, an alias of it, or a drop-in of it. Masking, stopping or disabling that unit, \
+     or moving the file away, takes the service down, and while it is down nothing else protects \
+     it — so nothing is offered here and every unit action refuses it. Fix it by hand and keep \
+     the service up: restore a packaged unit from its package (`rpm -V` or `dpkg -V` names what \
+     differs; `dnf reinstall` or `apt-get install --reinstall` of the package that owns it puts \
+     the shipped file back), or take an added drop-in or line out with an editor; then \
+     `systemctl daemon-reload`, and `services --restore --arm` brings the service back if it is \
+     down.";
+
+pub fn hold_scored(candidates: Vec<Candidate>, protect: &ProtectSet) -> Vec<Candidate> {
+    candidates
+        .into_iter()
+        .map(|mut c| {
+            if removes_held_scored(&c.disposition, &c.locus, protect) {
+                c.disposition = Disposition::Advise(SCORED_UNIT_ADVICE);
+            }
+            c
+        })
+        .collect()
+}
+
+fn removes_held_scored(d: &Disposition, locus: &str, protect: &ProtectSet) -> bool {
+    let Disposition::Remove(action) = d else { return false };
+    let unit = match action {
+        RemovalAction::MaskService { unit } | RemovalAction::StopAndRemoveUnit { unit, .. } => Some(unit.as_str()),
+        _ => None,
+    };
+    unit.is_some_and(|u| protect.scored_service(u).is_some())
+        || protect.scored_service_of_path(Path::new(locus)).is_some()
 }

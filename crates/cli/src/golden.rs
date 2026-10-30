@@ -235,12 +235,102 @@ pub(crate) fn pick_unit<'a>(candidates: &[&'a str], known: &BTreeSet<String>) ->
         .find(|c| known.contains(*c) || known.contains(&format!("{c}.service")))
 }
 
+pub(crate) fn scored_units_of_role(role: &str) -> Vec<(String, &'static str)> {
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    for s in services_of_role(role) {
+        for name in units_for(s.probe) {
+            for unit in [format!("{name}.service"), format!("{name}.socket")] {
+                if !out.iter().any(|(u, _)| *u == unit) {
+                    out.push((unit, s.service));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScoredHold {
+    pub role: Role,
+    pub units: Vec<(String, &'static str)>,
+}
+
+pub(crate) fn scored_hold(
+    golden_on: bool,
+    hostname: Option<&str>,
+    role_override: Option<&str>,
+) -> Option<Result<ScoredHold, String>> {
+    golden_on.then(|| {
+        resolve_role(hostname, role_override).map(|role| ScoredHold { role, units: scored_units_of_role(role.name) })
+    })
+}
+
+pub(crate) fn hold_line(hold: &Result<ScoredHold, String>, held: &std::collections::BTreeMap<String, String>) -> String {
+    let h = match hold {
+        Ok(h) => h,
+        Err(why) => {
+            return format!("HEMOSTAT_GOLDEN is set, but no scored service is held back on this box: {why}")
+        }
+    };
+    let mut by_service: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for (unit, service) in held {
+        by_service.entry(service.as_str()).or_default().push(unit.as_str());
+    }
+    if by_service.is_empty() {
+        return format!(
+            "HEMOSTAT_GOLDEN is set and this box is {}, which has no scored service a systemd unit \
+             runs: nothing is held back",
+            role_said(&h.role)
+        );
+    }
+    let services: Vec<String> =
+        by_service.iter().map(|(service, units)| format!("{service} ({})", units.join(", "))).collect();
+    format!(
+        "the packet's scored service on this box, {}: {} — never masked, stopped, disabled or \
+         moved, and nothing it runs is killed or blocked, while it is down too",
+        role_said(&h.role),
+        services.join("; ")
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn scored_hold_here() -> Option<Result<ScoredHold, String>> {
+    if !active() {
+        return None;
+    }
+    let host = hemostat_sensor_linux::saferead::read_scan_target(std::path::Path::new("/proc/sys/kernel/hostname"));
+    scored_hold(true, host.as_deref(), role_override().as_deref())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn scored_units_here() -> Vec<(String, String)> {
+    match scored_hold_here() {
+        Some(Ok(hold)) => hold.units.into_iter().map(|(unit, service)| (unit, service.to_string())).collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn scored_hold_by_name() -> hemostat_enforce_linux::ProtectSet {
+    hemostat_enforce_linux::ProtectSet {
+        scored_units: scored_units_here().into_iter().collect(),
+        ..hemostat_enforce_linux::ProtectSet::default()
+    }
+}
+
 pub(crate) const TEAM_ENV: &str = "HEMOSTAT_TEAM";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScopeRange {
     Lan,
     Cloud,
+}
+
+const NETBIRD_EGRESS_OCTET: u8 = 99;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn netbird_egress(team: u8) -> String {
+    format!("10.{team}.1.{NETBIRD_EGRESS_OCTET}")
 }
 
 const PACKET_HOSTS: &[(ScopeRange, u8, &str, &str)] = &[
@@ -250,6 +340,12 @@ const PACKET_HOSTS: &[(ScopeRange, u8, &str, &str)] = &[
     (ScopeRange::Lan, 4, "pitlane", "your team's SSH box, a scored service"),
     (ScopeRange::Lan, 5, "garage", "your team's FTP box, a scored service"),
     (ScopeRange::Lan, 6, "grandstand", "your team's IRC box, a scored service"),
+    (
+        ScopeRange::Lan,
+        NETBIRD_EGRESS_OCTET,
+        "the NetBird egress",
+        "out of scope in the packet (v2): do not modify, disable, or block this host or its traffic",
+    ),
     (ScopeRange::Lan, 254, "barrier", "your team's pfSense router, which every scored check crosses"),
     (ScopeRange::Cloud, 1, "transporters", "your team's SMB box, a scored service"),
     (ScopeRange::Cloud, 2, "stewards", "your team's IIS box, a scored service"),

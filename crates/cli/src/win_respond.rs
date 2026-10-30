@@ -128,6 +128,13 @@ pub(crate) fn kill_refusal(pid: u32, f: &KillFacts, allow_listener: bool) -> Opt
     if img.split('\\').any(|c| c == "datadog") {
         return Some(format!("{name} (PID {pid}) is DataDog's ({img}), which is protected (packet rule 14)"));
     }
+
+    if img.split('\\').any(|c| c == "netbird" || c == "netbird.exe") {
+        return Some(format!(
+            "{name} (PID {pid}) is NetBird's ({img}): the packet says its traffic is never blocked, and \
+             killing it cuts the tunnel"
+        ));
+    }
     if allow_listener {
         return None;
     }

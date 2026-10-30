@@ -16,7 +16,7 @@ pub use outcome::{
 };
 pub use paths::{daemon_reload, snapshot, udev_reload};
 pub use paths::open_unredirected;
-pub use revert::{undo, undo_with};
+pub use revert::{undo, undo_with, MAX_VAULT_BYTES};
 
 pub(crate) use paths::{
     path_refusal, resolve_tool,

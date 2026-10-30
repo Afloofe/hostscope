@@ -525,6 +525,96 @@ pub fn owner_of<'a>(path: &Path, accounts: &'a [Account]) -> Option<&'a Account>
     accounts.iter().find(|a| a.home == home)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeysScope {
+
+    Protected {
+
+        account: String,
+
+        how: String,
+    },
+
+    Unresolved(String),
+}
+
+impl KeysScope {
+
+    pub fn describe(&self) -> String {
+        match self {
+            KeysScope::Protected { account, how } => {
+                let (whose, kept) = if account.eq_ignore_ascii_case("whiteteam") {
+                    ("the white team's", "whiteteam keeps its access at all times")
+                } else {
+                    ("the DataDog agent's", "the DataDog agent and its accounts are out of scope")
+                };
+                format!(
+                    "the file is {whose} ({how}) — {kept}, and HEMOSTAT does not change this file \
+                     with any flag. A red-team key found there is removed by hand, once the white \
+                     team agrees"
+                )
+            }
+            KeysScope::Unresolved(why) => format!(
+                "{why}, so the file cannot be shown not to be the white team's or the DataDog \
+                 agent's, and HEMOSTAT does not change it. Read it, and remove a red-team key \
+                 found there by hand, once the white team agrees if the file is theirs"
+            ),
+        }
+    }
+}
+
+pub fn keys_scope(path: &Path, owner: u32, passwd: Option<&str>) -> Option<KeysScope> {
+    let Some(passwd) = passwd else {
+        return Some(KeysScope::Unresolved(
+            "/etc/passwd could not be read, so whose file this is cannot be told".into(),
+        ));
+    };
+    let mut unresolved: Option<String> = None;
+    match crate::account::name_in_passwd(passwd, owner) {
+        Some(name) if hs_core::accounts::is_hard_protected(&name) => {
+            return Some(KeysScope::Protected { how: format!("`{name}` owns it"), account: name });
+        }
+        Some(_) => {}
+        None => {
+            unresolved = Some(format!(
+                "its owner, uid {owner}, has no entry in /etc/passwd, which is also what an account \
+                 served by a directory looks like"
+            ));
+        }
+    }
+    for line in passwd.lines() {
+        let f: Vec<&str> = line.split(':').collect();
+        let Some(name) = f.first().copied().filter(|n| hs_core::accounts::is_hard_protected(n)) else {
+            continue;
+        };
+        match f.get(5).copied().filter(|h| h.starts_with('/')) {
+            Some(home) if path.starts_with(home) => {
+                return Some(KeysScope::Protected {
+                    account: name.to_string(),
+                    how: format!("it lies in `{name}`'s home directory, {home}"),
+                });
+            }
+            Some(_) => {}
+            None => {
+                unresolved.get_or_insert_with(|| {
+                    format!(
+                        "`{name}`'s home directory in /etc/passwd is not an absolute path, so which \
+                         files are its cannot be told"
+                    )
+                });
+            }
+        }
+    }
+    unresolved.map(KeysScope::Unresolved)
+}
+
+fn keys_scope_on_host(path: &Path, md: &fs::Metadata) -> Option<KeysScope> {
+    let passwd = hemostat_sensor_linux::saferead::read_scan_target_bounded(Path::new("/etc/passwd"))
+        .filter(|(_, cut)| !cut)
+        .map(|(text, _)| text);
+    keys_scope(path, md.uid(), passwd.as_deref())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn key_refusal(
     fp: Option<&str>,
@@ -728,6 +818,14 @@ pub(crate) struct Read {
 }
 
 pub(crate) fn read_for_edit(path: &Path) -> Result<Read, String> {
+    read_capped(path, MAX_BYTES, "the sweep reads")
+}
+
+pub(crate) fn read_for_restore(path: &Path) -> Result<Read, String> {
+    read_capped(path, crate::revert::MAX_VAULT_BYTES, "a restore reads")
+}
+
+fn read_capped(path: &Path, max: u64, whose: &str) -> Result<Read, String> {
     let pinned = pin_parent(path)?;
     let mut file = pinned.open(libc::O_RDONLY | libc::O_NONBLOCK, 0).map_err(|e| {
         if e.raw_os_error() == Some(libc::ELOOP) {
@@ -748,12 +846,12 @@ pub(crate) fn read_for_edit(path: &Path) -> Result<Read, String> {
             md.nlink()
         ));
     }
-    if md.len() > MAX_BYTES {
-        return Err(format!("it is {} bytes, past the {MAX_BYTES}-byte cap the sweep reads", md.len()));
+    if md.len() > max {
+        return Err(format!("it is {} bytes, past the {max}-byte cap {whose}", md.len()));
     }
-    let mut bytes = Vec::new();
-    (&mut file).take(MAX_BYTES + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_BYTES {
+    let mut bytes = Vec::with_capacity(usize::try_from(md.len()).unwrap_or(0));
+    (&mut file).take(max.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > max {
         return Err("it grew past the read cap while being read".into());
     }
     Ok(Read { pinned, file, md, bytes })
@@ -992,7 +1090,7 @@ pub(crate) fn plan(path: &Path, want: &LineRef, summary: String) -> Plan {
         Some(FileKind::Sudoers { .. }) => " The result must pass `visudo -c` before it replaces the file, and the whole policy is checked again after; a policy that parsed before and not after is put back at once.",
         Some(FileKind::Sshd { .. }) => " The result must pass `sshd -t` before it replaces the file, and the whole configuration is checked again after. sshd is NOT reloaded: the running daemon keeps its configuration until you reload it.",
         Some(FileKind::Pam) => " A PAM stack that authenticated must still have an `auth` line.",
-        Some(FileKind::AuthorizedKeys) => " The operator's own key and the last key of the only administrator are refused.",
+        Some(FileKind::AuthorizedKeys) => " The operator's own key and the last key of the only administrator are refused, and so is every key in the white team's or the DataDog agent's file.",
         _ => "",
     };
     Plan {
@@ -1058,6 +1156,24 @@ pub(crate) fn apply(
         Ok(r) => r,
         Err(why) => return refused(&summary, path, why),
     };
+
+    if kind == FileKind::AuthorizedKeys {
+        if let Some(scope) = keys_scope_on_host(path, &r.md) {
+            return Outcome::Refused(Refusal {
+                action: summary,
+                message: format!("refused to strip a key from {}: {}", path.display(), scope.describe()),
+                cause: match scope {
+                    KeysScope::Protected { .. } => {
+                        RefuseCause::Protected(crate::ProtectReason::OutOfScopeAccount)
+                    }
+                    KeysScope::Unresolved(_) => {
+                        RefuseCause::InvalidTarget("an authorized_keys file whose account cannot be told".into())
+                    }
+                },
+                suggested_alternative: None,
+            });
+        }
+    }
     let loc = match locate(&r.bytes, want) {
         Ok(l) => l,
         Err(why) => return refused(&summary, path, why),
@@ -1339,7 +1455,19 @@ pub fn offers_in(path: &Path, kind: FileKind, bytes: &[u8]) -> Vec<Offer> {
 
 pub fn offers(path: &Path) -> Result<Vec<Offer>, String> {
     let kind = FileKind::of(path).ok_or_else(|| format!("{} is not a file this edits a line of", path.display()))?;
+    if let Some(unit) = crate::guards::host_network_unit_of(path) {
+        return Err(format!(
+            "{} belongs to `{unit}`, a unit that brings the host's network up, and no line of it is \
+             taken out by this: change it by hand, from a console that does not need the network",
+            path.display()
+        ));
+    }
     let r = read_for_edit(path)?;
+    if kind == FileKind::AuthorizedKeys {
+        if let Some(scope) = keys_scope_on_host(path, &r.md) {
+            return Err(format!("no key of {} is offered: {}", path.display(), scope.describe()));
+        }
+    }
     Ok(offers_in(path, kind, &r.bytes))
 }
 

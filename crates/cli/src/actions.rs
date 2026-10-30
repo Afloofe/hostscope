@@ -719,7 +719,8 @@ pub(crate) fn print_exec_block(args: &[String], operands: &[&str]) -> u8 {
         }
     }
     let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
-    let protect = ProtectSet::gather();
+
+    let protect = ProtectSet::gather().declaring_scored(crate::golden::scored_units_here());
 
     let mechanism = exec::judge_mechanism(exec::can_bind_mount());
     let outcome = if has("--lift") {
@@ -776,6 +777,7 @@ pub(crate) fn start_service(unit: &str, args: &[String]) -> u8 {
     }
 
     let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
+
     let protect = ProtectSet::gather();
     match (RemovalAction::StartService { unit: unit.to_string() }).apply(&opts, &protect) {
         Outcome::Planned(plan) => {
@@ -1013,6 +1015,7 @@ pub(crate) fn restore_scored(args: &[String], json: bool) -> u8 {
     }
 
     let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
+
     let protect = ProtectSet::gather();
 
     let (mut any_failed, mut any_refused, mut any_planned) = (false, false, false);
@@ -1142,6 +1145,7 @@ pub(crate) fn watch_restore(args: &[String], json: bool, every_secs: u64) -> u8 
     }
 
     let mut gov = crate::uptime::Governor::default();
+
     let protect = ProtectSet::gather();
     let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
 
@@ -1811,7 +1815,8 @@ pub(crate) fn firewall_allow(args: &[String], _json: bool) -> u8 {
     }
 
     let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
-    let protect = ProtectSet::gather();
+
+    let protect = ProtectSet::gather().declaring_scored(crate::golden::scored_units_here());
     match (RemovalAction::AllowInboundPort { port }).apply(&opts, &protect) {
         Outcome::Planned(plan) => {
             println!("{}", h(&plan.summary));
@@ -1852,7 +1857,8 @@ pub(crate) fn seal_binaries(args: &[String], json: bool) -> u8 {
             return EXIT_FAILED;
         }
     };
-    let sealed = results.iter().filter(|r| r.outcome.is_ok()).count();
+
+    let sealed = crate::binvault::copies(&results);
 
     let unsealed = results
         .iter()
@@ -1863,8 +1869,9 @@ pub(crate) fn seal_binaries(args: &[String], json: bool) -> u8 {
             .iter()
             .map(|r| {
                 format!(
-                    "{{\"path\":{},\"sealed\":{},\"detail\":{}}}",
+                    "{{\"path\":{},\"link_to\":{},\"sealed\":{},\"detail\":{}}}",
                     json_str(&r.path),
+                    r.link_to.as_deref().map_or_else(|| "null".to_string(), json_str),
                     r.outcome.is_ok(),
                     json_str(match &r.outcome {
                         Ok(s) => s,
@@ -1885,12 +1892,26 @@ pub(crate) fn seal_binaries(args: &[String], json: bool) -> u8 {
             crate::binvault::VAULT
         );
         for r in &results {
+
+            let name = match &r.link_to {
+                Some(real) => format!("{} -> {}", h(&r.path), h(real)),
+                None => h(&r.path),
+            };
             match &r.outcome {
-                Ok(sha) => println!("  [sealed]  {}  sha256:{}", h(&r.path), &sha[..16.min(sha.len())]),
+                Ok(sha) if r.link_to.is_some() => {
+                    println!("  [link]    {name}  sha256:{}", &sha[..16.min(sha.len())])
+                }
+                Ok(sha) => println!("  [sealed]  {name}  sha256:{}", &sha[..16.min(sha.len())]),
 
                 Err(e) if e == crate::binvault::NOT_PRESENT => {}
-                Err(e) => println!("  [skipped] {} — {}", h(&r.path), h(e)),
+                Err(e) => println!("  [skipped] {name} — {}", h(e)),
             }
+        }
+        if results.iter().any(|r| r.link_to.is_some() && r.outcome.is_ok()) {
+            println!(
+                "\nA [link] name was sealed as the real file it leads to, once; --restore-binary of \
+                 the name restores that file, never through the link."
+            );
         }
         if unsealed > 0 {
             let (y, is, it) = if unsealed == 1 { ("y", "is", "it") } else { ("ies", "are", "them") };
@@ -1916,13 +1937,22 @@ pub(crate) fn restore_binary(path: &str, args: &[String]) -> u8 {
         eprintln!("hemostat remediate: {msg}");
         return EXIT_NOT_BUILT;
     }
-    let (bytes, sha) = match crate::binvault::sealed_good(path) {
+    let good = match crate::binvault::sealed_good(path) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("hemostat remediate: {}", h(&e));
             return EXIT_POLICY;
         }
     };
+
+    if good.target != path {
+        println!(
+            "{} is a link to {}, as it was when sealed: the vault holds that real file, and this \
+             writes it by its own name, never through the link.",
+            h(path),
+            h(&good.target)
+        );
+    }
 
     let armed = args.iter().any(|a| a == "--arm");
     let ticket = match crate::authz::armed_gate(
@@ -1939,12 +1969,13 @@ pub(crate) fn restore_binary(path: &str, args: &[String]) -> u8 {
     }
 
     let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
-    let protect = ProtectSet::gather();
+
+    let protect = ProtectSet::gather().declaring_scored(crate::golden::scored_units_here());
     let action = RemovalAction::RestoreKnownGood {
-        path: std::path::PathBuf::from(path),
-        content: bytes,
-        want_sha256: sha,
-        label: format!("{path} (arrival vault copy)"),
+        path: std::path::PathBuf::from(&good.target),
+        label: format!("{} (arrival vault copy)", good.target),
+        content: good.bytes,
+        want_sha256: good.sha,
     };
     match action.apply(&opts, &protect) {
         Outcome::Planned(plan) => {
@@ -2035,7 +2066,7 @@ pub(crate) fn print_account(args: &[String], user: Option<&str>) -> u8 {
         return EXIT_NOT_BUILT;
     }
 
-    let protect = ProtectSet::gather();
+    let protect = ProtectSet::gather().declaring_scored(crate::golden::scored_units_here());
     let armed = has("--arm");
     let ticket = match crate::authz::armed_gate("account", class, armed, 1) {
         Ok(t) => t,
@@ -2133,7 +2164,14 @@ pub(crate) fn print_narrow(
                 return ExitCode::from(EXIT_POLICY);
             }
         };
-        narrowing.processes.push(nn::occupancy(pid, &cgroup, &nn::read_cgroups()));
+        let o = nn::occupancy(pid, &cgroup, &nn::read_cgroups());
+
+        let covered = nn::read_covered(&o, hemostat_enforce_linux::account::owners_of);
+        if let Some(why) = nn::covering_refusal(&o, &covered) {
+            eprintln!("hemostat network: REFUSED — {}. Nothing was changed", h(&why));
+            return ExitCode::from(EXIT_POLICY);
+        }
+        narrowing.processes.push(o);
     }
 
     if let Some(d) = dest {
@@ -2303,14 +2341,19 @@ pub(crate) fn print_network(
         };
     }
     if revert {
+
         return match np::revert() {
             Ok(m) => {
-                println!("{m}");
+                for line in m.lines() {
+                    println!("{}", h(line));
+                }
                 ExitCode::from(EXIT_OK)
             }
 
             Err(e) => {
-                eprintln!("hemostat: {e}");
+                for (i, line) in e.lines().enumerate() {
+                    eprintln!("{}{}", if i == 0 { "hemostat: " } else { "" }, h(line));
+                }
                 ExitCode::from(EXIT_ENFORCER)
             }
         };
@@ -2324,14 +2367,57 @@ pub(crate) fn print_network(
     let surface = np::survey();
     let listening = surface.services.clone();
     let attributed = surface.attributed;
-    let (declared, egress_declared, bad, declarations_unknown) = match network_declarations(
+    let (declared, mut egress_declared, bad, declarations_unknown) = match network_declarations(
         hemostat_sensor_linux::saferead::read_text(std::path::Path::new(np::DECLARATION)),
     ) {
         Ok((d, e, b)) => (d, e, b, None),
         Err(why) => (Vec::new(), Vec::new(), Vec::new(), Some(why)),
     };
+
+    let golden_team = crate::golden::active()
+        .then(|| crate::golden::team(std::env::var(crate::golden::TEAM_ENV).ok().as_deref(), &crate::golden::own_addrs()));
+
+    let management_note = match (&golden_team, egress) {
+        (_, false) => None,
+        (None, true) => Some(
+            "--egress refuses NEW outbound connections from this host, SSH, RDP and WinRM to other \
+             boxes included (connections already open stay up). If you reach other boxes from here, \
+             declare them first (`egress tcp/22 ADDR` in /etc/hemostat/network-allow), or set \
+             HEMOSTAT_GOLDEN so the team's own boxes stay reachable."
+                .to_string(),
+        ),
+        (Some(Ok(team)), true) => {
+            egress_declared.extend(golden_management_allows(*team));
+            None
+        }
+        (Some(Err(why)), true) => {
+            Some(format!("--egress will refuse NEW outbound SSH, RDP and WinRM to the team's other boxes: {why}"))
+        }
+    };
+
+    let netbird_refusal = match &golden_team {
+        None => None,
+        Some(Err(why)) => Some(format!(
+            "the team is not known ({why}), so the NetBird egress (10.T.1.99), whose traffic the packet \
+             says is never blocked, cannot be kept open: set {}",
+            crate::golden::TEAM_ENV
+        )),
+        Some(Ok(_)) if hemostat_sensor_linux::netnarrow::netbird_runs() => Some(
+            "NetBird's agent runs on this host (a process named `netbird`), and the packet says NetBird's \
+             traffic is never blocked: a default-deny here could cut the tunnel the cloud boxes are reached \
+             through. Contain one address or process with --block-dest or --block-pid instead"
+                .to_string(),
+        ),
+        Some(Ok(_)) => None,
+    };
     let session = np::session_port(std::env::var("SSH_CONNECTION").ok().as_deref());
-    let plan = np::plan(&listening, &declared, session);
+    let mut plan = np::plan(&listening, &declared, session);
+    if let Some(Ok(team)) = &golden_team {
+        let egress_host = crate::golden::netbird_egress(*team);
+        let why = format!("the NetBird egress {egress_host}: the packet says its traffic is never blocked");
+        plan.trusted.push((egress_host, np::Origin::Mandatory(why)));
+        egress_declared.extend(golden_netbird_allows(*team));
+    }
 
     println!("Inbound policy plan — default deny, with these exceptions:");
     println!();
@@ -2342,10 +2428,26 @@ pub(crate) fn print_network(
             a.from.as_deref().unwrap_or("from anywhere"),
             np::describe(&a.origin));
     }
+    for (from, origin) in &plan.trusted {
+        println!("  {:<11} {:<18} {}", "every port", from, np::describe(origin));
+    }
     println!();
     println!("Always applied and not listed above: loopback, ESTABLISHED/RELATED (this is what");
     println!("keeps your current session alive across the change), and ICMP. Outbound and");
     println!("forwarding are not touched.");
+
+    let ftp = np::ftp_helper_lines(&plan);
+    if !ftp.is_empty() {
+        println!();
+        println!("tcp/21 is kept, so the ruleset also attaches the kernel's FTP conntrack");
+        println!("helper (nf_conntrack_ftp) to it. The passive data connections an FTP server");
+        println!("opens then arrive as RELATED and pass; without it they are NEW and the deny");
+        println!("drops them. A kernel that cannot load the helper fails the arm, which then");
+        println!("rolls back with nothing applied. The lines it adds:");
+        for l in &ftp {
+            println!("  {l}");
+        }
+    }
 
     if !bad.is_empty() {
         println!();
@@ -2398,6 +2500,10 @@ pub(crate) fn print_network(
         np::egress_plan(&np::resolvers(), &egress_declared, np::uses_dhcp(), &np::resolved_upstreams(), accounts.as_deref())
     });
 
+    if let Some(note) = &management_note {
+        println!();
+        println!("WARNING: {}", h(note));
+    }
     if let Some(eg) = &eplan {
         println!();
         println!("Egress policy plan — default deny outbound, with these exceptions:");
@@ -2452,6 +2558,10 @@ pub(crate) fn print_network(
             println!();
             println!("WARNING: {why}");
         }
+        if let Some(why) = &netbird_refusal {
+            println!();
+            println!("REFUSED WHEN ARMED: {}", h(why));
+        }
 
         println!();
         println!(
@@ -2482,6 +2592,10 @@ pub(crate) fn print_network(
 
     if let Some(b) = eplan.as_ref().and_then(|eg| eg.blocked.first()) {
         eprintln!("hemostat network: REFUSED — {}. Nothing was changed", h(b));
+        return ExitCode::from(EXIT_POLICY);
+    }
+    if let Some(why) = &netbird_refusal {
+        eprintln!("hemostat network: REFUSED — {}. Nothing was changed", h(why));
         return ExitCode::from(EXIT_POLICY);
     }
 
@@ -2571,6 +2685,43 @@ type Declarations = (
     Vec<hemostat_sensor_linux::netpolicy::EgressAllow>,
     Vec<String>,
 );
+
+#[cfg(target_os = "linux")]
+const MANAGEMENT_PORTS: [(u16, &str); 4] = [(22, "SSH"), (3389, "RDP"), (5985, "WinRM"), (5986, "WinRM over TLS")];
+
+#[cfg(target_os = "linux")]
+fn golden_management_allows(team: u8) -> Vec<hemostat_sensor_linux::netpolicy::EgressAllow> {
+    use hemostat_sensor_linux::netpolicy as np;
+    let ranges = [format!("10.{team}.1.0/24"), format!("192.168.{team}.0/24")];
+    ranges
+        .iter()
+        .flat_map(|range| {
+            MANAGEMENT_PORTS.iter().map(move |(port, what)| np::EgressAllow {
+                proto: np::Proto::Tcp,
+                port: Some(*port),
+                to: Some(range.clone()),
+                origin: np::Origin::Mandatory(format!(
+                    "{what} to the team's boxes in {range}: the way to them from here (HEMOSTAT_GOLDEN, team {team})"
+                )),
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn golden_netbird_allows(team: u8) -> Vec<hemostat_sensor_linux::netpolicy::EgressAllow> {
+    use hemostat_sensor_linux::netpolicy as np;
+    let host = crate::golden::netbird_egress(team);
+    [np::Proto::Tcp, np::Proto::Udp]
+        .into_iter()
+        .map(|proto| np::EgressAllow {
+            proto,
+            port: None,
+            to: Some(host.clone()),
+            origin: np::Origin::Mandatory(format!("the NetBird egress {host}: the packet says its traffic is never blocked")),
+        })
+        .collect()
+}
 
 #[cfg(target_os = "linux")]
 fn network_declarations(read: std::io::Result<String>) -> Result<Declarations, String> {

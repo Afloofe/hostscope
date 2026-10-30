@@ -352,7 +352,15 @@ pub(crate) fn console_model() -> hemostat_tui::ConsoleModel {
 
     let pr = hemostat_sensor_linux::persist_report();
     cov.note(Source::Persistence, crate::coverage::persistence(&pr).into());
+    let first = rows.len();
     push_t(&mut rows, Source::Persistence, &pr.findings);
+
+    let held = crate::golden::scored_hold_by_name();
+    for row in rows.iter_mut().skip(first) {
+        if let Some(note) = row.evidence.first().and_then(|locus| crate::remedy::scored_note(locus, &held)) {
+            row.why = format!("{} — {note}", row.why);
+        }
+    }
 
     let sd = hemostat_sensor_linux::enablement::report();
     cov.note(Source::Systemd, crate::coverage::enablement(&sd).into());
@@ -530,15 +538,26 @@ fn trust_remedy(
 #[cfg(target_os = "linux")]
 
 pub(crate) fn journal_one(rec: &hemostat_enforce_linux::UndoRecord) -> Result<String, String> {
+    journal_one_in(std::path::Path::new(hemostat_enforce_linux::DEFAULT_VAULT), rec)
+}
+
+#[cfg(target_os = "linux")]
+fn journal_one_in(dir: &std::path::Path, rec: &hemostat_enforce_linux::UndoRecord) -> Result<String, String> {
     use hemostat_enforce_linux::journal;
     use std::io::Write as _;
-    let dir = std::path::Path::new(hemostat_enforce_linux::DEFAULT_VAULT);
+    use std::os::unix::fs::OpenOptionsExt as _;
     let body = journal::encode(std::slice::from_ref(rec));
     let failed = |why: String| format!("{} — WARNING: the undo journal could not be written ({why})", rec.did);
     std::fs::create_dir_all(dir).map_err(|e| failed(e.to_string()))?;
     for _ in 0..16 {
         let Some(path) = journal::unique_path(dir) else { break };
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
             Ok(mut f) => {
                 return f
                     .write_all(body.as_bytes())

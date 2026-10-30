@@ -107,7 +107,7 @@ pub const REGISTRY: &[VerbSpec] = &[
     act("services --compose-up", &["services", "--compose-up"], &[L], &["mod-enf-persistence"], &[
         pos_many("PROJECT", false, Typed, "the Compose projects to bring up, by the name `docker compose ls` gives them, or a compose file's path (none: list what is down and change nothing)"),
     ],
-        "Brings up only the Docker Compose projects named here (grandstand's IRC after a `compose down`), each journaled; a project nobody named is never started, and the run is refused whole if any named one cannot be. `services --restore` restarts the daemon and restart-policy containers; this brings back a project removed from the daemon. Reversible with `compose down`."),
+        "Brings up only the Docker Compose projects named here (grandstand's IRC after a `compose down`), each journaled; a project nobody named is never started, and the run is refused whole if any named one cannot be. A project comes back with every compose file it was started with, each its own -f in order, and is refused if any of them is not a file here. `services --restore` restarts the daemon and restart-policy containers; this brings back a project removed from the daemon. Reversible with `compose down`."),
     act("services --install-watchdog", &["services", "--install-watchdog"], &[L], &["mod-enf-persistence"], &[
         opt("--every", "SECS", SECS, "the watchdog interval (default 30s)"),
     ],
@@ -153,7 +153,7 @@ pub const REGISTRY: &[VerbSpec] = &[
         OPERATOR_KEY,
         switch("--session-key-unknown", "say you cannot name the key your session came in on"),
         switch("--last-admin-key", "allow removing what may be the last admin key"),
-    ], "Each removal is moved into the vault and journalled; `hemostat undo <journal>` puts it back. The authentication surface is never removed by this run."),
+    ], "Each removal is moved into the vault and journalled; `hemostat undo <journal>` puts it back. The authentication surface is never removed by this run, and a unit that brings the network up (networking, systemd-networkd, NetworkManager, network, systemd-resolved, wicked, ifup@), its unit file and its drop-ins are never stopped, masked or moved. With HEMOSTAT_GOLDEN set the same holds for the units this box's role runs its scored services in (MariaDB on scrutineering: mariadb, mysqld, mysql), while the service is down too: a finding in one is left to you, to restore the unit from its package by hand."),
     v("remediate --lines", &["remediate", "--lines"], &[L], R, &["mod-enf-persistence"], &[pos("FILE", Live("path"), "a shared file whose lines to list, each with its token")]),
     v("remediate --anchors", &["remediate", "--anchors"], &[L], R, &["mod-enf-persistence"], &[]),
     act("remediate --remove-anchor", &["remediate", "--remove-anchor"], &[L], &["mod-enf-persistence"], &[
@@ -165,12 +165,12 @@ pub const REGISTRY: &[VerbSpec] = &[
         OPERATOR_KEY,
         switch("--session-key-unknown", "say you cannot name the key your session came in on"),
         switch("--last-admin-key", "allow removing what may be the last admin key"),
-    ], "One line comes out of a shared file; the journal holds it, and `hemostat undo <journal>` (with --auth for a login file) puts it back. A sudoers line naming whiteteam or a DataDog account, or someone that cannot be resolved, is refused."),
+    ], "One line comes out of a shared file; the journal holds it, and `hemostat undo <journal>` (with --auth for a login file) puts it back. A sudoers line naming whiteteam or a DataDog account, or someone that cannot be resolved, is refused, and so is every key in the authorized_keys of whiteteam or a DataDog account (one of them owns it, or it is in one's home) or of an account that cannot be told. With HEMOSTAT_GOLDEN set, a line of a unit file or drop-in of this box's scored services is refused too."),
     v("remediate --pam", &["remediate", "--pam"], &[L], R, &["mod-enf-persistence"], &[]),
     v("remediate --log", &["remediate", "--log"], &[L], R, &["mod-enf-persistence"], &[]),
     act("remediate --restore-pam", &["remediate", "--restore-pam"], &[L], &["mod-enf-persistence"], &[
         pos("PATH", Live("path"), "the module path, from `remediate --pam`"),
-    ], "The distribution's stock module is written back atomically (owner, mode and SELinux label kept); the current file goes to the vault and `hemostat undo <journal>` restores it. Armed, a throwaway login is tried from an unprivileged account before and after the swap, with the right password and a wrong one; if it got in before and not after, or a wrong password is taken after but was refused before, the swap is rolled back."),
+    ], "The distribution's stock module is written back atomically (owner, mode and SELinux label kept): the build baked for the installed package version, and if none is baked it is refused, naming the baked builds. The current file goes to the vault and `hemostat undo <journal>` restores it. Armed, a throwaway login is tried from an unprivileged account before and after the swap, with the right password and a wrong one; if it got in before and not after, or a wrong password is taken after but was refused before, the swap is rolled back."),
 
     VerbSpec {
         name: "remediate --seal-binaries",
@@ -181,11 +181,11 @@ pub const REGISTRY: &[VerbSpec] = &[
         fields: &[switch("--replace", "re-seal over an existing vault (only if the binaries are still known-clean)")],
         arm: None,
         commit: None,
-        warn: "Copies this host's critical binaries (scored daemons + su/sudo/sshd/passwd) into /var/lib/hemostat/arrival-bin at arrival — the reliable offline source for a later restore, since the snapshot keeps only hashes and the package cache is usually empty. There is no dry run: Run seals at once, and with --replace overwrites the arrival copies. Read-only on the system; writes only the vault, and refuses a vault that is a link or not root's alone. One that is there and could not be sealed (not a regular file, over the size cap) is listed [skipped] and the run exits 7.",
+        warn: "Copies this host's critical binaries (scored daemons + su/sudo/sshd/passwd) into /var/lib/hemostat/arrival-bin at arrival — the reliable offline source for a later restore, since the snapshot keeps only hashes and the package cache is usually empty. There is no dry run: Run seals at once, and with --replace overwrites the arrival copies. Read-only on the system; writes only the vault, and refuses a vault that is a link or not root's alone. One that is there and could not be sealed (not a regular file, over the size cap) is listed [skipped] and the run exits 7. A name that is a link (Rocky's /usr/sbin/mariadbd) is sealed once, as the real file it leads to, and listed [link].",
     },
     act("remediate --restore-binary", &["remediate", "--restore-binary"], &[L], &["mod-enf-persistence"], &[
         pos("PATH", Live("path"), "the absolute path of the tampered binary to restore"),
-    ], "Writes the arrival copy back over a tampered binary, atomically and attribute-preserving, after sha-verifying the sealed copy against its manifest (a tampered vault is refused). The current file goes to the vault and `hemostat undo <journal>` restores it."),
+    ], "Writes the arrival copy back over a tampered binary, atomically and attribute-preserving, after sha-verifying the sealed copy against its manifest (a tampered vault is refused). Given a link's name, it writes the real file the link led to when sealed, never through the link, and refuses (exit 4) if the link no longer leads there. The current file goes to the vault and `hemostat undo <journal>` restores it."),
     VerbSpec {
         name: "network",
         argv: &["network"],
@@ -193,8 +193,8 @@ pub const REGISTRY: &[VerbSpec] = &[
         kind: Kind::Act,
         needs: &["mod-enf-net-ingress"],
         fields: &[
-            switch("--egress", "default-deny outbound too, keeping what network-allow declares"),
-            opt("--block-pid", "N", Live("pid"), "narrow instead: refuse NEW connections from this process"),
+            switch("--egress", "default-deny outbound too, keeping DNS, DHCP, syslog, Wazuh, DataDog and what network-allow declares"),
+            opt("--block-pid", "N", Live("pid"), "narrow instead: refuse NEW connections from this process (refused for whiteteam, DataDog, log shippers)"),
             opt("--block-dest", "ADDR", Typed, "narrow instead: refuse NEW connections to this address"),
         ],
         arm: Some(Arm::Window { flag: "--arm", choices: &["60", "120", "300", "600"], default: "120" }),
@@ -205,15 +205,15 @@ pub const REGISTRY: &[VerbSpec] = &[
             fixed: &["--block-pid", "--block-dest"],
             fixed_secs: 120,
         }),
-        warn: "The ruleset rolls itself back at the end of the window unless kept. Open a SECOND connection and check it works before [Keep]. Refused, with nothing applied, if /var/lib/hemostat is a link or anyone but root can write it.",
+        warn: "The ruleset rolls itself back at the end of the window unless kept. Open a SECOND connection and check it works before [Keep]. Refused, with nothing applied, if /var/lib/hemostat is a link or anyone but root can write it. A plan that keeps tcp/21 also loads the kernel's FTP conntrack helper, so passive FTP keeps working; a kernel that cannot load it fails the arm, with nothing applied. --block-pid is refused (exit 4) when its cgroup holds a process that belongs to whiteteam or a DataDog account, or whose account cannot be named, or a log shipper.",
     },
     change("network --confirm", &["network", "--confirm"], &[L], &[], &[], "Keeps an armed ruleset: its scheduled rollback will not fire."),
-    change("network --revert", &["network", "--revert"], &[L], &[], &[], "Puts the ruleset saved before the arm back now."),
+    change("network --revert", &["network", "--revert"], &[L], &[], &[], "Deletes the table the arm added (inet hemostat, or inet hemostat_narrow for a narrowing) and nothing else: firewalld's, ufw's and Docker's tables are left as they are. The run exits 6, naming the `nft delete table` command to run by hand, if the table is still loaded afterwards."),
     act("exec-block", &["exec-block"], &[L], &["mod-enf-exec"], &[
         pos_opt("PATH", Live("path"), "the binary to stop starting again"),
         opt("--pid", "N", Live("pid"), "the binary this process runs"),
         switch("--lift", "remove a block instead"),
-    ], "The file is left byte-identical (a bind mount of /dev/null over it); the journal undoes it. Refused for sshd, a listening process's binary, or anything a declared service starts."),
+    ], "The file is left byte-identical (a bind mount of /dev/null over it); the journal undoes it. Refused for sshd, a listening process's binary, anything a declared service starts, anything a unit of this box's scored services starts with HEMOSTAT_GOLDEN set, or the systemd-networkd and systemd-resolved binaries."),
     act("account", &["account"], &[L], &["mod-enf-account"], &[
         pos("USER", Live("user"), "the account"),
         switch("--end-sessions", "end its sessions"),

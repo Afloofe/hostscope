@@ -26,7 +26,7 @@ pub(crate) fn action_path(a: &hemostat_enforce_linux::RemovalAction) -> Option<s
 
 #[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
 pub(crate) fn remediate(args: &[String], json: bool) -> u8 {
-    use hemostat_enforce_linux::persistence::{plan, Disposition};
+    use hemostat_enforce_linux::persistence::{hold_scored, plan, Disposition};
     use hemostat_enforce_linux::{ApplyOptions, Outcome, ProtectSet};
 
     if args.iter().any(|a| a == "--log") {
@@ -76,15 +76,22 @@ pub(crate) fn remediate(args: &[String], json: bool) -> u8 {
         }
     };
     let report = hemostat_sensor_linux::persist::report();
-    let candidates = plan(&report);
-    let batch = bulk_targets(&candidates);
 
     let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
 
     let protect = ProtectSet::gather()
+        .declaring_scored(crate::golden::scored_units_here())
         .declaring_protected(declared.clone())
         .allowing_listeners(allow_listeners.clone());
+
+    let candidates = hold_scored(plan(&report), &protect);
+    let batch = bulk_targets(&candidates);
     if !json {
+
+        let hold = crate::golden::scored_hold_here();
+        if let Some(hold) = &hold {
+            println!("  {}", h(&crate::golden::hold_line(hold, &protect.scored_units)));
+        }
         if !protect.declared_protected.is_empty() {
             println!(
                 "  declared off-limits for this host: {}",
@@ -94,7 +101,7 @@ pub(crate) fn remediate(args: &[String], json: bool) -> u8 {
         if !allow_listeners.is_empty() {
             println!("  listening-socket guard cleared by hand for: {}", allow_listeners.join(", "));
         }
-        if !protect.declared_protected.is_empty() || !allow_listeners.is_empty() {
+        if hold.is_some() || !protect.declared_protected.is_empty() || !allow_listeners.is_empty() {
             println!();
         }
     }
@@ -335,7 +342,8 @@ pub(crate) fn remediate(args: &[String], json: bool) -> u8 {
     let mut still_removable = 0usize;
     if armed && !done.is_empty() && !journal_broke {
         let after = hemostat_sensor_linux::persist::report();
-        still_removable = plan(&after)
+
+        still_removable = hold_scored(plan(&after), &protect)
             .iter()
             .filter(|c| c.disposition.is_actionable())
             .count();
@@ -467,10 +475,15 @@ fn merge_refusal(prev: Option<u8>, code: u8) -> Option<u8> {
 
 #[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
 pub(crate) fn open_run_journal() -> Result<(std::fs::File, String), u8> {
-    use hemostat_enforce_linux::{journal, DEFAULT_VAULT};
-    use std::io::Write as _;
+    open_run_journal_in(std::path::Path::new(hemostat_enforce_linux::DEFAULT_VAULT))
+}
 
-    let dir = std::path::Path::new(DEFAULT_VAULT);
+#[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
+fn open_run_journal_in(dir: &std::path::Path) -> Result<(std::fs::File, String), u8> {
+    use hemostat_enforce_linux::journal;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
     if let Err(e) = std::fs::create_dir_all(dir) {
         eprintln!(
             "hemostat remediate: cannot create the vault directory {}: {e}\n  Nothing was changed.",
@@ -488,6 +501,8 @@ pub(crate) fn open_run_journal() -> Result<(std::fs::File, String), u8> {
     let mut f = std::fs::OpenOptions::new()
         .create_new(true)
         .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .map_err(|e| {
             eprintln!(
@@ -511,12 +526,22 @@ pub(crate) fn open_run_journal() -> Result<(std::fs::File, String), u8> {
 
 #[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
 pub(crate) fn log_timeline(json: bool) -> u8 {
-    use hemostat_enforce_linux::{journal, DEFAULT_VAULT};
+    log_timeline_in(std::path::Path::new(hemostat_enforce_linux::DEFAULT_VAULT), json)
+}
 
-    let dir = std::path::Path::new(DEFAULT_VAULT);
-    let names: Vec<String> = std::fs::read_dir(dir)
-        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
-        .unwrap_or_default();
+#[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
+fn log_timeline_in(dir: &std::path::Path, json: bool) -> u8 {
+    use hemostat_enforce_linux::journal;
+
+    let mut unread: Vec<String> = Vec::new();
+    let names: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            unread.push(format!("{}: {e}", dir.display()));
+            Vec::new()
+        }
+    };
 
     let mut runs: Vec<(u64, String, bool)> = names
         .iter()
@@ -530,12 +555,20 @@ pub(crate) fn log_timeline(json: bool) -> u8 {
 
     let mut rows: Vec<String> = Vec::new();
     let mut n_actions = 0usize;
+    let mut runs_read = 0usize;
     for (epoch, name, replayed) in &runs {
         let when = epoch_to_utc(*epoch);
-        let records = hemostat_sensor_linux::saferead::read_text(&dir.join(name))
-            .ok()
-            .and_then(|t| journal::decode(&t).ok())
-            .unwrap_or_default();
+        let read = hemostat_sensor_linux::saferead::read_text(&dir.join(name))
+            .map_err(|e| e.to_string())
+            .and_then(|t| journal::decode(&t));
+        let records = match read {
+            Ok(records) => records,
+            Err(why) => {
+                unread.push(format!("{}: {why}", dir.join(name).display()));
+                continue;
+            }
+        };
+        runs_read += 1;
         for rec in &records {
             n_actions += 1;
             if json {
@@ -552,13 +585,30 @@ pub(crate) fn log_timeline(json: bool) -> u8 {
         }
     }
     if json {
-        jprintln!("{{\"actions\":[{}]}}", rows.join(","));
-    } else if n_actions == 0 {
-        println!("  No remediation has been armed on this host (no run journals in {}).", h(&dir.display().to_string()));
+        let not_read: Vec<String> = unread.iter().map(|u| format!("\"{}\"", jesc(u))).collect();
+        jprintln!("{{\"actions\":[{}],\"unread\":[{}]}}", rows.join(","), not_read.join(","));
     } else {
-        println!("\n  {n_actions} armed action(s) across {} run(s). Each is reversible with `mahoraga undo <journal>`.", runs.len());
+        for u in &unread {
+            println!("  NOT READ: {}", h(u));
+        }
+        if n_actions > 0 {
+            println!("\n  {n_actions} armed action(s) across {runs_read} run(s). Each is reversible with `mahoraga undo <journal>`.");
+        } else if unread.is_empty() {
+            println!("  No remediation has been armed on this host (no run journals in {}).", h(&dir.display().to_string()));
+        }
+        if !unread.is_empty() {
+            println!(
+                "\n  {} not read (above), so this timeline is not the whole of what was armed. The \
+                 journals are root's alone: as any other account, none of them can be read.",
+                unread.len()
+            );
+        }
     }
-    EXIT_OK
+    if unread.is_empty() {
+        EXIT_OK
+    } else {
+        crate::EXIT_PARTIAL
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -709,6 +759,7 @@ fn undo_exit(failed: usize, refused: usize, recorded: bool) -> u8 {
 
 pub(crate) fn record_replay(journal: &str, outcomes: &[String]) -> Result<std::path::PathBuf, String> {
     use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -720,7 +771,13 @@ pub(crate) fn record_replay(journal: &str, outcomes: &[String]) -> Result<std::p
         } else {
             format!("{journal}.replayed-{secs}-{n}")
         });
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
             Ok(f) => break (path, f),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 999 => n += 1,
             Err(e) => return Err(format!("{}: {e}", path.display())),

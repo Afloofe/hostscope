@@ -150,6 +150,21 @@ pub(crate) fn input(c: &Collection, own_image: Option<&str>) -> DetectInput {
     }
 }
 
+fn cut_count(n: impl std::fmt::Display, what: &str) -> String {
+    format!(
+        "{n} {what}(s) had a field over {} bytes, of which only the head and the tail were evaluated — a rule \
+         keyed on text in the cut middle could not have matched them",
+        hs_core::MAX_FIELD_BYTES
+    )
+}
+
+fn cut_hit_note() -> String {
+    format!(
+        "a field of this event was over {} bytes and was cut: its head and tail were evaluated, not its middle",
+        hs_core::MAX_FIELD_BYTES
+    )
+}
+
 fn mapping_line() -> String {
     MAPPING
         .iter()
@@ -203,10 +218,11 @@ pub(crate) fn findings(set: &RuleSet, input: &DetectInput) -> Vec<Finding> {
                 subject: hit.title.clone(),
                 what,
                 why: format!(
-                    "Sigma rule{} at level {} matched {}. A rule match is a lead, not a verdict",
+                    "Sigma rule{} at level {} matched {}. A rule match is a lead, not a verdict{}",
                     hit.id.as_ref().map_or_else(String::new, |i| format!(" {i}")),
                     hit.level.token(),
-                    input.about(hit.seq).unwrap_or("an event")
+                    input.about(hit.seq).unwrap_or("an event"),
+                    if hit.truncated { format!("; {}", cut_hit_note()) } else { String::new() }
                 ),
                 fix: None,
             }
@@ -253,6 +269,10 @@ pub(crate) fn console_result(
         part.push(format!("{} rule file(s) could not be read", unreadable.len()));
     }
     part.extend(input.gaps.iter().cloned());
+    let cut = hemostat_detect::truncated_events(&input.events);
+    if cut > 0 {
+        part.push(cut_count(cut, "event"));
+    }
     let covered = if part.is_empty() { Covered::Fully } else { Covered::InPart(part.join("; ")) };
     (found, covered)
 }
@@ -302,6 +322,28 @@ pub(crate) struct LiveHit {
     pub(crate) seen: i64,
 
     pub(crate) latency_ms: Option<i64>,
+
+    pub(crate) truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveCut {
+
+    pub(crate) about: String,
+
+    pub(crate) line: String,
+
+    pub(crate) event_json: String,
+
+    pub(crate) seen: i64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Fed {
+
+    pub(crate) hits: Vec<LiveHit>,
+
+    pub(crate) cut: Vec<LiveCut>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -347,6 +389,8 @@ pub(crate) struct LiveEval {
     pub(crate) suppressed: u64,
     pub(crate) hits: u64,
     pub(crate) latency: Latency,
+
+    pub(crate) truncated: u64,
 }
 
 const fn source_index(s: Source) -> usize {
@@ -367,6 +411,7 @@ impl LiveEval {
             suppressed: 0,
             hits: 0,
             latency: Latency::default(),
+            truncated: 0,
         }
     }
 
@@ -374,10 +419,10 @@ impl LiveEval {
         self.evaluated.iter().sum()
     }
 
-    pub(crate) fn feed(&mut self, set: &hemostat_detect::RuleSet, arrivals: &[Arrival]) -> Vec<LiveHit> {
+    pub(crate) fn feed(&mut self, set: &hemostat_detect::RuleSet, arrivals: &[Arrival]) -> Fed {
         let boot = BootId::from_bytes([0; 16]);
         let o = origin();
-        let mut out = Vec::new();
+        let mut out = Fed::default();
         for a in arrivals {
             let s = &a.start;
             let ours = match (self.own.as_deref(), s.parent_image.as_deref()) {
@@ -397,6 +442,16 @@ impl LiveEval {
             }
             let event = s.to_event(self.seq, boot, o);
             self.seq += 1;
+
+            if event.truncated() {
+                self.truncated += 1;
+                out.cut.push(LiveCut {
+                    about: format!("{} record {}, {}", s.source.name(), s.record_id, when(s.time)),
+                    line: crate::analysis::event_line(&event),
+                    event_json: crate::analysis::event_json(&event),
+                    seen: a.seen,
+                });
+            }
             for hit in hemostat_detect::run(set, std::slice::from_ref(&event)) {
                 let key = hit.id.clone().unwrap_or_else(|| hit.title.clone());
                 let image = s.image.as_deref().unwrap_or_default().to_lowercase();
@@ -421,7 +476,7 @@ impl LiveEval {
                     self.recent.push_back((key, pid, image, t, s.source));
                 }
                 self.hits += 1;
-                out.push(LiveHit {
+                out.hits.push(LiveHit {
                     level: hit.level,
                     title: hit.title,
                     id: hit.id,
@@ -430,11 +485,30 @@ impl LiveEval {
                     event_json: crate::analysis::event_json(&event),
                     seen: a.seen,
                     latency_ms,
+                    truncated: hit.truncated,
                 });
             }
         }
         out
     }
+}
+
+pub(crate) fn cut_line(c: &LiveCut) -> String {
+    format!(
+        "{}: a field was over {} bytes and was cut — its head and tail were evaluated, not its middle, so a \
+         rule keyed on text there could not have matched it",
+        c.about,
+        hs_core::MAX_FIELD_BYTES
+    )
+}
+
+pub(crate) fn cut_json(c: &LiveCut) -> String {
+    format!(
+        "{{\"type\":\"truncated\",\"from\":{},\"seen\":{},\"event\":{}}}",
+        json_str(&c.about),
+        json_str(&when(Some(c.seen))),
+        c.event_json
+    )
 }
 
 pub(crate) fn change_line(c: &Change) -> String {
@@ -547,19 +621,25 @@ pub(crate) fn watch_complete(
     eval: &LiveEval,
     dropped: u64,
 ) -> bool {
-    set.complete() && unreadable.is_empty() && ledger.faults.is_empty() && dropped == 0 && eval.evaluated_total() > 0
+    set.complete()
+        && unreadable.is_empty()
+        && ledger.faults.is_empty()
+        && dropped == 0
+        && eval.evaluated_total() > 0
+        && eval.truncated == 0
 }
 
 pub(crate) fn hit_json(h: &LiveHit) -> String {
     format!(
         "{{\"type\":\"hit\",\"level\":\"{}\",\"title\":{},\"id\":{},\"from\":{},\"seen\":{},\"latency_ms\":{},\
-         \"event\":{}}}",
+         \"truncated\":{},\"event\":{}}}",
         h.level.token(),
         json_str(&h.title),
         h.id.as_ref().map_or("null".into(), |i| json_str(i)),
         json_str(&h.about),
         json_str(&when(Some(h.seen))),
         h.latency_ms.map_or("null".into(), |l| l.to_string()),
+        h.truncated,
         h.event_json
     )
 }
@@ -616,6 +696,11 @@ pub(crate) fn summary(
         } else {
             format!("0 dropped by the ring (cap {cap})")
         },
+        if eval.truncated > 0 {
+            format!("{}, so this watch is NOT complete", cut_count(eval.truncated, "record"))
+        } else {
+            format!("0 record(s) had a field cut at {} bytes", hs_core::MAX_FIELD_BYTES)
+        },
     ];
     for s in status {
         lines.push(status_line(s));
@@ -623,7 +708,7 @@ pub(crate) fn summary(
     let json = format!(
         "{{\"type\":\"summary\",\"seconds\":{secs_watched},\"complete\":{complete},\"evaluated\":{},\
          \"by_source\":{{\"Sysmon 1\":{},\"Security 4688\":{}}},\"hits\":{},\"excluded_own\":{},\
-         \"suppressed\":{},\"dropped\":{dropped},\"ring_cap\":{cap},\
+         \"suppressed\":{},\"dropped\":{dropped},\"ring_cap\":{cap},\"truncated_events\":{},\
          \"latency_ms\":{{\"n\":{},\"min\":{},\"mean\":{},\"max\":{},\"over_1s\":{},\"over_5s\":{}}},\
          \"faults\":[{}],\"sources\":[{}]}}",
         eval.evaluated_total(),
@@ -632,6 +717,7 @@ pub(crate) fn summary(
         eval.hits,
         eval.excluded_own,
         eval.suppressed,
+        eval.truncated,
         l.n,
         if l.n > 0 { l.min.to_string() } else { "null".into() },
         l.mean().map_or("null".into(), |m| m.to_string()),
@@ -706,7 +792,17 @@ pub(crate) fn print_watch(json: bool, set: &hemostat_detect::RuleSet, unreadable
         }
         initial = false;
         ledger.observe(&d.changes, &d.status, filetime_now());
-        for hit in eval.feed(set, &d.arrivals) {
+        let fed = eval.feed(set, &d.arrivals);
+
+        for cut in &fed.cut {
+            if json {
+                jprintln!("{}", cut_json(cut));
+            } else {
+                println!("  [cut] {}", h(&cut_line(cut)));
+                println!("      {}", h(&cut.line));
+            }
+        }
+        for hit in fed.hits {
             if json {
                 jprintln!("{}", hit_json(&hit));
             } else {
@@ -718,6 +814,9 @@ pub(crate) fn print_watch(json: bool, set: &hemostat_detect::RuleSet, unreadable
                     h(&hit.about)
                 );
                 println!("      {}", h(&hit.line));
+                if hit.truncated {
+                    println!("      {}", cut_hit_note());
+                }
             }
         }
         dropped = d.dropped;
@@ -800,12 +899,13 @@ pub(crate) fn live_row(hit: &LiveHit) -> hemostat_tui::FindingRow {
         subject: hit.title.clone(),
         what: hit.line.clone(),
         why: format!(
-            "Sigma rule{} at level {} matched {}, seen live at {}{}. A rule match is a lead, not a verdict",
+            "Sigma rule{} at level {} matched {}, seen live at {}{}. A rule match is a lead, not a verdict{}",
             hit.id.as_ref().map_or_else(String::new, |i| format!(" {i}")),
             hit.level.token(),
             hit.about,
             when(Some(hit.seen)),
-            hit.latency_ms.map_or_else(String::new, |l| format!(", {} after it was written", secs(l)))
+            hit.latency_ms.map_or_else(String::new, |l| format!(", {} after it was written", secs(l))),
+            if hit.truncated { format!("; {}", cut_hit_note()) } else { String::new() }
         ),
         remedy: None,
         evidence: Vec::new(),
@@ -813,7 +913,7 @@ pub(crate) fn live_row(hit: &LiveHit) -> hemostat_tui::FindingRow {
 }
 
 #[cfg(any(test, all(target_os = "windows", feature = "mod-tui")))]
-pub(crate) fn live_gap(ledger: &Ledger, dropped: u64, rows_dropped: u64) -> Option<hemostat_tui::Gap> {
+pub(crate) fn live_gap(ledger: &Ledger, dropped: u64, rows_dropped: u64, truncated: u64) -> Option<hemostat_tui::Gap> {
     let mut why: Vec<String> = Vec::new();
     if ledger.blind() {
         why.push("no source is delivering process starts now".into());
@@ -826,6 +926,9 @@ pub(crate) fn live_gap(ledger: &Ledger, dropped: u64, rows_dropped: u64) -> Opti
     }
     if rows_dropped > 0 {
         why.push(format!("{rows_dropped} live row(s) dropped at the cap of {CONSOLE_ROWS_CAP}"));
+    }
+    if truncated > 0 {
+        why.push(cut_count(truncated, "live record"));
     }
     if why.is_empty() {
         return None;
@@ -874,7 +977,8 @@ pub(crate) fn console_live_tick(model: &mut hemostat_tui::ConsoleModel) -> bool 
     c.dropped = d.dropped;
     c.status = d.status;
     let mut new_rows = Vec::new();
-    for hit in c.eval.feed(&c.set, &d.arrivals) {
+
+    for hit in c.eval.feed(&c.set, &d.arrivals).hits {
         let row = live_row(&hit);
         if c.rows.len() >= CONSOLE_ROWS_CAP {
             c.rows.remove(0);
@@ -885,7 +989,7 @@ pub(crate) fn console_live_tick(model: &mut hemostat_tui::ConsoleModel) -> bool 
     }
     let changed = !new_rows.is_empty();
     model.add_rows(new_rows);
-    let gap = live_gap(&c.ledger, c.dropped, c.rows_dropped);
+    let gap = live_gap(&c.ledger, c.dropped, c.rows_dropped, c.eval.truncated);
     model.set_gap(LIVE_SOURCE, gap) || changed
 }
 
@@ -894,7 +998,7 @@ pub(crate) fn console_live_rows(rows: &mut Vec<hemostat_tui::FindingRow>, gaps: 
     let Ok(g) = CONSOLE_LIVE.lock() else { return };
     let Some(c) = g.as_ref() else { return };
     rows.extend(c.rows.iter().map(|(_, r)| r.clone()));
-    gaps.extend(live_gap(&c.ledger, c.dropped, c.rows_dropped));
+    gaps.extend(live_gap(&c.ledger, c.dropped, c.rows_dropped, c.eval.truncated));
 }
 
 #[cfg(all(target_os = "windows", feature = "mod-tui"))]

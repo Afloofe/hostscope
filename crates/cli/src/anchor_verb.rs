@@ -175,7 +175,10 @@ fn remove(args: &[String], json: bool) -> u8 {
             }
         }
     }
-    let protect = ProtectSet::gather().declaring_protected(declared);
+
+    let protect = ProtectSet::gather()
+        .declaring_scored(crate::golden::scored_units_here())
+        .declaring_protected(declared);
     let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
     let outcome = action.apply(&opts, &protect);
     if !matches!(outcome, Outcome::Applied(_)) && armed {

@@ -201,7 +201,10 @@ fn strip_line(args: &[String], json: bool) -> u8 {
             }
         }
     }
-    let protect = ProtectSet::gather().declaring_protected(declared);
+
+    let protect = ProtectSet::gather()
+        .declaring_scored(crate::golden::scored_units_here())
+        .declaring_protected(declared);
     let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
     let outcome = action.apply(&opts, &protect);
     if !matches!(outcome, Outcome::Applied(_)) && armed {
@@ -319,7 +322,10 @@ pub(crate) fn suggestions(findings: &[hemostat_sensor_linux::triage::Finding]) -
         let severity = f.severity.tag().to_string();
         match strip::offer_for(path, &f.what) {
             Some(offer) => add(&mut out, Suggestion::Line { severity, offer }),
-            None if kind.is_auth() => add(&mut out, Suggestion::List { severity, path: f.locus.clone() }),
+
+            None if kind.is_auth() && strip::offers(path).is_ok() => {
+                add(&mut out, Suggestion::List { severity, path: f.locus.clone() });
+            }
             None => {}
         }
     }

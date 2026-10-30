@@ -91,7 +91,8 @@ pub(crate) fn print_kmod(json: bool, unload: Option<&str>, armed: bool) -> u8 {
     };
 
     let action = RemovalAction::UnloadModule { name: name.to_string(), seen };
-    let protect = ProtectSet::gather();
+
+    let protect = ProtectSet::gather().declaring_scored(crate::golden::scored_units_here());
 
     let class = class_of_action(&action);
     let ticket_class = hemostat_buildinfo::ActionClass::ALL

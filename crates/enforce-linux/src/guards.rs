@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -58,6 +58,8 @@ pub struct ProtectSet {
 
     pub declared_protected: BTreeSet<String>,
 
+    pub scored_units: BTreeMap<String, String>,
+
     pub modules: crate::modprotect::ModuleProtectSet,
 
     pub protected_users: BTreeSet<String>,
@@ -116,6 +118,7 @@ impl ProtectSet {
             listener_units,
             modules,
             declared_protected,
+            scored_units: BTreeMap::new(),
             allow_listener_units: BTreeSet::new(),
             agent_pid,
             listener_map_complete: complete,
@@ -132,6 +135,50 @@ impl ProtectSet {
     pub fn declaring_protected_users(mut self, users: impl IntoIterator<Item = String>) -> Self {
         self.protected_users.extend(users);
         self
+    }
+
+    #[must_use]
+    pub fn declaring_scored(self, units: impl IntoIterator<Item = (String, String)>) -> ProtectSet {
+        self.declaring_scored_with(units, unit_names)
+    }
+
+    fn declaring_scored_with(
+        mut self,
+        units: impl IntoIterator<Item = (String, String)>,
+        names_of: impl Fn(&[String]) -> Vec<String>,
+    ) -> ProtectSet {
+        let mut by_service: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (unit, service) in units {
+            by_service.entry(service).or_default().push(normalise_unit(&unit));
+        }
+        for (service, units) in by_service {
+            let mut names = names_of(&units);
+            names.extend(units);
+            for name in names {
+                self.scored_units.entry(name).or_insert_with(|| service.clone());
+            }
+        }
+        self
+    }
+
+    pub fn scored_service(&self, unit: &str) -> Option<&str> {
+        self.scored_units
+            .get(unit)
+            .or_else(|| self.scored_units.get(&normalise_unit(unit)))
+            .map(String::as_str)
+    }
+
+    pub fn scored_service_of_path(&self, path: &Path) -> Option<&str> {
+        if !path.to_string_lossy().contains("/systemd/") {
+            return None;
+        }
+        let own = path.file_name().and_then(|n| n.to_str()).and_then(|n| self.scored_service(n));
+        own.or_else(|| {
+            path.ancestors()
+                .skip(1)
+                .filter_map(|a| a.file_name()?.to_str()?.strip_suffix(".d"))
+                .find_map(|u| self.scored_service(u))
+        })
     }
 
     pub(crate) fn declared_reason(&self, subject: &str) -> Option<ProtectReason> {
@@ -199,6 +246,10 @@ impl ProtectSet {
         exe: Option<&str>,
         unit: Option<&str>,
     ) -> Option<ProtectReason> {
+
+        if let Some(service) = unit.and_then(|u| self.scored_service(u)) {
+            return Some(ProtectReason::ScoredService(service.to_string()));
+        }
         if exe.is_some_and(|e| self.declared(e)) || unit.is_some_and(|u| self.declared(u)) {
             return Some(ProtectReason::OperatorDeclared);
         }
@@ -222,6 +273,14 @@ impl ProtectSet {
         let held = |set: &BTreeSet<String>| set.contains(unit) || set.contains(&named);
         if unit_is_ssh(unit) || held(&self.session_units) {
             return Some(ProtectReason::OperatorSession);
+        }
+
+        if unit_is_host_network(unit) {
+            return Some(ProtectReason::HostNetwork);
+        }
+
+        if let Some(service) = self.scored_service(unit) {
+            return Some(ProtectReason::ScoredService(service.to_string()));
         }
 
         if let Some(r) = self.declared_reason(unit) {
@@ -289,6 +348,39 @@ pub(crate) fn unit_is_ssh(unit: &str) -> bool {
         .or_else(|| unit.strip_suffix(".socket"))
         .unwrap_or(unit);
     matches!(base, "ssh" | "sshd")
+}
+
+const HOST_NETWORK_UNITS: &[&str] = &[
+    "networking.service",
+    "systemd-networkd.service",
+    "systemd-networkd.socket",
+    "NetworkManager.service",
+    "network.service",
+    "systemd-resolved.service",
+    "wicked.service",
+    "dbus-org.freedesktop.network1.service",
+    "dbus-org.freedesktop.resolve1.service",
+    "dbus-org.freedesktop.NetworkManager.service",
+];
+
+pub(crate) fn unit_is_host_network(unit: &str) -> bool {
+    let named = normalise_unit(unit);
+    HOST_NETWORK_UNITS.contains(&named.as_str())
+        || named.strip_prefix("ifup@").is_some_and(|i| i.ends_with(".service"))
+}
+
+pub(crate) fn host_network_unit_of(path: &Path) -> Option<String> {
+    if !path.to_string_lossy().contains("/systemd/") {
+        return None;
+    }
+    let own = path.file_name().and_then(|n| n.to_str()).filter(|n| unit_is_host_network(n));
+    let dropin = || {
+        path.ancestors()
+            .skip(1)
+            .filter_map(|a| a.file_name()?.to_str()?.strip_suffix(".d"))
+            .find(|u| unit_is_host_network(u))
+    };
+    own.or_else(dropin).map(normalise_unit)
 }
 
 pub(crate) fn session_chain(start: u32) -> BTreeSet<u32> {

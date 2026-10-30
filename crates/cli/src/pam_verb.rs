@@ -2,23 +2,26 @@ use hemostat_enforce_linux::pam_validate::{self, AfterSwap, Probe};
 use hemostat_enforce_linux::{ApplyOptions, Outcome, ProtectSet, RemovalAction};
 
 use crate::authz::{broker_admits, exit_for_refusal, loaded_sanction, presented_authority};
-use crate::pam_golden::{self, KnownModule};
+use crate::pam_golden::{self, DistroKey, KnownModule, Pick};
 use crate::render::{h, jesc};
 use crate::{repeated_flag_values, EXIT_AUTHZ, EXIT_DRYRUN, EXIT_ENFORCER, EXIT_OK, EXIT_PARTIAL, EXIT_POLICY, EXIT_USAGE};
 
 pub(crate) enum State {
 
-    Clean,
+    Clean { build: &'static KnownModule },
 
-    Tampered { on_disk: String },
+    Tampered { build: &'static KnownModule, on_disk: String },
 
-    VersionMismatch { installed: Option<String> },
+    VersionMismatch { pkg: &'static str, installed: Option<String>, baked: Vec<&'static str> },
 
-    Unreadable { why: String },
+    Ambiguous { why: String },
+
+    Unreadable { build: &'static KnownModule, why: String },
 }
 
 pub(crate) struct Finding {
-    pub(crate) module: &'static KnownModule,
+
+    pub(crate) path: &'static str,
     pub(crate) state: State,
 }
 
@@ -29,28 +32,41 @@ pub(crate) fn scan() -> Result<Vec<Finding>, String> {
     let key = pam_golden::detect()?;
     let arch = pam_golden::host_arch();
     let mgr = hemostat_sensor_linux::pkg::manager();
-    Ok(pam_golden::KNOWN
-        .iter()
-        .filter(|m| m.distro_id == key.id && m.version_id == key.version_id && m.arch == arch)
-        .map(|m| {
-            let installed = mgr.as_ref().and_then(|g| g.installed_version(m.pkg));
-            if installed.as_deref() != Some(m.pkg_version) {
-                return Finding { module: m, state: State::VersionMismatch { installed } };
-            }
-            let state = match hemostat_sensor_linux::saferead::sha256_of(std::path::Path::new(m.path)) {
-                Ok(d) => {
-                    let got = hex32(&d);
-                    if got.eq_ignore_ascii_case(m.sha256) {
-                        State::Clean
-                    } else {
-                        State::Tampered { on_disk: got }
-                    }
-                }
-                Err(e) => State::Unreadable { why: e.to_string() },
+    Ok(judge(
+        pam_golden::KNOWN,
+        &key,
+        arch,
+        |pkg| mgr.as_ref().and_then(|g| g.installed_version(pkg)),
+        |path| {
+            hemostat_sensor_linux::saferead::sha256_of(std::path::Path::new(path))
+                .map(|d| hex32(&d))
+                .map_err(|e| e.to_string())
+        },
+    ))
+}
+
+fn judge(
+    table: &'static [KnownModule],
+    key: &DistroKey,
+    arch: &str,
+    installed_version: impl Fn(&str) -> Option<String>,
+    digest: impl Fn(&str) -> Result<String, String>,
+) -> Vec<Finding> {
+    pam_golden::paths_for(table, key, arch)
+        .into_iter()
+        .filter_map(|path| {
+            let state = match pam_golden::pick(table, key, arch, path, &installed_version)? {
+                Pick::Build(build) => match digest(build.path) {
+                    Ok(got) if got.eq_ignore_ascii_case(build.sha256) => State::Clean { build },
+                    Ok(got) => State::Tampered { build, on_disk: got },
+                    Err(why) => State::Unreadable { build, why },
+                },
+                Pick::NoBuild { pkg, installed, baked } => State::VersionMismatch { pkg, installed, baked },
+                Pick::Ambiguous(why) => State::Ambiguous { why },
             };
-            Finding { module: m, state }
+            Some(Finding { path, state })
         })
-        .collect())
+        .collect()
 }
 
 fn hex32(b: &[u8; 32]) -> String {
@@ -65,8 +81,77 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn restore_cmd(m: &KnownModule) -> String {
-    format!("hemostat remediate --restore-pam {} --arm", sh_quote(m.path))
+fn restore_cmd(path: &str) -> String {
+    format!("hemostat remediate --restore-pam {} --arm", sh_quote(path))
+}
+
+fn no_build_why(pkg: &str, installed: Option<&str>, baked: &[&str], release: &str) -> String {
+    format!(
+        "installed {pkg} {} is none of the builds baked for {release} ({})",
+        installed.unwrap_or("(not installed, or its version could not be read)"),
+        baked.join(", ")
+    )
+}
+
+fn not_baked_why(path: &str, release: &str, baked_paths: &[&str]) -> String {
+    let have = if baked_paths.is_empty() {
+        "nothing is baked for it".to_string()
+    } else {
+        format!("baked for it: {}", baked_paths.join(", "))
+    };
+    format!("no baked known-good for {path} on {release} ({have})")
+}
+
+fn json_row(f: &Finding) -> String {
+    let path = jesc(f.path);
+    let judged = |b: &KnownModule| format!("\"pkg\":\"{}\",\"build\":\"{}\"", jesc(b.pkg), jesc(b.pkg_version));
+    match &f.state {
+        State::Clean { build } => format!("{{\"path\":\"{path}\",\"state\":\"clean\",{}}}", judged(build)),
+        State::Tampered { build, on_disk } => format!(
+            "{{\"path\":\"{path}\",\"state\":\"tampered\",{},\"expected\":\"{}\",\"on_disk\":\"{}\"}}",
+            judged(build),
+            jesc(build.sha256),
+            jesc(on_disk)
+        ),
+        State::VersionMismatch { pkg, installed, baked } => format!(
+            "{{\"path\":\"{path}\",\"state\":\"version-mismatch\",\"pkg\":\"{}\",\"baked\":\"{}\",\"baked_builds\":[{}],\"installed\":{}}}",
+            jesc(pkg),
+            jesc(&baked.join(", ")),
+            baked.iter().map(|v| format!("\"{}\"", jesc(v))).collect::<Vec<_>>().join(","),
+            installed.as_deref().map_or("null".to_string(), |v| format!("\"{}\"", jesc(v)))
+        ),
+        State::Ambiguous { why } => format!("{{\"path\":\"{path}\",\"state\":\"ambiguous\",\"why\":\"{}\"}}", jesc(why)),
+        State::Unreadable { build, why } => {
+            format!("{{\"path\":\"{path}\",\"state\":\"unreadable\",{},\"why\":\"{}\"}}", judged(build), jesc(why))
+        }
+    }
+}
+
+fn text_row(f: &Finding) -> String {
+    match &f.state {
+        State::Clean { build } => {
+            format!("  [ok]       {} — matches stock {} {}", h(f.path), h(build.pkg), h(build.pkg_version))
+        }
+        State::Tampered { build, on_disk } => format!(
+            "  [TAMPERED] {} — on-disk {}…, stock {}… ({} {})\n             {}",
+            h(f.path),
+            h(on_disk.get(..16).unwrap_or(on_disk)),
+            h(build.sha256.get(..16).unwrap_or(build.sha256)),
+            h(build.pkg),
+            h(build.pkg_version),
+            h(&restore_cmd(f.path))
+        ),
+        State::VersionMismatch { pkg, installed, baked } => crate::render::wrap_why(
+            &h(&format!(
+                "{} — {}; restore from the package cache",
+                f.path,
+                no_build_why(pkg, installed.as_deref(), baked, "this release")
+            )),
+            "  [skip]     ",
+        ),
+        State::Ambiguous { why } => format!("  [warn]     {} — {}; not checked", h(f.path), h(why)),
+        State::Unreadable { why, .. } => format!("  [warn]     {} — {}", h(f.path), h(why)),
+    }
 }
 
 fn label_of(m: &KnownModule) -> String {
@@ -93,27 +178,7 @@ fn list(json: bool) -> u8 {
         Err(why) => return distro_unknown(&why, json),
     };
     if json {
-        let rows: Vec<String> = findings
-            .iter()
-            .map(|f| match &f.state {
-                State::Clean => format!("{{\"path\":\"{}\",\"state\":\"clean\"}}", jesc(f.module.path)),
-                State::Tampered { on_disk } => format!(
-                    "{{\"path\":\"{}\",\"state\":\"tampered\",\"expected\":\"{}\",\"on_disk\":\"{}\"}}",
-                    jesc(f.module.path),
-                    jesc(f.module.sha256),
-                    jesc(on_disk)
-                ),
-                State::VersionMismatch { installed } => format!(
-                    "{{\"path\":\"{}\",\"state\":\"version-mismatch\",\"baked\":\"{}\",\"installed\":{}}}",
-                    jesc(f.module.path),
-                    jesc(f.module.pkg_version),
-                    installed.as_deref().map_or("null".to_string(), |v| format!("\"{}\"", jesc(v)))
-                ),
-                State::Unreadable { why } => {
-                    format!("{{\"path\":\"{}\",\"state\":\"unreadable\",\"why\":\"{}\"}}", jesc(f.module.path), jesc(why))
-                }
-            })
-            .collect();
+        let rows: Vec<String> = findings.iter().map(json_row).collect();
         jprintln!("{{\"pam_modules\":[{}]}}", rows.join(","));
         return EXIT_OK;
     }
@@ -124,28 +189,21 @@ fn list(json: bool) -> u8 {
         );
         return EXIT_OK;
     }
-    let tampered = findings.iter().filter(|f| matches!(f.state, State::Tampered { .. })).count();
-    println!(
-        "  PAM modules checked against the distribution's stock build — {tampered} tampered. Each \
-         restore is a dry run until --arm."
-    );
+    println!("{}", summary_line(&findings));
     for f in &findings {
-        match &f.state {
-            State::Clean => println!("  [ok]       {} — matches stock", h(f.module.path)),
-            State::Tampered { on_disk } => {
-                println!("  [TAMPERED] {} — on-disk {}…, stock {}…", h(f.module.path), h(&on_disk[..16]), h(&f.module.sha256[..16]));
-                println!("             {}", h(&restore_cmd(f.module)));
-            }
-            State::VersionMismatch { installed } => println!(
-                "  [skip]     {} — installed {} is not the baked {}; restore from the package cache",
-                h(f.module.path),
-                h(installed.as_deref().unwrap_or("(not installed)")),
-                h(f.module.pkg_version)
-            ),
-            State::Unreadable { why } => println!("  [warn]     {} — {}", h(f.module.path), h(why)),
-        }
+        println!("{}", text_row(f));
     }
     EXIT_OK
+}
+
+fn summary_line(findings: &[Finding]) -> String {
+    let tampered = findings.iter().filter(|f| matches!(f.state, State::Tampered { .. })).count();
+    let unchecked = findings.iter().filter(|f| !matches!(f.state, State::Clean { .. } | State::Tampered { .. })).count();
+    let unchecked = if unchecked == 0 { String::new() } else { format!(", {unchecked} not checked") };
+    format!(
+        "  PAM modules checked against the distribution's stock build of the installed version — \
+         {tampered} tampered{unchecked}. Each restore is a dry run until --arm."
+    )
 }
 
 fn distro_unknown(why: &str, json: bool) -> u8 {
@@ -186,29 +244,34 @@ fn restore(args: &[String], json: bool) -> u8 {
         }
     };
     let arch = pam_golden::host_arch();
-    let Some(m) = pam_golden::known_good_for(&key, arch, &path) else {
-        eprintln!(
-            "hemostat remediate: no baked known-good for {} on {} {} ({arch}). Nothing was attempted",
-            h(&path),
-            h(&key.id),
-            h(&key.version_id)
-        );
-        return EXIT_USAGE;
-    };
+    let release = format!("{} {} {arch}", key.id, key.version_id);
 
-    let installed = hemostat_sensor_linux::pkg::manager().and_then(|g| g.installed_version(m.pkg));
-    if installed.as_deref() != Some(m.pkg_version) {
-        eprintln!(
-            "hemostat remediate: refusing to restore {} — installed {} is {}, not the baked {}. \
-             Writing our bytes could be the wrong build; restore from the package cache \
-             (apt/dnf reinstall from /var/cache) instead. Nothing was changed",
-            h(&path),
-            h(m.pkg),
-            h(installed.as_deref().unwrap_or("not installed")),
-            h(m.pkg_version)
-        );
-        return EXIT_POLICY;
-    }
+    let mgr = hemostat_sensor_linux::pkg::manager();
+    let picked = pam_golden::pick(pam_golden::KNOWN, &key, arch, &path, |pkg| {
+        mgr.as_ref().and_then(|g| g.installed_version(pkg))
+    });
+    let m = match picked {
+        Some(Pick::Build(m)) => m,
+        None => {
+            let baked_paths = pam_golden::paths_for(pam_golden::KNOWN, &key, arch);
+            eprintln!("hemostat remediate: {}. Nothing was attempted", h(&not_baked_why(&path, &release, &baked_paths)));
+            return EXIT_USAGE;
+        }
+        Some(Pick::NoBuild { pkg, installed, baked }) => {
+            eprintln!(
+                "hemostat remediate: refusing to restore {} — {}. Writing our bytes could be the \
+                 wrong build; restore from the package cache (apt/dnf reinstall from /var/cache) \
+                 instead. Nothing was changed",
+                h(&path),
+                h(&no_build_why(pkg, installed.as_deref(), &baked, &release))
+            );
+            return EXIT_POLICY;
+        }
+        Some(Pick::Ambiguous(why)) => {
+            eprintln!("hemostat remediate: refusing to restore {} — {}. Nothing was changed", h(&path), h(&why));
+            return EXIT_POLICY;
+        }
+    };
 
     let declared = match repeated_flag_values(args, "--protect") {
         Ok(v) => v,
@@ -276,7 +339,10 @@ fn restore(args: &[String], json: bool) -> u8 {
             }
         }
     }
-    let protect = ProtectSet::gather().declaring_protected(declared);
+
+    let protect = ProtectSet::gather()
+        .declaring_scored(crate::golden::scored_units_here())
+        .declaring_protected(declared);
     let opts = if armed { ApplyOptions::armed() } else { ApplyOptions::dry_run() };
 
     let baseline = if armed { Some(pam_validate::probe()) } else { None };

@@ -164,11 +164,15 @@ pub(crate) fn linux_remedy(
     }
 
     if source == "persistence" && !locus.is_empty() {
-        return persist_remedy(subject, locus, sev, |p| p.exists(), |p| {
-            hemostat_sensor_linux::pkg::manager().is_some_and(|m| m.owns(p))
-        })
-
-        .or_else(|| strip_remedy(locus, what, sev));
+        return persist_row_remedy(
+            subject,
+            locus,
+            what,
+            sev,
+            &crate::golden::scored_hold_by_name(),
+            |p| p.exists(),
+            |p| hemostat_sensor_linux::pkg::manager().is_some_and(|m| m.owns(p)),
+        );
     }
 
     if source == "trust" && matches!(sev, Sev::Critical | Sev::Warn) {
@@ -204,8 +208,13 @@ pub(crate) fn watchdog_remedy(seed: &[hemostat_sensor_linux::watchdog::Pinned]) 
         risk: Risk::MayBreak,
         note: "every member is SIGSTOPped first, so none can restart another, and only \
                then killed. If any member is refused by the protect-set the whole action \
-               is abandoned and the frozen ones are resumed — it is all of them or none. \
-               A survivor is reported as a survivor rather than as a success"
+               is abandoned and the frozen ones are resumed — it is all of them or none — \
+               and so it is if a process starting the members' program during the freeze \
+               runs as whiteteam, a DataDog account or an owner that cannot be named. A \
+               systemd unit a member runs in is masked only if everything in it is the \
+               group's (a member, or descended from one); one that also runs anything \
+               else is left running, and the result names it and what else it runs. A \
+               survivor is reported as a survivor rather than as a success"
             .into(),
         undo: "a killed process cannot be restarted from the journal. If the group is \
                frozen but not yet killed, hemostat undo <journal> resumes it"
@@ -258,6 +267,36 @@ pub(crate) fn scoped_why(source: &str, subject: &str, what: &str, why: &str) -> 
         Some(note) => format!("{why} — {note}"),
         None => why.to_string(),
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+pub(crate) fn scored_note(locus: &str, held: &hemostat_enforce_linux::ProtectSet) -> Option<String> {
+    let service = held.scored_service_of_path(std::path::Path::new(locus))?;
+    Some(format!(
+        "SCORED SERVICE, human-only: this belongs to a unit that runs the packet's scored service \
+         on this box: {service}. No fix is offered here and every unit action refuses it, since \
+         masking, stopping or moving it takes the service down — restore the unit from its \
+         package by hand (`rpm -V` or `dpkg -V` shows what differs, then reinstall the package), \
+         or take an added drop-in or line out, keeping the service up"
+    ))
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn persist_row_remedy(
+    subject: &str,
+    locus: &str,
+    what: &str,
+    sev: hemostat_tui::Sev,
+    held: &hemostat_enforce_linux::ProtectSet,
+    exists: impl Fn(&std::path::Path) -> bool,
+    packaged: impl Fn(&std::path::Path) -> bool,
+) -> Option<hemostat_tui::Remedy> {
+    if held.scored_service_of_path(std::path::Path::new(locus)).is_some() {
+        return None;
+    }
+    persist_remedy(subject, locus, sev, exists, packaged)
+
+        .or_else(|| strip_remedy(locus, what, sev))
 }
 
 #[cfg(all(target_os = "linux", feature = "mod-tui"))]
@@ -674,7 +713,8 @@ fn apply_watchdog(rest: &str) -> Result<String, String> {
         members: members.into_iter().collect(),
         units,
     };
-    let protect = ProtectSet::gather();
+
+    let protect = ProtectSet::gather().declaring_scored(crate::golden::scored_units_here());
 
     let mut appender =
         journal::Appender::new(std::path::Path::new(hemostat_enforce_linux::DEFAULT_VAULT));
@@ -704,14 +744,29 @@ fn apply_watchdog(rest: &str) -> Result<String, String> {
     };
 
     let narration = out.steps.join("; ");
+
+    let left = left_units_note(&out.left_units);
     match (out.removed, &out.aborted) {
         (_, Some(why)) => Err(format!("{why}. Steps: {narration}")),
-        (true, None) => Ok(format!("group removed{journalled}. Steps: {narration}")),
+        (true, None) => Ok(format!("group removed{left}{journalled}. Steps: {narration}")),
         (false, None) => Err(format!(
-            "the group was NOT fully removed — still alive: {:?}. Steps: {narration}{journalled}",
+            "the group was NOT fully removed — still alive: {:?}{left}. Steps: {narration}{journalled}",
             out.survivors
         )),
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+fn left_units_note(left: &[hemostat_enforce_linux::group::LeftUnit]) -> String {
+    left.iter()
+        .map(|l| {
+            format!(
+                " — unit {} was NOT masked: {}; if it restarts what was killed, stop it by hand",
+                l.unit,
+                l.why()
+            )
+        })
+        .collect()
 }
 
 #[cfg(all(target_os = "linux", feature = "mod-tui"))]
@@ -750,7 +805,8 @@ fn apply_ld_preload() -> Result<String, String> {
         path: std::path::PathBuf::from("/etc/ld.so.preload"),
         entry: None,
     };
-    match action.apply(&ApplyOptions::armed(), &ProtectSet::gather()) {
+
+    match action.apply(&ApplyOptions::armed(), &ProtectSet::gather().declaring_scored(crate::golden::scored_units_here())) {
         Outcome::Applied(rec) => {
             Ok(record(rec, &[std::path::PathBuf::from("/etc/ld.so.preload")]))
         }
@@ -795,7 +851,8 @@ fn lock_refusal(
 #[cfg(all(target_os = "linux", feature = "mod-tui"))]
 fn apply_lock_account(user: &str) -> Result<String, String> {
     require_built(hemostat_buildinfo::ActionClass::AccountDisable)?;
-    let protect = hemostat_enforce_linux::ProtectSet::gather();
+
+    let protect = hemostat_enforce_linux::ProtectSet::gather().declaring_scored(crate::golden::scored_units_here());
     if let Some(why) = lock_refusal(user, &protect, std::env::var("SUDO_USER").ok().as_deref()) {
         return Err(why);
     }
@@ -885,7 +942,8 @@ fn apply_group_drop(rest: &str) -> Result<String, String> {
         &action,
         &ApplyOptions::armed(),
         &hemostat_enforce_linux::account::operator_uids(),
-        &ProtectSet::gather(),
+
+        &ProtectSet::gather().declaring_scored(crate::golden::scored_units_here()),
     ) {
         Outcome::Applied(rec) => Ok(record(rec, &[])),
         Outcome::Refused(r) => Err(r.message),
@@ -960,7 +1018,8 @@ fn apply_strip(token: &str, auth: bool) -> Result<String, String> {
         line,
         authority: StripAuthority { auth, operator_keys: keys, ..StripAuthority::default() },
     };
-    match action.apply(&ApplyOptions::armed(), &ProtectSet::gather()) {
+
+    match action.apply(&ApplyOptions::armed(), &ProtectSet::gather().declaring_scored(crate::golden::scored_units_here())) {
         Outcome::Applied(rec) => Ok(record(rec, &[])),
         Outcome::Refused(r) => Err(r.message),
         Outcome::Failed(f) => Err(f.reason),
@@ -975,7 +1034,8 @@ fn apply_anchor(token: &str) -> Result<String, String> {
     require_built(hemostat_buildinfo::ActionClass::PersistenceNeutralize)?;
     let (path, anchor) = AnchorRef::parse(token)?;
     let action = RemovalAction::RemoveAnchor { path, anchor };
-    match action.apply(&ApplyOptions::armed(), &ProtectSet::gather()) {
+
+    match action.apply(&ApplyOptions::armed(), &ProtectSet::gather().declaring_scored(crate::golden::scored_units_here())) {
         Outcome::Applied(rec) => Ok(record(rec, &[])),
         Outcome::Refused(r) => Err(r.message),
         Outcome::Failed(f) => Err(f.reason),
@@ -998,7 +1058,7 @@ fn apply_persist(rest: &str) -> Result<String, String> {
         return Err(format!("{locus} is no longer something this policy will remove"));
     };
 
-    match action.apply(&ApplyOptions::armed(), &ProtectSet::gather()) {
+    match action.apply(&ApplyOptions::armed(), &ProtectSet::gather().declaring_scored(crate::golden::scored_units_here())) {
         Outcome::Applied(rec) => {
             let done = record(rec, &[std::path::PathBuf::from(locus)]);
 

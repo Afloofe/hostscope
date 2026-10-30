@@ -69,9 +69,10 @@ impl Occupancy {
 }
 
 pub fn occupancy(target: u32, cgroup: &str, procs: &[(u32, String, String)]) -> Occupancy {
+    let beneath = |cg: &str| cg.strip_prefix(cgroup).is_some_and(|rest| rest.starts_with('/'));
     let mut others: Vec<(u32, String)> = procs
         .iter()
-        .filter(|(pid, cg, _)| *pid != target && cg == cgroup)
+        .filter(|(pid, cg, _)| *pid != target && (cg == cgroup || beneath(cg)))
         .map(|(pid, _, comm)| (*pid, comm.clone()))
         .collect();
     others.sort_unstable();
@@ -94,6 +95,127 @@ pub fn read_cgroups() -> Vec<(u32, String, String)> {
         let comm = std::fs::read(e.path().join("comm"))
             .map_or_else(|_| "?".into(), |c| String::from_utf8_lossy(&c).trim().to_string());
         out.push((pid, cg, comm));
+    }
+    out
+}
+
+pub const LOG_SHIPPERS: &[&str] = &[
+    "rsyslogd",
+    "syslog-ng",
+    "systemd-journald",
+    "systemd-journal-upload",
+    "wazuh-agentd",
+    "ossec-agentd",
+];
+
+pub const NETBIRD: &str = "netbird";
+
+const NETBIRD_AGENT: &str = "the NetBird agent";
+
+pub fn netbird_runs() -> bool {
+    read_cgroups().iter().any(|(_, _, comm)| comm == NETBIRD)
+}
+
+pub const DATADOG_DIR: &str = "datadog-agent";
+
+const DATADOG_ROOT_COMMS: &[&str] = &["system-probe", "security-agent"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Covered {
+
+    pub pid: u32,
+
+    pub comm: String,
+
+    pub exe: Option<String>,
+
+    pub owners: Result<Vec<String>, String>,
+}
+
+fn log_shipper(exe: Option<&str>, comm: &str) -> Option<&'static str> {
+    let Some(exe) = exe else {
+        if DATADOG_ROOT_COMMS.contains(&comm) {
+            return Some("the DataDog agent");
+        }
+        if comm == NETBIRD {
+            return Some(NETBIRD_AGENT);
+        }
+
+        return LOG_SHIPPERS.iter().any(|s| s.get(..15).unwrap_or(s) == comm).then_some("a log shipper");
+    };
+
+    let exe = exe.strip_suffix(" (deleted)").unwrap_or(exe);
+    if exe.split('/').any(|c| c == DATADOG_DIR) {
+        return Some("the DataDog agent");
+    }
+    let name = exe.rsplit('/').next().unwrap_or(exe);
+    if name == NETBIRD {
+        return Some(NETBIRD_AGENT);
+    }
+    LOG_SHIPPERS.contains(&name).then_some("a log shipper")
+}
+
+pub fn never_narrowed(c: &Covered) -> Option<String> {
+    let who = format!("pid {} ({})", c.pid, c.comm);
+    match &c.owners {
+        Ok(names) => {
+            if let Some(n) = names.iter().find(|n| hs_core::accounts::is_hard_protected(n)) {
+                return Some(format!(
+                    "{who} belongs to `{n}`: whiteteam and the DataDog accounts (dd-agent, \
+                     ddagentuser, datadog) are never narrowed"
+                ));
+            }
+        }
+        Err(why) => {
+            return Some(format!(
+                "the account {who} belongs to could not be established ({why}), so it cannot be \
+                 shown not to be the white team's or the DataDog agent's — an account a directory \
+                 serves looks exactly like this. Check `ps -o user,ruser -p {}` and contain it by \
+                 hand if it is neither",
+                c.pid
+            ));
+        }
+    }
+    let what = log_shipper(c.exe.as_deref(), &c.comm)?;
+    let why = if what == NETBIRD_AGENT {
+        "the packet says NetBird's traffic is never blocked"
+    } else {
+        "log shipping and monitoring are never a block target"
+    };
+    Some(match c.exe.as_deref() {
+        Some(exe) => format!("{who} runs {exe}, {what}: {why}"),
+        None => format!("{who} has no executable this run could read, and carries the name of {what}: {why}"),
+    })
+}
+
+pub fn covering_refusal(o: &Occupancy, covered: &[Covered]) -> Option<String> {
+    covered.iter().find_map(|c| {
+        let why = never_narrowed(c)?;
+        Some(if c.pid == o.target {
+            why
+        } else {
+            format!(
+                "the rule would name pid {}'s cgroup `{}`, which blocks every process in it and \
+                 beneath it, and {why}",
+                o.target, o.cgroup
+            )
+        })
+    })
+}
+
+pub fn read_covered(o: &Occupancy, owners_of: impl Fn(u32) -> Result<Vec<String>, String>) -> Vec<Covered> {
+    let pids = std::iter::once(o.target).chain(o.others.iter().map(|(p, _)| *p));
+    let mut out = Vec::new();
+    for pid in pids {
+        let owners = owners_of(pid);
+        let base = std::path::PathBuf::from(format!("/proc/{pid}"));
+        if owners.is_err() && !base.exists() {
+            continue;
+        }
+        let comm = crate::saferead::read_scan_target(&base.join("comm"))
+            .map_or_else(|| "?".to_string(), |c| c.trim().to_string());
+        let exe = std::fs::read_link(base.join("exe")).ok().map(|p| p.to_string_lossy().into_owned());
+        out.push(Covered { pid, comm, exe, owners });
     }
     out
 }
@@ -174,8 +296,8 @@ pub fn parse_dest(dest: &str, width: Width) -> Result<Cidr, String> {
     if c.is_everything() {
         return Err(format!(
             "{c} is every address: that is egress isolation, not a narrowing. `hemostat network \
-             --arm N --egress` isolates, and keeps DNS, DHCP, syslog and the DataDog agent while \
-             it does"
+             --arm N --egress` isolates, and keeps DNS, DHCP, syslog, the Wazuh agent and the \
+             DataDog agent while it does"
         ));
     }
     let (single, widest) = if c.is_v4() { (32, WIDEST_V4) } else { (128, WIDEST_V6) };

@@ -279,7 +279,7 @@ fn undo_unlock_account(
     })
 }
 
-const MAX_VAULT_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_VAULT_BYTES: u64 = 256 * 1024 * 1024;
 
 fn undo_remove_created_file(vault: &Path, original: &Path, opts: &ApplyOptions) -> Outcome {
     let written = match hemostat_sensor_linux::saferead::read_bytes(vault, MAX_VAULT_BYTES) {

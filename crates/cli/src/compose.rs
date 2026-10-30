@@ -14,7 +14,7 @@ pub(crate) fn json_str_field(obj: &str, key: &str) -> Option<String> {
     Some(after_colon[q1..q1 + q2].to_string())
 }
 
-pub(crate) fn down_projects(ls_json: &str) -> Vec<(String, String)> {
+pub(crate) fn down_projects(ls_json: &str) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
     for obj in ls_json.split('}') {
         let (Some(name), Some(status)) = (json_str_field(obj, "Name"), json_str_field(obj, "Status")) else {
@@ -23,12 +23,17 @@ pub(crate) fn down_projects(ls_json: &str) -> Vec<(String, String)> {
         if status.starts_with("running") {
             continue;
         }
-
         let config = json_str_field(obj, "ConfigFiles").unwrap_or_default();
-        let first = config.split(',').next().unwrap_or("").trim().to_string();
-        out.push((name, first));
+        out.push((name, config_files(&config)));
     }
     out
+}
+
+pub(crate) fn config_files(config: &str) -> Vec<String> {
+    if config.trim().is_empty() {
+        return Vec::new();
+    }
+    config.split(',').map(|f| f.trim().to_string()).collect()
 }
 
 pub(crate) fn project_names(ls_json: &str) -> Vec<String> {
@@ -77,7 +82,7 @@ pub(crate) enum Step {
 
         name: String,
 
-        file: String,
+        files: Vec<String>,
     },
 
     Recreate {
@@ -107,16 +112,25 @@ pub(crate) fn plan(named: &[Named], ls_json: &str, is_file: impl Fn(&str) -> boo
             Named::File(f) if is_file(f) => Step::Recreate { file: f.clone() },
             Named::File(f) => Step::Refused { what: f.clone(), why: "it is not a compose file on this host".into() },
             Named::Project(p) => match down.iter().find(|(name, _)| name == p) {
-                Some((_, file)) if file.starts_with('/') && is_file(file) => {
-                    Step::Up { name: p.clone(), file: file.clone() }
-                }
-                Some((_, file)) if file.is_empty() => Step::Refused {
+                Some((_, files)) if files.is_empty() => Step::Refused {
                     what: p.clone(),
                     why: "it has no compose file on record; name its compose file instead".into(),
                 },
-                Some((_, file)) => Step::Refused {
-                    what: p.clone(),
-                    why: format!("its compose file on record, {file}, is not an absolute path to a file on this host"),
+
+                Some((_, files)) => match files.iter().find(|f| !(f.starts_with('/') && is_file(f))) {
+                    None => Step::Up { name: p.clone(), files: files.clone() },
+                    Some(bad) if files.len() == 1 => Step::Refused {
+                        what: p.clone(),
+                        why: format!("its compose file on record, {bad}, is not an absolute path to a file on this host"),
+                    },
+                    Some(bad) => Step::Refused {
+                        what: p.clone(),
+                        why: format!(
+                            "`{bad}`, one of the {} compose files it was started with, is not an absolute \
+                             path to a file on this host, and it is brought up with all of them or not at all",
+                            files.len()
+                        ),
+                    },
                 },
                 None if known.contains(p) => Step::Running { name: p.clone() },
                 None => Step::Refused {
@@ -140,6 +154,31 @@ pub(crate) fn down_hint(name: &str, ls_json: &str, is_file: impl Fn(&str) -> boo
         Some(Step::Refused { why, .. }) => format!("not by name: {why}"),
         _ => format!("bring it up: mahoraga services --compose-up {name} --arm"),
     }
+}
+
+pub(crate) fn up_argv(name: Option<&str>, files: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(n) = name {
+        out.extend(["-p".to_string(), n.to_string()]);
+    }
+    for f in files {
+        out.extend(["-f".to_string(), f.clone()]);
+    }
+    out.extend(["up".to_string(), "-d".to_string()]);
+    out
+}
+
+pub(crate) fn shown_command(cli: &str, name: Option<&str>, files: &[String], verb: &str) -> String {
+    let mut out = cli.to_string();
+    if let Some(n) = name {
+        out.push_str(&format!(" -p {}", h(n)));
+    }
+    for f in files {
+        out.push_str(&format!(" -f \"{}\"", h(f)));
+    }
+    out.push(' ');
+    out.push_str(verb);
+    out
 }
 
 #[cfg(target_os = "linux")]
@@ -192,8 +231,12 @@ fn print_down(ls: &str) -> bool {
         return false;
     }
     println!("compose — projects that are not fully running:");
-    for (name, file) in &down {
-        println!("  DOWN `{}`  —  {}", h(name), if file.is_empty() { "no compose file on record".to_string() } else { h(file) });
+    for (name, files) in &down {
+        println!(
+            "  DOWN `{}`  —  {}",
+            h(name),
+            if files.is_empty() { "no compose file on record".to_string() } else { h(&files.join(", ")) }
+        );
         println!("       {}", h(&down_hint(name, ls, on_host)));
     }
     true
@@ -273,18 +316,21 @@ pub(crate) fn compose_up(args: &[String], _json: bool) -> u8 {
     let mut acts: Vec<(Vec<String>, String, String, String)> = Vec::new();
     for s in &steps {
         match s {
-            Step::Up { name, file } => acts.push((
-                ["-p", name, "-f", file, "up", "-d"].iter().map(|a| (*a).to_string()).collect(),
+            Step::Up { name, files } => acts.push((
+                up_argv(Some(name), files),
                 format!("compose project `{}`", h(name)),
-                format!("{cli} -p {} -f \"{}\" up -d", h(name), h(file)),
-                format!("{cli} -p {} -f \"{}\" down", h(name), h(file)),
+                shown_command(&cli, Some(name), files, "up -d"),
+                shown_command(&cli, Some(name), files, "down"),
             )),
-            Step::Recreate { file } => acts.push((
-                ["-f", file, "up", "-d"].iter().map(|a| (*a).to_string()).collect(),
-                format!("the Docker Compose project at {}", h(file)),
-                format!("{cli} -f \"{}\" up -d", h(file)),
-                format!("{cli} -f \"{}\" down", h(file)),
-            )),
+            Step::Recreate { file } => {
+                let files = [file.clone()];
+                acts.push((
+                    up_argv(None, &files),
+                    format!("the Docker Compose project at {}", h(file)),
+                    shown_command(&cli, None, &files, "up -d"),
+                    shown_command(&cli, None, &files, "down"),
+                ));
+            }
             Step::Running { name } => println!("compose project `{}` is running already; nothing to do", h(name)),
             Step::Refused { .. } => {}
         }

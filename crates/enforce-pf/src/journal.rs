@@ -387,11 +387,15 @@ impl Journals {
         }
         hemostat_sensor_freebsd::store::create_private(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))?;
         let p = self.path(&i.id);
-        let mut f = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&p)
-            .map_err(|e| format!("{}: {e}", p.display()))?;
+        let mut o = std::fs::OpenOptions::new();
+        o.create_new(true).write(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            o.mode(0o600);
+        }
+        let mut f = o.open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         writeln!(f, "{HEADER}\n{}", intent_line(i)).map_err(|e| format!("{}: {e}", p.display()))?;
         f.sync_all().map_err(|e| format!("{}: {e}", p.display()))?;
         std::fs::File::open(&self.dir).and_then(|d| d.sync_all()).map_err(|e| format!("{}: {e}", self.dir.display()))

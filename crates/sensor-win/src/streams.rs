@@ -129,6 +129,13 @@ fn command_stream(stream: &str) -> Result<String, &'static str> {
     Ok(ps_quote(stream))
 }
 
+fn hex_view(stream: &str, path: &str) -> String {
+    format!(
+        "Format-Hex -InputObject ([byte[]](Get-Content -Stream {stream} -Encoding Byte -ReadCount 0 \
+         -LiteralPath {path}))"
+    )
+}
+
 fn longest_run(s: &str) -> usize {
     let (mut best, mut run, mut prev) = (0, 0, None);
     for c in s.chars() {
@@ -193,9 +200,10 @@ pub fn judge(s: &Stream) -> Option<Finding> {
                   directly by path. It is a hiding place, and nothing benign uses it this way"
                 .into(),
             fix: Some(stream_fix(&s.path, &s.name, "read it before deleting it, then remove it", |p, n| {
+                let read = hex_view(n, p);
                 format!(
-                    "read it before deleting it — `Get-Content -Stream {n} -LiteralPath {p} -Raw` — then \
-                     remove it with `Remove-Item -Stream {n} -LiteralPath {p}`"
+                    "read it before deleting it — `{read}` shows its bytes as hex — then remove it with \
+                     `Remove-Item -Stream {n} -LiteralPath {p}`"
                 )
             })),
         });
@@ -217,7 +225,7 @@ pub fn judge(s: &Stream) -> Option<Finding> {
                   why something hiding data picks one. The size no longer matches the name"
                 .into(),
             fix: Some(stream_fix(&s.path, &s.name, "look at the content", |p, n| {
-                format!("look at the content: `Get-Content -Stream {n} -LiteralPath {p} -Raw`")
+                format!("look at the content as hex: `{}`", hex_view(n, p))
             })),
         });
     }
@@ -231,7 +239,7 @@ pub fn judge(s: &Stream) -> Option<Finding> {
               that reads the file by path alone"
             .into(),
         fix: Some(stream_fix(&s.path, &s.name, "look at it without executing it", |p, n| {
-            format!("`Get-Content -Stream {n} -LiteralPath {p} -Raw` shows it without executing it")
+            format!("`{}` shows its bytes as hex without executing it", hex_view(n, p))
         })),
     })
 }
@@ -342,9 +350,10 @@ pub fn judge_autostart(locus: &str, name: &str, command: &str) -> Option<Finding
             &stream,
             "capture it before anything else, then remove the autostart, then the stream",
             |p, n| {
+                let read = hex_view(n, p);
                 format!(
-                    "capture it before anything else — `Get-Content -Stream {n} -LiteralPath {p} -Raw` — \
-                     then remove the autostart, then the stream with `Remove-Item -Stream {n} -LiteralPath {p}`"
+                    "capture it before anything else — `{read}` shows its bytes as hex — then remove the \
+                     autostart, then the stream with `Remove-Item -Stream {n} -LiteralPath {p}`"
                 )
             },
         )),
