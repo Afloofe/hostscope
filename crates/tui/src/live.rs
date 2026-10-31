@@ -1,4 +1,5 @@
 use std::io::{self, Write as _};
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -136,9 +137,6 @@ fn draw<S: Surface>(surface: &mut S, render: impl FnOnce(Rect, &mut Buffer) -> H
     let hits = render(area, &mut buf);
     surface.present(&buf, &hits)
 }
-
-const SWEEPING: &str = "re-scanning this host to confirm; this takes as long as start-up did. \
-                        Keys wait until it is done";
 
 fn release_for_sweep<S: Surface>(surface: &mut S, verbs: &VerbsPane) {
     if !verbs.busy() {
@@ -308,8 +306,8 @@ fn sgr_for(fg: Color, m: Modifier) -> String {
 
 pub fn run_console<F, A>(initial: crate::console::ConsoleModel, refresh: F, apply: A, verbs: Verbs) -> io::Result<()>
 where
-    F: FnMut() -> crate::console::ConsoleModel,
-    A: FnMut(&str) -> Result<String, String>,
+    F: FnMut() -> crate::console::ConsoleModel + Send,
+    A: FnMut(&str) -> Result<String, String> + Send,
 {
     run_console_on(TerminalSurface::enter()?, initial, refresh, apply, verbs)
 }
@@ -322,8 +320,8 @@ pub fn run_console_on<S: Surface, F, A>(
     verbs: Verbs,
 ) -> io::Result<()>
 where
-    F: FnMut() -> crate::console::ConsoleModel,
-    A: FnMut(&str) -> Result<String, String>,
+    F: FnMut() -> crate::console::ConsoleModel + Send,
+    A: FnMut(&str) -> Result<String, String> + Send,
 {
     run_loop(surface, initial, refresh, apply, None::<fn(&mut crate::console::ConsoleModel) -> bool>, None, None::<fn() -> crate::console::ConsoleModel>, verbs)
 }
@@ -336,8 +334,8 @@ pub fn run_console_live<F, A, T>(
     verbs: Verbs,
 ) -> io::Result<()>
 where
-    F: FnMut() -> crate::console::ConsoleModel,
-    A: FnMut(&str) -> Result<String, String>,
+    F: FnMut() -> crate::console::ConsoleModel + Send,
+    A: FnMut(&str) -> Result<String, String> + Send,
     T: FnMut(&mut crate::console::ConsoleModel) -> bool,
 {
     run_console_live_on(TerminalSurface::enter()?, initial, refresh, apply, tick, verbs)
@@ -352,8 +350,8 @@ pub fn run_console_live_on<S: Surface, F, A, T>(
     verbs: Verbs,
 ) -> io::Result<()>
 where
-    F: FnMut() -> crate::console::ConsoleModel,
-    A: FnMut(&str) -> Result<String, String>,
+    F: FnMut() -> crate::console::ConsoleModel + Send,
+    A: FnMut(&str) -> Result<String, String> + Send,
     T: FnMut(&mut crate::console::ConsoleModel) -> bool,
 {
     run_loop(surface, initial, refresh, apply, Some(tick), None, None::<fn() -> crate::console::ConsoleModel>, verbs)
@@ -368,9 +366,9 @@ pub fn run_console_every<F, P, A>(
     verbs: Verbs,
 ) -> io::Result<()>
 where
-    F: FnMut() -> crate::console::ConsoleModel,
+    F: FnMut() -> crate::console::ConsoleModel + Send,
     P: FnMut() -> crate::console::ConsoleModel,
-    A: FnMut(&str) -> Result<String, String>,
+    A: FnMut(&str) -> Result<String, String> + Send,
 {
     run_console_every_on(TerminalSurface::enter()?, initial, refresh, periodic, apply, every, verbs)
 }
@@ -385,19 +383,102 @@ pub fn run_console_every_on<S: Surface, F, P, A>(
     verbs: Verbs,
 ) -> io::Result<()>
 where
-    F: FnMut() -> crate::console::ConsoleModel,
+    F: FnMut() -> crate::console::ConsoleModel + Send,
     P: FnMut() -> crate::console::ConsoleModel,
-    A: FnMut(&str) -> Result<String, String>,
+    A: FnMut(&str) -> Result<String, String> + Send,
 {
     run_loop(surface, initial, refresh, apply, None::<fn(&mut crate::console::ConsoleModel) -> bool>, Some(every), Some(periodic), verbs)
+}
+
+enum JobNews {
+
+    Applied(Result<String, String>),
+
+    Swept(crate::console::ConsoleModel),
+}
+
+struct Pending {
+    target: Option<crate::console::Identity>,
+    deferred: Option<&'static str>,
+    outcome: Option<Result<String, String>>,
+}
+
+struct Job<'scope> {
+    news: mpsc::Receiver<JobNews>,
+    handle: std::thread::ScopedJoinHandle<'scope, ()>,
+    started: Instant,
+
+    fix: Option<Pending>,
+
+    keep: usize,
+
+    shown: u64,
+}
+
+const SWEEPING: &str = "re-scanning this host to confirm; this takes as long as start-up did";
+
+const APPLYING: &str = "applying the fix";
+
+const BUSY: &str = "a fix or re-scan is still running; wait for it to finish";
+
+fn job_footer(job: &Job<'_>, secs: u64) -> String {
+    let keys = "you can move around meanwhile";
+    match &job.fix {
+        None => format!("{SWEEPING} ({secs} s; {keys})"),
+        Some(Pending { outcome: None, .. }) => format!("{APPLYING}… ({secs} s)"),
+        Some(Pending { outcome: Some(Ok(done)), .. }) => format!("written: {done} — {SWEEPING} ({secs} s; {keys})"),
+        Some(Pending { outcome: Some(Err(why)), .. }) => {
+            format!("NOT applied — nothing was changed: {why} — {SWEEPING} ({secs} s; {keys})")
+        }
+    }
+}
+
+fn verdict(
+    outcome: Result<String, String>,
+    target: Option<crate::console::Identity>,
+    deferred: Option<&'static str>,
+    model: &crate::console::ConsoleModel,
+) -> String {
+    match (outcome, target) {
+        (Err(why), _) => format!("NOT applied — nothing was changed: {why}"),
+
+        (Ok(done), Some(_)) if deferred.is_some() => {
+            format!("configured, but NOT YET IN EFFECT: {done}. {}", deferred.unwrap_or_default())
+        }
+
+        (Ok(done), Some(t)) if model.still_present(&t) => format!(
+            "applied, but the finding is STILL PRESENT after a re-scan: \
+             {done}. The change was made and the problem is still here — \
+             something is putting it back, or it was never the whole \
+             cause. Do NOT treat this as fixed"
+        ),
+
+        (Ok(done), Some(t)) if !model.source_ran(&t.source) => format!(
+            "applied: {done} — but this CANNOT be confirmed: the `{}` sweep \
+             did not run on the re-scan, so the finding is absent because \
+             nobody looked, not because it is gone. Re-run once that sweep \
+             can run",
+            t.source
+        ),
+        (Ok(done), Some(_)) => format!("applied, and confirmed gone by a re-scan: {done}"),
+
+        (Ok(done), None) => format!(
+            "applied: {done} — could not confirm by re-scan, so this is \
+             the write succeeding and not the problem being gone"
+        ),
+    }
+}
+
+fn work<W>(m: &Mutex<W>) -> std::sync::MutexGuard<'_, W> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_loop<S, F, A, T, P>(
     mut surface: S,
     initial: crate::console::ConsoleModel,
-    mut refresh: F,
-    mut apply: A,
+    refresh: F,
+    apply: A,
     mut tick: Option<T>,
     every: Option<std::time::Duration>,
     mut periodic: Option<P>,
@@ -405,142 +486,160 @@ fn run_loop<S, F, A, T, P>(
 ) -> io::Result<()>
 where
     S: Surface,
-    F: FnMut() -> crate::console::ConsoleModel,
-    A: FnMut(&str) -> Result<String, String>,
+    F: FnMut() -> crate::console::ConsoleModel + Send,
+    A: FnMut(&str) -> Result<String, String> + Send,
     T: FnMut(&mut crate::console::ConsoleModel) -> bool,
     P: FnMut() -> crate::console::ConsoleModel,
 {
-    let Verbs { items, host } = verbs;
-    let mut driver = Driver::new(host);
-    let mut app = ConsoleApp::new(initial).with_verbs(items);
-    app.verbs.set_inherited_ticket(driver.inherited_ticket());
+    let tools = Mutex::new((refresh, apply));
+    std::thread::scope(|scope| -> io::Result<()> {
+        let Verbs { items, host } = verbs;
+        let mut driver = Driver::new(host);
+        let mut app = ConsoleApp::new(initial).with_verbs(items);
+        app.verbs.set_inherited_ticket(driver.inherited_ticket());
 
-    let mut redraw = true;
-    let mut last_sweep = Instant::now();
-    loop {
-        if redraw {
-            draw(&mut surface, |area, buf| app.render(area, buf))?;
-        }
-        redraw = true;
-        let input = match surface.next(tick.is_some() || every.is_some() || app.verbs.busy())? {
-            None => {
-                let now = Instant::now();
-                let ran = driver.service(&mut app.verbs, now);
-
-                let asking = app.model.confirming || app.verbs.confirming();
-                let ticked = !asking && tick.as_mut().is_some_and(|t| t(&mut app.model));
-
-                let swept = !asking
-                    && every.is_some_and(|iv| now.duration_since(last_sweep) >= iv)
-                    && periodic.as_mut().is_some_and(|p| {
-                        let keep = app.model.selected;
-                        release_for_sweep(&mut surface, &app.verbs);
-                        app.model = p();
-                        app.model.selected = keep.min(app.model.findings.len().saturating_sub(1));
-                        last_sweep = now;
-                        true
-                    });
-                redraw = ran || ticked || swept;
-                continue;
+        let mut job: Option<Job<'_>> = None;
+        let mut redraw = true;
+        let mut last_sweep = Instant::now();
+        loop {
+            if redraw {
+                draw(&mut surface, |area, buf| app.render(area, buf))?;
             }
-            Some(SurfaceEvent::Resize) => continue,
-            Some(SurfaceEvent::Close) => {
+            redraw = true;
 
-                if app.verbs.quit_ok() {
+            if let Some(j) = job.as_mut() {
+                let mut finished = None;
+                for news in j.news.try_iter() {
+                    match news {
+                        JobNews::Applied(outcome) => {
+                            if let Some(p) = j.fix.as_mut() {
+                                p.outcome = Some(outcome);
+                            }
+                        }
+                        JobNews::Swept(model) => finished = Some(model),
+                    }
+                }
+                if let Some(mut model) = finished {
+                    model.selected = j.keep.min(model.findings.len().saturating_sub(1));
+                    if let Some(p) = j.fix.take() {
+                        let outcome = p.outcome.unwrap_or_else(|| Err("the fix reported nothing".into()));
+                        model.last_result = Some(verdict(outcome, p.target, p.deferred, &model));
+                    }
+                    app.model = model;
+                    app.confirm_opened = None;
+                    if let Some(done) = job.take() {
+                        let _ = done.handle.join();
+                    }
+                    continue;
+                }
+                let secs = j.started.elapsed().as_secs();
+                if secs != j.shown || app.model.last_result.is_none() {
+                    j.shown = secs;
+                    app.model.last_result = Some(job_footer(j, secs));
+                    continue;
+                }
+            }
+
+            let idle = tick.is_some() || every.is_some() || app.verbs.busy() || job.is_some();
+            let input = match surface.next(idle)? {
+                None => {
+                    let now = Instant::now();
+                    let ran = driver.service(&mut app.verbs, now);
+
+                    let asking = app.model.confirming || app.verbs.confirming();
+                    let ticked = !asking && tick.as_mut().is_some_and(|t| t(&mut app.model));
+
+                    let swept = !asking
+                        && job.is_none()
+                        && every.is_some_and(|iv| now.duration_since(last_sweep) >= iv)
+                        && periodic.as_mut().is_some_and(|p| {
+                            let keep = app.model.selected;
+                            release_for_sweep(&mut surface, &app.verbs);
+                            app.model = p();
+                            app.model.selected = keep.min(app.model.findings.len().saturating_sub(1));
+                            last_sweep = now;
+                            true
+                        });
+                    redraw = ran || ticked || swept;
+                    continue;
+                }
+                Some(SurfaceEvent::Resize) => continue,
+                Some(SurfaceEvent::Close) => {
+
+                    if app.verbs.quit_ok() {
+                        finish(&mut surface, &mut app, job.take())?;
+                        driver.leave();
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Some(SurfaceEvent::In(i)) => i,
+            };
+            let now = Instant::now();
+            let effect = app.handle(input, now, surface.area()?);
+            driver.service(&mut app.verbs, now);
+            match effect {
+                ConsoleEffect::None => {}
+                ConsoleEffect::Quit => {
+                    finish(&mut surface, &mut app, job.take())?;
                     driver.leave();
                     return Ok(());
                 }
-                continue;
-            }
-            Some(SurfaceEvent::In(i)) => i,
-        };
-        let now = Instant::now();
-        let effect = app.handle(input, now, surface.area()?);
-        driver.service(&mut app.verbs, now);
-        match effect {
-            ConsoleEffect::None => {}
-            ConsoleEffect::Quit => {
-                driver.leave();
-                return Ok(());
-            }
-            ConsoleEffect::Rescan => {
-                let keep = app.model.selected;
-
-                app.model.last_result = Some(SWEEPING.into());
-                draw(&mut surface, |area, buf| app.render(area, buf))?;
-                release_for_sweep(&mut surface, &app.verbs);
-                app.model = refresh();
-                app.model.selected = keep.min(app.model.findings.len().saturating_sub(1));
-            }
-            ConsoleEffect::Confirm(yes) => {
-                let model = &mut app.model;
-                app.confirm_opened = None;
-                model.confirming = false;
-                if yes {
-                    let id = model
-                        .findings
-                        .get(model.selected)
-                        .and_then(|f| f.remedy.as_ref())
-                        .map(|r| r.id.clone());
-                    if let Some(id) = id {
-
-                        let target = model.findings.get(model.selected).map(FindingRow::identity);
-
-                        let deferred = model
-                            .findings
-                            .get(model.selected)
-                            .and_then(|f| f.remedy.as_ref())
-                            .and_then(|r| r.risk.deferred());
-
-                        let outcome = apply(&id);
-                        let keep = model.selected;
-
-                        model.last_result = Some(match &outcome {
-                            Ok(done) => format!("written: {done} — {SWEEPING}"),
-                            Err(why) => format!("NOT applied — nothing was changed: {why} — {SWEEPING}"),
-                        });
-                        draw(&mut surface, |area, buf| app.render(area, buf))?;
-                        release_for_sweep(&mut surface, &app.verbs);
-                        let model = &mut app.model;
-                        *model = refresh();
-                        model.selected = keep.min(model.findings.len().saturating_sub(1));
-
-                        model.last_result = Some(match (outcome, target) {
-                            (Err(why), _) => format!("NOT applied — nothing was changed: {why}"),
-
-                            (Ok(done), Some(_)) if deferred.is_some() => format!(
-                                "configured, but NOT YET IN EFFECT: {done}. {}",
-                                deferred.unwrap_or_default()
-                            ),
-
-                            (Ok(done), Some(t)) if model.still_present(&t) => format!(
-                                "applied, but the finding is STILL PRESENT after a re-scan: \
-                                 {done}. The change was made and the problem is still here — \
-                                 something is putting it back, or it was never the whole \
-                                 cause. Do NOT treat this as fixed"
-                            ),
-
-                            (Ok(done), Some(t)) if !model.source_ran(&t.source) => format!(
-                                "applied: {done} — but this CANNOT be confirmed: the `{}` sweep \
-                                 did not run on the re-scan, so the finding is absent because \
-                                 nobody looked, not because it is gone. Re-run once that sweep \
-                                 can run",
-                                t.source
-                            ),
-                            (Ok(done), Some(_)) => {
-                                format!("applied, and confirmed gone by a re-scan: {done}")
-                            }
-
-                            (Ok(done), None) => format!(
-                                "applied: {done} — could not confirm by re-scan, so this is \
-                                 the write succeeding and not the problem being gone"
-                            ),
-                        });
+                ConsoleEffect::Rescan | ConsoleEffect::Confirm(true) if job.is_some() => {
+                    app.model.confirming = false;
+                    app.confirm_opened = None;
+                    app.model.last_result = Some(BUSY.into());
+                }
+                ConsoleEffect::Rescan => {
+                    let (tx, rx) = mpsc::channel();
+                    let tools = &tools;
+                    let handle = scope.spawn(move || {
+                        let model = (work(tools).0)();
+                        let _ = tx.send(JobNews::Swept(model));
+                    });
+                    job = Some(Job { news: rx, handle, started: Instant::now(), fix: None, keep: app.model.selected, shown: 0 });
+                    app.model.last_result = None;
+                }
+                ConsoleEffect::Confirm(yes) => {
+                    let model = &mut app.model;
+                    app.confirm_opened = None;
+                    model.confirming = false;
+                    if !yes {
+                        model.last_result = Some("cancelled; nothing was changed".into());
+                        continue;
                     }
-                } else {
-                    model.last_result = Some("cancelled; nothing was changed".into());
+                    let selected = model.findings.get(model.selected);
+                    let Some(id) = selected.and_then(|f| f.remedy.as_ref()).map(|r| r.id.clone()) else {
+                        continue;
+                    };
+
+                    let fix = Pending {
+                        target: selected.map(FindingRow::identity),
+                        deferred: selected.and_then(|f| f.remedy.as_ref()).and_then(|r| r.risk.deferred()),
+                        outcome: None,
+                    };
+                    let (tx, rx) = mpsc::channel();
+                    let tools = &tools;
+                    let handle = scope.spawn(move || {
+
+                        let mut tools = work(tools);
+                        let outcome = (tools.1)(&id);
+                        let _ = tx.send(JobNews::Applied(outcome));
+                        let model = (tools.0)();
+                        let _ = tx.send(JobNews::Swept(model));
+                    });
+                    job = Some(Job { news: rx, handle, started: Instant::now(), fix: Some(fix), keep: model.selected, shown: 0 });
+                    model.last_result = None;
                 }
             }
         }
-    }
+    })
+}
+
+fn finish<S: Surface>(surface: &mut S, app: &mut ConsoleApp, job: Option<Job<'_>>) -> io::Result<()> {
+    let Some(job) = job else { return Ok(()) };
+    app.model.last_result = Some("leaving once the running fix or re-scan finishes…".into());
+    draw(surface, |area, buf| app.render(area, buf))?;
+    let _ = job.handle.join();
+    Ok(())
 }
