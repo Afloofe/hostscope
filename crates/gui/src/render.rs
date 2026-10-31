@@ -25,7 +25,7 @@ pub struct Look {
     pub pointer: Option<(i32, i32)>,
 }
 
-pub(crate) const BG: u32 = 0x000F_1419;
+pub const BG: u32 = 0x000F_1419;
 
 pub(crate) const FG: u32 = 0x00D5_DBE1;
 

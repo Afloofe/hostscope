@@ -72,6 +72,8 @@ pub mod volume;
 
 pub mod gui_fb;
 
+pub mod gui_x11;
+
 pub use probe::{probe, Finding, L1Availability, LsmBootLine, Tier, TierReport};
 pub use accounts::{report as account_report, Account, Report as AccountReport, Severity};
 pub use hooks::{report as hook_report, HookReport, HookState};

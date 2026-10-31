@@ -16,6 +16,8 @@ use hemostat_gui::render::Frame;
 use hemostat_gui::surface::GuiSurface;
 #[cfg(target_os = "linux")]
 use hemostat_sensor_linux::gui_fb::{self, Framebuffer, PointerEvent, Pointers, RawTty, VtGraphics};
+#[cfg(target_os = "linux")]
+use hemostat_sensor_linux::gui_x11::{self, XEvent, XKey};
 #[cfg(target_os = "windows")]
 use hemostat_sensor_win::gui_window::Window;
 #[cfg(any(target_os = "windows", test))]
@@ -29,7 +31,7 @@ const SWEEPING: &str = "hemostat: sweeping this host…";
 const SWEEPING_AGAIN: &str = "hemostat gui: sweeping this host… the view comes back when the sweep is done \
                               (Ctrl+C ends the GUI at once, without waiting for a seal in progress)";
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 const TITLE: &str = "Mahoraga — findings console";
 
 pub(crate) fn gui(args: &[String]) -> ExitCode {
@@ -131,9 +133,19 @@ fn every_secs(args: &[String]) -> Result<Option<u64>, String> {
 fn cannot_open(e: &io::Error) -> String {
     format!(
         "hemostat gui: the GUI cannot open here: {}\n  Nothing was swept or changed. Use the \
-         terminal console instead: hemostat console",
-        crate::render::h(&e.to_string())
+         terminal console instead: hemostat console{}",
+        crate::render::h(&e.to_string()),
+        desktop_hint()
     )
+}
+
+fn desktop_hint() -> &'static str {
+    if cfg!(target_os = "linux") && std::env::var_os("DISPLAY").is_none() {
+        "\n  On a desktop, run it from a terminal there so it opens as a window: sudo keeps \
+         DISPLAY; after su -, use DISPLAY=:0 hemostat gui"
+    } else {
+        ""
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -145,8 +157,16 @@ fn sweeping(surface: &mut GuiSurface<WinBackend>) {
 }
 
 #[cfg(target_os = "linux")]
-fn sweeping(_: &mut GuiSurface<FbBackend>) {
-    eprintln!("{SWEEPING}");
+fn sweeping(surface: &mut GuiSurface<LinuxBackend>) {
+    if matches!(surface.backend_mut(), LinuxBackend::Console(_)) {
+        eprintln!("{SWEEPING}");
+        return;
+    }
+
+    let _ = surface.notice(SWEEPING);
+    if let LinuxBackend::Window(window) = surface.backend_mut() {
+        window.forget = true;
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -159,8 +179,137 @@ fn install_restore_hook() {
 }
 
 #[cfg(target_os = "linux")]
-fn open() -> io::Result<FbBackend> {
-    FbBackend::open()
+fn open() -> io::Result<LinuxBackend> {
+    match gui_x11::display_from_env() {
+        Some(display) => {
+            let window = gui_x11::Window::open(&display?, TITLE, hemostat_gui::render::BG)?;
+            Ok(LinuxBackend::Window(XBackend { window, forget: false }))
+        }
+        None => FbBackend::open().map(LinuxBackend::Console),
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum LinuxBackend {
+
+    Window(XBackend),
+
+    Console(FbBackend),
+}
+
+#[cfg(target_os = "linux")]
+impl Backend for LinuxBackend {
+    fn size(&self) -> (u32, u32) {
+        match self {
+            LinuxBackend::Window(b) => b.size(),
+            LinuxBackend::Console(b) => b.size(),
+        }
+    }
+
+    fn poll(&mut self, timeout: Duration) -> io::Result<Option<RawEvent>> {
+        match self {
+            LinuxBackend::Window(b) => b.poll(timeout),
+            LinuxBackend::Console(b) => b.poll(timeout),
+        }
+    }
+
+    fn present(&mut self, frame: &Frame) -> io::Result<()> {
+        match self {
+            LinuxBackend::Window(b) => b.present(frame),
+            LinuxBackend::Console(b) => b.present(frame),
+        }
+    }
+
+    fn wants_pointer(&self) -> bool {
+        match self {
+            LinuxBackend::Window(b) => b.wants_pointer(),
+            LinuxBackend::Console(b) => b.wants_pointer(),
+        }
+    }
+
+    fn scale_floor(&self) -> u32 {
+        match self {
+            LinuxBackend::Window(b) => b.scale_floor(),
+            LinuxBackend::Console(b) => b.scale_floor(),
+        }
+    }
+
+    fn release(&mut self) {
+        match self {
+            LinuxBackend::Window(b) => b.release(),
+            LinuxBackend::Console(b) => b.release(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct XBackend {
+    window: gui_x11::Window,
+
+    forget: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Backend for XBackend {
+    fn size(&self) -> (u32, u32) {
+        self.window.size()
+    }
+
+    fn poll(&mut self, timeout: Duration) -> io::Result<Option<RawEvent>> {
+        Ok(self.window.poll(timeout)?.map(x_event))
+    }
+
+    fn present(&mut self, frame: &Frame) -> io::Result<()> {
+        if std::mem::take(&mut self.forget) {
+            self.window.forget_input()?;
+        }
+        self.window.present(frame.width, frame.height, &frame.pixels)
+    }
+
+    fn wants_pointer(&self) -> bool {
+        false
+    }
+
+    fn scale_floor(&self) -> u32 {
+        self.window.scale_floor()
+    }
+
+    fn release(&mut self) {
+        self.forget = true;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn x_event(event: XEvent) -> RawEvent {
+    use hemostat_gui::backend::{Mods, RawKey};
+    match event {
+        XEvent::Key { key, ctrl, alt, shift } => {
+            let key = match key {
+                XKey::Char(c) => RawKey::Char(c),
+                XKey::Enter => RawKey::Enter,
+                XKey::Esc => RawKey::Esc,
+                XKey::Backspace => RawKey::Backspace,
+                XKey::Tab => RawKey::Tab,
+                XKey::BackTab => RawKey::BackTab,
+                XKey::Up => RawKey::Up,
+                XKey::Down => RawKey::Down,
+                XKey::Left => RawKey::Left,
+                XKey::Right => RawKey::Right,
+                XKey::PageUp => RawKey::PageUp,
+                XKey::PageDown => RawKey::PageDown,
+                XKey::Home => RawKey::Home,
+                XKey::End => RawKey::End,
+                XKey::Delete => RawKey::Delete,
+                XKey::F(n) => RawKey::F(n),
+            };
+            RawEvent::Key(key, Mods { ctrl, alt, shift })
+        }
+        XEvent::PointerMove { x, y } => RawEvent::PointerMove { x, y },
+        XEvent::PointerDown { x, y } => RawEvent::PointerDown { x, y },
+        XEvent::Wheel { up } => RawEvent::Wheel { up },
+        XEvent::Resized { width, height } => RawEvent::Resized { width, height },
+        XEvent::Close => RawEvent::Close,
+    }
 }
 
 #[cfg(target_os = "linux")]

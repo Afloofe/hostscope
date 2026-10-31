@@ -137,6 +137,9 @@ fn draw<S: Surface>(surface: &mut S, render: impl FnOnce(Rect, &mut Buffer) -> H
     surface.present(&buf, &hits)
 }
 
+const SWEEPING: &str = "re-scanning this host to confirm; this takes as long as start-up did. \
+                        Keys wait until it is done";
+
 fn release_for_sweep<S: Surface>(surface: &mut S, verbs: &VerbsPane) {
     if !verbs.busy() {
         surface.release();
@@ -462,6 +465,9 @@ where
             }
             ConsoleEffect::Rescan => {
                 let keep = app.model.selected;
+
+                app.model.last_result = Some(SWEEPING.into());
+                draw(&mut surface, |area, buf| app.render(area, buf))?;
                 release_for_sweep(&mut surface, &app.verbs);
                 app.model = refresh();
                 app.model.selected = keep.min(app.model.findings.len().saturating_sub(1));
@@ -488,7 +494,14 @@ where
 
                         let outcome = apply(&id);
                         let keep = model.selected;
+
+                        model.last_result = Some(match &outcome {
+                            Ok(done) => format!("written: {done} — {SWEEPING}"),
+                            Err(why) => format!("NOT applied — nothing was changed: {why} — {SWEEPING}"),
+                        });
+                        draw(&mut surface, |area, buf| app.render(area, buf))?;
                         release_for_sweep(&mut surface, &app.verbs);
+                        let model = &mut app.model;
                         *model = refresh();
                         model.selected = keep.min(model.findings.len().saturating_sub(1));
 
