@@ -326,6 +326,9 @@ enum ScopeRange {
     Cloud,
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) const INFRA_EXCEPTIONS: &[(&str, u16)] = &[("10.64.250.228", 9000)];
+
 const NETBIRD_EGRESS_OCTET: u8 = 99;
 
 #[cfg(target_os = "linux")]

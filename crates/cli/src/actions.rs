@@ -2419,6 +2419,14 @@ pub(crate) fn print_network(
         egress_declared.extend(golden_netbird_allows(*team));
     }
 
+    if golden_team.is_some() {
+        for (addr, port) in crate::golden::INFRA_EXCEPTIONS {
+            let why = format!("{addr}:{port}, competition infrastructure the organizers named; never cut");
+            plan.trusted.push(((*addr).to_string(), np::Origin::Mandatory(why)));
+        }
+        egress_declared.extend(golden_infra_allows());
+    }
+
     println!("Inbound policy plan — default deny, with these exceptions:");
     println!();
     for a in &plan.allows {
@@ -2702,6 +2710,24 @@ fn golden_management_allows(team: u8) -> Vec<hemostat_sensor_linux::netpolicy::E
                 to: Some(range.clone()),
                 origin: np::Origin::Mandatory(format!(
                     "{what} to the team's boxes in {range}: the way to them from here (HEMOSTAT_GOLDEN, team {team})"
+                )),
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn golden_infra_allows() -> Vec<hemostat_sensor_linux::netpolicy::EgressAllow> {
+    use hemostat_sensor_linux::netpolicy as np;
+    crate::golden::INFRA_EXCEPTIONS
+        .iter()
+        .flat_map(|(addr, port)| {
+            [np::Proto::Tcp, np::Proto::Udp].into_iter().map(move |proto| np::EgressAllow {
+                proto,
+                port: Some(*port),
+                to: Some((*addr).to_string()),
+                origin: np::Origin::Mandatory(format!(
+                    "{addr}:{port}, competition infrastructure the organizers named; never cut"
                 )),
             })
         })
