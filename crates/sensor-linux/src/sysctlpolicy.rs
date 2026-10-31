@@ -356,7 +356,7 @@ pub fn proc_path(key: &str) -> Option<PathBuf> {
 }
 
 pub fn read(key: &str) -> Option<String> {
-    std::fs::read_to_string(proc_path(key)?).ok().map(|s| s.trim().to_string())
+    crate::saferead::read_kernel_text(proc_path(key)?).ok().map(|s| s.trim().to_string())
 }
 
 pub fn write(key: &str, value: &str) -> Result<(), String> {

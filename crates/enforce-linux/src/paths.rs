@@ -87,14 +87,14 @@ pub fn udev_reload() -> Result<(), String> {
     let Some(udevadm) = resolve_tool(&["/usr/bin/udevadm", "/bin/udevadm", "/sbin/udevadm"]) else {
         return Err("udevadm not found".into());
     };
-    run_tool(&udevadm, &["control", "--reload-rules"])
+    run_tool_within(&udevadm, &["control", "--reload-rules"], TOOL_LIMIT)
 }
 
 pub fn daemon_reload() -> Result<(), String> {
     let Some(systemctl) = resolve_tool(&["/usr/bin/systemctl", "/bin/systemctl"]) else {
         return Err("systemctl not found".into());
     };
-    run_tool(&systemctl, &["daemon-reload"])
+    run_tool_within(&systemctl, &["daemon-reload"], TOOL_LIMIT)
 }
 
 pub(crate) fn path_refusal(path: &Path) -> Option<String> {
@@ -298,6 +298,40 @@ pub(crate) fn run_tool(tool: &Path, args: &[&str]) -> Result<(), String> {
         .env_clear()
         .output()
         .map_err(|e| format!("could not run {}: {e}", tool.display()))?;
+    exited(tool, &output)
+}
+
+pub(crate) const TOOL_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+pub(crate) fn run_tool_within(tool: &Path, args: &[&str], limit: std::time::Duration) -> Result<(), String> {
+    let mut cmd = Command::new(tool);
+    cmd.args(args).env_clear();
+    match hemostat_sensor_linux::sshd::output_within(&mut cmd, std::process::Stdio::null(), limit) {
+        Ok(Some(output)) => exited(tool, &output),
+        Ok(None) => Err(format!(
+            "`{} {}` had not finished after {} seconds",
+            tool.display(),
+            args.join(" "),
+            limit.as_secs()
+        )),
+        Err(e) => Err(format!("could not run {}: {e}", tool.display())),
+    }
+}
+
+pub(crate) fn unit_query(systemctl: &Path, query: &str, unit: &str, limit: std::time::Duration) -> Option<bool> {
+    let mut cmd = Command::new(systemctl);
+    cmd.args([query, "--quiet", unit]).env_clear();
+    match hemostat_sensor_linux::sshd::output_within(&mut cmd, std::process::Stdio::null(), limit) {
+        Ok(Some(output)) => Some(output.status.success()),
+        Ok(None) | Err(_) => None,
+    }
+}
+
+pub(crate) fn unit_active(systemctl: &Path, unit: &str, limit: std::time::Duration) -> bool {
+    run_tool_within(systemctl, &["is-active", "--quiet", unit], limit).is_ok()
+}
+
+fn exited(tool: &Path, output: &std::process::Output) -> Result<(), String> {
     if output.status.success() {
         Ok(())
     } else {
@@ -540,7 +574,11 @@ pub(crate) fn move_file(from: &Path, to: &Path) -> Result<Vec<String>, String> {
     if rc == 0 {
         return Ok(Vec::new());
     }
-    let (lost, copied) = copy_preserving(&src, from, &dst, to)?;
+    let refused = std::io::Error::last_os_error();
+    if refused.raw_os_error() != Some(libc::EXDEV) {
+        return Err(format!("moving {} to {} failed: {refused}", from.display(), to.display()));
+    }
+    let (lost, copied, made) = copy_preserving(&src, from, &dst, to)?;
 
     match stat_at(&src.dir, &src.name) {
         Ok(st) if st.st_dev == copied.dev() && st.st_ino == copied.ino() => {}
@@ -556,13 +594,30 @@ pub(crate) fn move_file(from: &Path, to: &Path) -> Result<Vec<String>, String> {
 
     let rc = unsafe { libc::unlinkat(src.dir.as_raw_fd(), src.name.as_ptr(), 0) };
     if rc != 0 {
-        return Err(format!(
-            "removing {} after copy failed: {}",
-            from.display(),
-            std::io::Error::last_os_error()
-        ));
+        let why = std::io::Error::last_os_error();
+        return Err(format!("removing {} after copy failed: {why}{}", from.display(), unmake(&dst, &made, to)));
     }
     Ok(lost)
+}
+
+fn unmake(at: &Pinned, made: &fs::File, to: &Path) -> String {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    match (made.metadata(), at.stat()) {
+        (Ok(m), Ok(st)) if st.st_dev == m.dev() && st.st_ino == m.ino() => {
+
+            if unsafe { libc::unlinkat(at.dir.as_raw_fd(), at.name.as_ptr(), 0) } == 0 {
+                "; the copy was removed again, so nothing was moved".into()
+            } else {
+                format!(
+                    "; the copy at {} could NOT be removed ({}) — remove it by hand",
+                    to.display(),
+                    std::io::Error::last_os_error()
+                )
+            }
+        }
+        _ => format!("; {} is no longer the copy this made, so it was left as it is", to.display()),
+    }
 }
 
 fn copy_preserving(
@@ -570,7 +625,7 @@ fn copy_preserving(
     from: &Path,
     dst_at: &Pinned,
     to: &Path,
-) -> Result<(Vec<String>, fs::Metadata), String> {
+) -> Result<(Vec<String>, fs::Metadata, fs::File), String> {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -592,9 +647,12 @@ fn copy_preserving(
         )
         .map_err(|e| format!("copy {} -> {} failed: {e}", from.display(), to.display()))?;
 
-    std::io::copy(&mut src, &mut dst)
-        .map_err(|e| format!("copy {} -> {} failed: {e}", from.display(), to.display()))?;
-    dst.sync_all().map_err(|e| format!("copy to {} failed to flush: {e}", to.display()))?;
+    let filled = std::io::copy(&mut src, &mut dst)
+        .map_err(|e| format!("copy {} -> {} failed: {e}", from.display(), to.display()))
+        .and_then(|_| dst.sync_all().map_err(|e| format!("copy to {} failed to flush: {e}", to.display())));
+    if let Err(why) = filled {
+        return Err(format!("{why}{}", unmake(dst_at, &dst, to)));
+    }
 
     let mut lost = Vec::new();
 
@@ -618,5 +676,5 @@ fn copy_preserving(
         lost.push(format!("timestamps (mtime {}: {})", md.mtime(), std::io::Error::last_os_error()));
     }
 
-    Ok((lost, md))
+    Ok((lost, md, dst))
 }

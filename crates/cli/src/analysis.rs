@@ -714,7 +714,10 @@ pub(crate) fn collect_events_for_detection() -> DetectInput {
         boot: BootId::from_bytes(id.as_ref().map_or([0; 16], |i| i.boot)),
     };
 
-    let events: Vec<hs_core::Event> = procfs::walk()
+    let procs = procfs::walk();
+
+    let cut = procfs::cmdline_gap(&procs);
+    let events: Vec<hs_core::Event> = procs
         .into_iter()
         .enumerate()
         .map(|(i, p)| p.to_event(u64::try_from(i).unwrap_or(0), stamp, origin))
@@ -727,10 +730,12 @@ pub(crate) fn collect_events_for_detection() -> DetectInput {
         })
         .collect();
     let n = events.len();
+    let mut notes = vec!["the procfs floor: one sample of the processes running now".to_string()];
+    notes.extend(cut);
     DetectInput {
         events,
         about,
-        notes: vec!["the procfs floor: one sample of the processes running now".into()],
+        notes,
         gaps: Vec::new(),
         sources_json: format!("[{{\"source\":\"procfs\",\"state\":\"read\",\"records\":{n}}}]"),
         no_events: NO_EVENTS.into(),

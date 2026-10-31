@@ -235,9 +235,10 @@ mod verbs {
         quota: Option<store::Store>,
     }
 
-    pub(crate) fn prepare(verb: &str, dir: &str) -> Result<Prepared, String> {
+    pub(crate) fn prepare(verb: &str, dir: &str, args: &[String]) -> Result<Prepared, String> {
         let open = |p: &Path| saferead::open_regular(p, saferead::NOT_REGULAR);
-        let loaded = crate::vendor_manifest::load_in_place(None, &open)?;
+        let path = args.iter().position(|a| a == "--manifest").and_then(|i| args.get(i + 1)).map(String::as_str);
+        let loaded = crate::vendor_manifest::load_in_place(path, &open)?;
         let mut sys = tools::System::new(loaded.as_ref());
         prepare_in(verb, dir, &mut sys)
     }
@@ -261,12 +262,24 @@ mod verbs {
         })
     }
 
+    const FRAMING: u64 = 64 * 1024;
+
     pub(crate) fn admit(p: &Prepared, bytes: usize) -> Result<(), String> {
         match &p.quota {
-
-            Some(s) => s.admit(bytes as u64 + 64 * 1024).map_err(|e| e.to_string()),
+            Some(s) => s.admit(bytes as u64 + FRAMING).map_err(|e| e.to_string()),
             None => Ok(()),
         }
+    }
+
+    pub(crate) fn admit_reserved(p: &Prepared, bytes: usize) -> Result<(), String> {
+        match &p.quota {
+            Some(s) => s.admit_reserved(bytes as u64 + FRAMING).map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn room(p: &Prepared) -> Option<u64> {
+        p.quota.as_ref().map(|s| s.room().saturating_sub(FRAMING))
     }
 
     fn read_config() -> Result<Vec<u8>, String> {
@@ -279,7 +292,7 @@ mod verbs {
             return EXIT_NOT_BUILT;
         }
         let dir = store_arg(args);
-        let prep = match prepare("snapshot", &dir) {
+        let prep = match prepare("snapshot", &dir, args) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("hemostat snapshot: DID NOT RUN — {}", h(&e));
@@ -392,7 +405,7 @@ mod verbs {
             .map(|r| r.iter().take(4).map(|b| format!("{b:02x}")).collect())
             .unwrap_or_default();
         let drift_dir = format!("{dir}.drift/{secs}-{tag}");
-        let prep = match prepare("drift", &drift_dir) {
+        let prep = match prepare("drift", &drift_dir, args) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("hemostat drift: DID NOT RUN — {}", h(&e));
@@ -464,4 +477,4 @@ mod verbs {
 }
 
 #[cfg(target_os = "freebsd")]
-pub(crate) use verbs::{admit, drift, prepare, prepare_in, take_snapshot};
+pub(crate) use verbs::{admit, admit_reserved, drift, prepare_in, room, take_snapshot};

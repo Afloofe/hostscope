@@ -17,6 +17,12 @@ path = "src/main.rs"
 
 [dependencies]
 hemostat-tui = { path = "../tui", optional = true }
+# The on-host GUI (`gui`): the console's own views drawn as pixels, in a window
+# on Windows and on the framebuffer of a Linux console. Behind `mod-tui` with
+# the console it draws, so it is in every image the console is in and in none
+# the console is not. It touches no device itself: the window and the
+# framebuffer are the sensor crates', adapted to it in `gui_verb`.
+hemostat-gui = { path = "../gui", optional = true }
 # The render-boundary sanitizer. Mandatory in every variant and never
 # feature-gated (RFC-001 §2): every verb prints host-derived strings — process
 # paths, unit names, cron lines, account names — to a terminal, and an image
@@ -230,7 +236,7 @@ mod-deceive = ["hemostat-modules/mod-deceive"]
 mod-sidecar = ["hemostat-modules/mod-sidecar"]
 mod-collect = ["hemostat-modules/mod-collect"]
 mod-acquire = ["hemostat-modules/mod-acquire"]
-mod-tui = ["hemostat-modules/mod-tui", "dep:hemostat-tui"]
+mod-tui = ["hemostat-modules/mod-tui", "dep:hemostat-tui", "dep:hemostat-gui"]
 mod-remote = ["hemostat-modules/mod-remote", "dep:hemostat-remote"]
 mod-collector = ["hemostat-modules/mod-collector", "dep:hemostat-sensor-freebsd", "dep:hemostat-fleet"]
 mod-export-stix = ["hemostat-modules/mod-export-stix"]

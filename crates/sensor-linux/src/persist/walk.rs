@@ -3,8 +3,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-pub(super) fn boot_time() -> Option<u64> {
-    let stat = fs::read_to_string("/proc/stat").ok()?;
+pub(crate) fn boot_time() -> Option<u64> {
+    let stat = crate::saferead::read_kernel_text("/proc/stat").ok()?;
     stat.lines()
         .find_map(|l| l.strip_prefix("btime "))
         .and_then(|v| v.trim().parse().ok())
@@ -81,6 +81,8 @@ pub(super) enum DeadLink {
     Masked,
 
     Dangling(PathBuf),
+
+    Directory(PathBuf),
 }
 
 pub(super) fn dead_link(p: &Path) -> Option<DeadLink> {
@@ -90,6 +92,7 @@ pub(super) fn dead_link(p: &Path) -> Option<DeadLink> {
     }
     match fs::metadata(p) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Some(DeadLink::Dangling(target)),
+        Ok(m) if m.is_dir() => Some(DeadLink::Directory(target)),
         _ => None,
     }
 }

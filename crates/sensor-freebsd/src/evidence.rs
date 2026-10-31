@@ -242,6 +242,35 @@ impl Evidence {
     pub fn size(&self) -> usize {
         self.records().iter().map(Vec::len).sum()
     }
+
+    pub fn shed_to(&mut self, room: u64) -> u64 {
+        let mut size = u64::try_from(self.size()).unwrap_or(u64::MAX);
+        if size <= room {
+            return size;
+        }
+        let mut kept: Vec<(bool, usize, String)> = self
+            .obs
+            .iter()
+            .filter_map(|(p, o)| match o {
+                Obs::Bytes(b) => Some((p.as_str() != crate::configxml::CONFIG_PATH, b.len(), p.clone())),
+                _ => None,
+            })
+            .collect();
+
+        kept.sort_unstable();
+        while size > room {
+            let Some((_, len, path)) = kept.pop() else { break };
+            let why = format!(
+                "{len} bytes, read and not kept: the evidence store had no room for it beside the rest of this \
+                 sweep, short of the part kept for containment evidence"
+            );
+
+            let Some(freed) = len.checked_sub(why.len()).filter(|f| *f > 0) else { continue };
+            size = size.saturating_sub(u64::try_from(freed).unwrap_or(u64::MAX));
+            self.obs.insert(path, Obs::Refused(why));
+        }
+        size
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -270,6 +299,8 @@ pub const MAX_ENTRIES: usize = 4096;
 
 pub const MAX_KEPT_BYTES: u64 = 64 * 1024 * 1024;
 
+pub const ROOM_SLACK: u64 = 1024 * 1024;
+
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct Collector {
@@ -280,6 +311,8 @@ pub struct Collector {
 
     kept: u64,
     budget: u64,
+
+    room_cut: bool,
 }
 
 #[cfg(unix)]
@@ -292,6 +325,28 @@ impl Collector {
             throttle: crate::saferead::Throttle::new(crate::saferead::HASH_BYTES_PER_SEC),
             kept: 0,
             budget: MAX_KEPT_BYTES,
+            room_cut: false,
+        }
+    }
+
+    pub fn keep_within(&mut self, room: u64) {
+        let held = u64::try_from(self.ev.size()).unwrap_or(u64::MAX);
+        let cap = self.kept.saturating_add(room.saturating_sub(held).saturating_sub(ROOM_SLACK));
+        if cap < self.budget {
+            self.budget = cap;
+            self.room_cut = true;
+        }
+    }
+
+    fn over_budget(&self, len: u64) -> String {
+        if self.room_cut {
+            format!(
+                "{len} bytes, not read: this sweep had already kept {} bytes of files, and the evidence store had \
+                 room for {} of them short of the part kept for containment evidence",
+                self.kept, self.budget
+            )
+        } else {
+            format!("{len} bytes, not read: this sweep had already kept {} bytes of files, and keeps at most {}", self.kept, self.budget)
         }
     }
 
@@ -346,12 +401,7 @@ impl Collector {
         let o = match crate::saferead::open_regular(&p, crate::saferead::NOT_REGULAR) {
             Ok((_, md)) if md.len() > max => return self.hash(path),
 
-            Ok((_, md)) if md.len() > left => Obs::Refused(format!(
-                "{} bytes, not read: this sweep had already kept {} bytes of files, and keeps at most {}",
-                md.len(),
-                self.kept,
-                self.budget
-            )),
+            Ok((_, md)) if md.len() > left => Obs::Refused(self.over_budget(md.len())),
             Ok((f, md)) => match crate::saferead::read_open(&f, &md, max.min(left)) {
                 Ok(b) => {
                     self.kept = self.kept.saturating_add(b.len() as u64);

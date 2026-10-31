@@ -88,12 +88,13 @@ pub fn read_cgroups() -> Vec<(u32, String, String)> {
         let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
             continue;
         };
-        let Ok(text) = std::fs::read_to_string(e.path().join("cgroup")) else {
+
+        let Ok(text) = crate::saferead::read_pid_text(e.path().join("cgroup")) else {
             continue;
         };
         let Ok(cg) = cgroup_of(&text) else { continue };
-        let comm = std::fs::read(e.path().join("comm"))
-            .map_or_else(|_| "?".into(), |c| String::from_utf8_lossy(&c).trim().to_string());
+        let comm = crate::saferead::read_pid_text(e.path().join("comm"))
+            .map_or_else(|_| "?".into(), |c| c.trim().to_string());
         out.push((pid, cg, comm));
     }
     out

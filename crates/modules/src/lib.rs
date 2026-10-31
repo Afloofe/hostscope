@@ -387,7 +387,7 @@ const fn registered(id: ModuleId) -> Implementation {
 
         ModuleId::EnfFile => R("enforce-linux/src/lib.rs::apply_move_out"),
 
-        ModuleId::Tui => R("crates/tui"),
+        ModuleId::Tui => R("crates/tui + gui"),
 
         ModuleId::Collect => R("crates/evfmt"),
 

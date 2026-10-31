@@ -444,6 +444,7 @@ pub fn report_with(manifest: Option<&crate::vendor::Manifest>) -> Report {
 
     run_service_scan(&mut findings, &mut rep, &mut cov);
     run_writable_path_scan(&mut findings, &mut cov);
+    run_sensitive_mode_scan(&mut findings, &mut cov);
     run_process_scan(&mut findings, &mut cov);
 
     findings.extend(refusal_findings(&cov.refused));
@@ -974,6 +975,152 @@ fn run_writable_path_scan(findings: &mut Vec<Finding>, cov: &mut Coverage) {
                 });
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+
+    RootWrites,
+
+    Secret,
+
+    Shared,
+}
+
+const SENSITIVE: &[(&str, Held, bool)] = &[
+    ("/etc", Held::RootWrites, false),
+    ("/etc/passwd", Held::RootWrites, false),
+    ("/etc/group", Held::RootWrites, false),
+    ("/etc/shadow", Held::Secret, false),
+    ("/etc/gshadow", Held::Secret, false),
+    ("/etc/sudoers", Held::RootWrites, false),
+    ("/etc/sudoers.d", Held::RootWrites, true),
+    ("/etc/pam.d", Held::RootWrites, true),
+    ("/etc/security", Held::RootWrites, false),
+    ("/etc/ld.so.preload", Held::RootWrites, false),
+    ("/etc/ld.so.conf.d", Held::RootWrites, true),
+    ("/etc/crontab", Held::RootWrites, false),
+    ("/etc/cron.d", Held::RootWrites, true),
+    ("/etc/cron.hourly", Held::RootWrites, true),
+    ("/etc/cron.daily", Held::RootWrites, true),
+    ("/etc/cron.weekly", Held::RootWrites, true),
+    ("/etc/cron.monthly", Held::RootWrites, true),
+    ("/etc/systemd/system", Held::RootWrites, true),
+    ("/usr/lib/systemd/system", Held::RootWrites, false),
+    ("/etc/profile", Held::RootWrites, false),
+    ("/etc/profile.d", Held::RootWrites, true),
+    ("/etc/bash.bashrc", Held::RootWrites, false),
+    ("/etc/bashrc", Held::RootWrites, false),
+    ("/etc/environment", Held::RootWrites, false),
+    ("/etc/ssh", Held::RootWrites, false),
+    ("/etc/ssh/sshd_config", Held::RootWrites, false),
+    ("/etc/ssh/sshd_config.d", Held::RootWrites, true),
+    ("/etc/ssh/ssh_host_rsa_key", Held::Secret, false),
+    ("/etc/ssh/ssh_host_ecdsa_key", Held::Secret, false),
+    ("/etc/ssh/ssh_host_ed25519_key", Held::Secret, false),
+    ("/root", Held::Secret, false),
+    ("/root/.ssh", Held::Secret, false),
+    ("/root/.ssh/authorized_keys", Held::RootWrites, false),
+    ("/tmp", Held::Shared, false),
+    ("/var/tmp", Held::Shared, false),
+    ("/dev/shm", Held::Shared, false),
+];
+
+fn judge_mode(held: Held, mode: u32, uid: u32, gid: u32, is_dir: bool) -> Option<(Severity, String)> {
+    let m = mode & 0o7777;
+    if held == Held::Shared {
+        return (is_dir && m & 0o002 != 0 && m & 0o1000 == 0).then(|| {
+            (
+                Severity::Warn,
+                format!("mode {m:04o}: every account can write here and the sticky bit is off"),
+            )
+        });
+    }
+    let mut wrong = Vec::new();
+    if uid != 0 {
+        wrong.push(format!("owned by uid {uid}, not root"));
+    }
+    if m & 0o002 != 0 {
+        wrong.push("writable by every account".to_string());
+    }
+    if m & 0o020 != 0 && gid != 0 {
+        wrong.push(format!("writable by group {gid}"));
+    }
+    let writable = !wrong.is_empty();
+    if held == Held::Secret && m & 0o004 != 0 {
+        wrong.push("readable by every account".to_string());
+    }
+    if wrong.is_empty() {
+        return None;
+    }
+
+    let severity = if writable || !is_dir { Severity::Critical } else { Severity::Warn };
+    Some((severity, format!("mode {m:04o}, uid {uid}, gid {gid}: {}", wrong.join(", "))))
+}
+
+fn held_why(held: Held) -> &'static str {
+    match held {
+        Held::RootWrites => {
+            "only root may change this: sudo, PAM, cron, systemd, the loader and login all trust it, \
+             so an account that can write it can make itself root. Check what changed, then put the \
+             stock owner and mode back by hand (chown root, chmod go-w)"
+        }
+        Held::Secret => {
+            "it holds password hashes, private keys or root's own files: an account that can read or \
+             write it has a way to root. Check it was not copied or changed, then restore the stock \
+             mode by hand (chmod o-rwx)"
+        }
+        Held::Shared => {
+            "without the sticky bit any account can delete or replace another account's files here, \
+             a socket or a lock file a root service trusts among them. Restore it by hand (chmod +t)"
+        }
+    }
+}
+
+fn run_sensitive_mode_scan(findings: &mut Vec<Finding>, cov: &mut Coverage) {
+    use std::os::unix::fs::MetadataExt;
+    let judge = |findings: &mut Vec<Finding>, path: &str, held: Held, meta: &fs::Metadata| {
+        if let Some((severity, what)) = judge_mode(held, meta.mode(), meta.uid(), meta.gid(), meta.is_dir()) {
+            findings.push(Finding {
+                severity,
+                subject: format!("permissions of {path}"),
+                what,
+                why: held_why(held).into(),
+            });
+        }
+    };
+    let mut unchecked = Vec::new();
+    for &(path, held, files) in SENSITIVE {
+        let meta = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                unchecked.push(format!("{path} ({e})"));
+                continue;
+            }
+        };
+        judge(findings, path, held, &meta);
+        if files && meta.is_dir() {
+            let Some(rd) = cov.open(path) else { continue };
+            for ent in rd.flatten() {
+
+                let Ok(m) = ent.metadata() else { continue };
+                if m.file_type().is_file() {
+                    judge(findings, &ent.path().to_string_lossy(), held, &m);
+                }
+            }
+        }
+    }
+    if !unchecked.is_empty() {
+        findings.push(Finding {
+            severity: Severity::Note,
+            subject: "permissions not checked".into(),
+            what: format!("could not read the mode of {}", unchecked.join(", ")),
+            why: "a path whose mode could not be read is not one shown to be safe; run as root to \
+                  check it"
+                .into(),
+        });
     }
 }
 

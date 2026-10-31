@@ -218,7 +218,15 @@ mod verbs {
             }
         };
         let mut c = Collector::new(verb, Path::new("/"));
+
+        if let Some(room) = crate::freebsd_drift::room(&prep) {
+            c.keep_within(room);
+        }
         gather(&mut c, &mut sys);
+
+        if let Some(room) = crate::freebsd_drift::room(&prep) {
+            c.ev.shed_to(room);
+        }
         if let Err(e) = crate::freebsd_drift::admit(&prep, c.ev.size()) {
             eprintln!("hemostat {verb}: DID NOT RUN — {}", h(&e));
             return EXIT_FAILED;

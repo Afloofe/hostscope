@@ -23,7 +23,7 @@ pub(crate) fn open_ledger(layout: &Layout, engagement: [u8; 16], verb: &str, sou
 }
 
 fn uid() -> Option<u32> {
-    std::fs::read_to_string("/proc/self/status")
+    hemostat_sensor_linux::saferead::read_pid_text("/proc/self/status")
         .ok()?
         .lines()
         .find_map(|l| l.strip_prefix("Uid:"))

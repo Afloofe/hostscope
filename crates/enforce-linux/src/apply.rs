@@ -12,7 +12,7 @@ use crate::outcome::{
 };
 use crate::paths::{
     move_into_vault, path_refusal, pin_parent, resolve_tool, run_tool,
-    snapshot_into_vault,
+    run_tool_within, snapshot_into_vault, unit_active, unit_query, TOOL_LIMIT,
 };
 
 impl RemovalAction {
@@ -672,29 +672,17 @@ impl RemovalAction {
                 reason: "systemctl not found at /usr/bin or /bin".into(),
             });
         };
+        self.enable_and_start(&systemctl, unit, TOOL_LIMIT)
+    }
 
-        let was_enabled = std::process::Command::new(&systemctl)
-            .args(["is-enabled", "--quiet", unit])
-            .env_clear()
-            .status()
-            .ok()
-            .map(|s| s.success());
-        let was_active = std::process::Command::new(&systemctl)
-            .args(["is-active", "--quiet", unit])
-            .env_clear()
-            .status()
-            .ok()
-            .map(|s| s.success());
-        match run_tool(&systemctl, &["enable", "--now", unit]) {
+    pub(crate) fn enable_and_start(&self, systemctl: &Path, unit: &str, limit: std::time::Duration) -> Outcome {
+
+        let was_enabled = unit_query(systemctl, "is-enabled", unit, limit);
+        let was_active = unit_query(systemctl, "is-active", unit, limit);
+        match run_tool_within(systemctl, &["enable", "--now", unit], limit) {
             Ok(()) => {
 
-                let active = std::process::Command::new(&systemctl)
-                    .args(["is-active", "--quiet", unit])
-                    .env_clear()
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if active {
+                if unit_active(systemctl, unit, limit) {
                     Outcome::Applied(UndoRecord {
                         did: format!("enabled and started unit `{unit}`"),
                         undo: UndoKind::RestoreServiceState {

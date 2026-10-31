@@ -303,7 +303,7 @@ pub fn is_loopback(local: &str) -> bool {
 }
 
 pub fn ephemeral_range() -> (u16, u16) {
-    std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+    crate::saferead::read_kernel_text("/proc/sys/net/ipv4/ip_local_port_range")
         .ok()
         .and_then(|t| {
             let mut it = t.split_whitespace();

@@ -99,6 +99,27 @@ windows-sys = { version = "0.61", features = [
     # manager says it is running, and a stopped Sysmon writes nothing while
     # every key and the driver look exactly as they did.
     "Win32_System_Services",
+    # The operator GUI's window (`gui_window`): its class, window procedure
+    # and message pump (`RegisterClassExW`, `CreateWindowExW`, `PeekMessageW`,
+    # `MsgWaitForMultipleObjects`), the work area it opens in, and
+    # `SetProcessDPIAware`, which windows-sys files here rather than in HiDpi.
+    # A terminal over a web console mangles keys and floods or drops the
+    # mouse; a window's input is Windows' own.
+    "Win32_UI_WindowsAndMessaging",
+    # Painting that window: `BeginPaint`, `StretchDIBits` from a 32-bit
+    # top-down bitmap, `FillRect` for what a frame leaves uncovered.
+    # windows-sys also gates `RegisterClassExW` on it, because a class names
+    # a background brush.
+    "Win32_Graphics_Gdi",
+    # `GetKeyState`, for the modifiers a key was typed with; `SetFocus`; and
+    # the virtual-key codes the GUI's hand-written key table is held to.
+    "Win32_UI_Input_KeyboardAndMouse",
+    # `GetModuleHandleW(NULL)`, the instance a window class is registered
+    # under. It names this process's own image and loads nothing.
+    "Win32_System_LibraryLoader",
+    # `ProcessIdToSessionId`, so the GUI refuses session 0, where services
+    # run and a window is drawn on a desktop nobody can see.
+    "Win32_System_RemoteDesktop",
 ] }
 
 [lints]

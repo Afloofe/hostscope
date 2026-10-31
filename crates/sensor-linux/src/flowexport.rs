@@ -487,7 +487,7 @@ pub fn gather(r: &crate::overview::Report, now: u64) -> HostFlows {
         Ok(d) => {
             for e in d.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
-                let mac = fs::read_to_string(e.path().join("address")).ok().map(|m| m.trim().to_ascii_lowercase()).filter(|m| m.len() == 17);
+                let mac = crate::saferead::read_kernel_text(e.path().join("address")).ok().map(|m| m.trim().to_ascii_lowercase()).filter(|m| m.len() == 17);
                 h.ifaces.push(Iface { name, mac });
             }
             h.ifaces.sort();
@@ -646,7 +646,7 @@ fn descriptor_walk() -> (BTreeMap<u64, (Vec<String>, std::path::PathBuf)>, BTree
     let mut nss: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for pid in pids() {
         let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
-        let comm = std::fs::read(format!("/proc/{pid}/comm")).map(|b| String::from_utf8_lossy(&b).trim().to_string()).unwrap_or_default();
+        let comm = crate::saferead::read_pid_text(format!("/proc/{pid}/comm")).map(|s| s.trim().to_string()).unwrap_or_default();
         let who = format!("{comm} (pid {pid})");
         for fd in fds.flatten() {
             let Ok(t) = std::fs::read_link(fd.path()) else { continue };

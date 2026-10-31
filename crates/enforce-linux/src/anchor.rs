@@ -721,6 +721,18 @@ fn put_back(path: &Path, bytes: &[u8], meta: Meta, after: Option<&[u8; 32]>) -> 
     }
 }
 
+fn after_rebuild(command: &str, bundle: &str, rebuilt: Result<(bool, Option<bool>), String>) -> Result<String, String> {
+    match rebuilt {
+        Ok((true, Some(true))) => Ok(format!(" `{command}` rebuilt {bundle}, and it is byte for byte what it was before the removal.")),
+        Ok((true, _)) => Ok(format!(
+            " `{command}` rebuilt {bundle}; the certificate is back in it, and the bundle is not byte for byte what it \
+             was before the removal — something else in the store changed since"
+        )),
+        Ok((false, _)) => Err(format!("`{command}` ran and the certificate is NOT back in {bundle}, so what reads it does not trust the certificate")),
+        Err(e) => Err(format!("the rebuild failed ({e}): run `{command}` by hand, or what reads {bundle} does not trust the certificate")),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Recorded<'a> {
     pub(crate) vault: &'a Path,
@@ -820,22 +832,19 @@ pub(crate) fn undo(rec: Recorded<'_>, opts: &ApplyOptions) -> Outcome {
     }
     let mut note = String::new();
     if let Some(rb) = &rebuild {
-        match rb.run() {
-            Ok(_) => {
-                let back = fingerprints(Path::new(rb.bundle)).contains(&cert);
-                let exact = unhex32(rec.bundle_before).zip(digest_of(Path::new(rb.bundle))).map(|(b, n)| b == n);
-                note = match (back, exact) {
-                    (true, Some(true)) => format!(" `{}` rebuilt {}, and it is byte for byte what it was before the removal.", rb.command(), rb.bundle),
-                    (true, _) => format!(
-                        " `{}` rebuilt {}; the certificate is back in it, and the bundle is not byte for byte what it \
-                         was before the removal — something else in the store changed since",
-                        rb.command(),
-                        rb.bundle
-                    ),
-                    (false, _) => format!(" WARNING: `{}` ran and the certificate is NOT back in {}", rb.command(), rb.bundle),
-                };
+        let rebuilt = rb.run().map(|_| {
+            let back = fingerprints(Path::new(rb.bundle)).contains(&cert);
+            let exact = unhex32(rec.bundle_before).zip(digest_of(Path::new(rb.bundle))).map(|(b, n)| b == n);
+            (back, exact)
+        });
+        match after_rebuild(&rb.command(), rb.bundle, rebuilt) {
+            Ok(n) => note = n,
+            Err(why) => {
+                return Outcome::Failed(Failure {
+                    action: summary,
+                    reason: format!("{} is back from the vault, but {why}", path.display()),
+                })
             }
-            Err(e) => note = format!(" WARNING: the file is back and the rebuild failed ({e}); run it by hand"),
         }
     }
     Outcome::Applied(UndoRecord {

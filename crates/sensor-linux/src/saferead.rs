@@ -72,36 +72,44 @@ pub const NOT_REGULAR: &str = "not a regular file — a named pipe, socket or de
 
 pub fn open_regular(path: &Path, refusal: &str) -> std::io::Result<(fs::File, fs::Metadata)> {
     use std::io::{Error, ErrorKind};
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
 
     let at = open_o_path(path)?;
     let md = at.metadata()?;
     if !md.is_file() {
         return Err(Error::new(ErrorKind::InvalidInput, refusal.to_string()));
     }
-    let f = fs::OpenOptions::new()
+    Ok((reopen(&at).map_err(not_reopened)?, md))
+}
+
+fn reopen(at: &fs::File) -> std::io::Result<fs::File> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(format!("/proc/self/fd/{}", at.as_raw_fd()))
-        .map_err(|e| {
+}
 
-            if e.kind() == ErrorKind::NotFound {
-                Error::other(format!("not reopened through /proc/self/fd ({e})"))
-            } else {
-                e
-            }
-        })?;
-    Ok((f, md))
+fn not_reopened(e: std::io::Error) -> std::io::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        std::io::Error::other(format!("not reopened through /proc/self/fd ({e})"))
+    } else {
+        e
+    }
 }
 
 pub fn open_o_path(path: &Path) -> std::io::Result<fs::File> {
+    open_o_path_with(path, 0)
+}
+
+fn open_o_path_with(path: &Path, extra: libc::c_int) -> std::io::Result<fs::File> {
     use std::os::fd::{FromRawFd as _, OwnedFd};
 
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains a NUL"))?;
 
-    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC | extra) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -147,7 +155,71 @@ fn reads_as_image(r: impl std::io::Read, ours: &(u64, [u8; 32])) -> bool {
 pub const MAX_PROC_BYTES: u64 = 1024 * 1024;
 
 pub fn read_proc(path: &Path, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
-    read_bounded(fs::File::open(path)?, cap)
+    read_bounded(open_kernel(path, true, under_proc(path))?, cap)
+}
+
+pub(crate) fn read_procfs(path: &Path, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    read_bounded(open_kernel(path, true, true)?, cap)
+}
+
+pub const MAX_PID_FILE_BYTES: u64 = 64 * 1024;
+
+pub fn read_pid_text(path: impl AsRef<Path>) -> std::io::Result<String> {
+    read_proc(path.as_ref(), MAX_PID_FILE_BYTES).map(|(b, _)| lossy(b))
+}
+
+pub const NOT_KERNEL_FILE: &str = "not a regular file the kernel serves — something is mounted over it (a named \
+     pipe, a device, a socket, or a file from another filesystem), and it is neither opened nor read";
+
+fn under_proc(path: &Path) -> bool {
+    path.starts_with("/proc")
+}
+
+fn open_kernel(path: &Path, nofollow: bool, procfs: bool) -> std::io::Result<fs::File> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let refuse = || Error::new(ErrorKind::InvalidInput, NOT_KERNEL_FILE);
+    let at = open_o_path_with(path, if nofollow { libc::O_NOFOLLOW } else { 0 })?;
+    let md = at.metadata()?;
+    if !md.is_file() {
+        return Err(refuse());
+    }
+
+    let ask_again = procfs
+        && match on_procfs(&at) {
+            Ok(true) => false,
+            Ok(false) => return Err(refuse()),
+            Err(e) if e.raw_os_error() == Some(libc::EBADF) => true,
+            Err(e) => return Err(e),
+        };
+
+    let f = reopen(&at).map_err(|e| if under_proc(path) { e } else { not_reopened(e) })?;
+    let now = f.metadata()?;
+    if (now.dev(), now.ino()) != (md.dev(), md.ino()) || (ask_again && !on_procfs(&f)?) {
+        return Err(refuse());
+    }
+    Ok(f)
+}
+
+fn on_procfs(f: &fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+
+    let rc = unsafe { libc::fstatfs(f.as_raw_fd(), &mut sfs) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(is_proc_magic(sfs.f_type))
+}
+
+pub(crate) fn is_proc_magic(f_type: impl Into<i128>) -> bool {
+    f_type.into() == i128::from(libc::PROC_SUPER_MAGIC)
+}
+
+pub fn open_kernel_file(path: &Path) -> std::io::Result<fs::File> {
+    open_kernel(path, false, under_proc(path))
 }
 
 pub(crate) fn read_bounded(mut r: impl std::io::Read, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
@@ -175,7 +247,32 @@ pub(crate) fn read_bounded(mut r: impl std::io::Read, cap: u64) -> std::io::Resu
 }
 
 pub fn read_kernel_text(path: impl AsRef<Path>) -> std::io::Result<String> {
-    fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned())
+    read_kernel_bytes(path).map(lossy)
+}
+
+pub const MAX_KERNEL_TABLE_BYTES: u64 = 64 * 1024 * 1024;
+
+pub fn read_kernel_bytes(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+    let path = path.as_ref();
+    read_whole(open_kernel(path, false, under_proc(path))?, MAX_KERNEL_TABLE_BYTES)
+}
+
+fn read_whole(r: impl std::io::Read, cap: u64) -> std::io::Result<Vec<u8>> {
+    let (buf, over) = read_bounded(r, cap)?;
+    if over {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "over the {cap}-byte cap on one kernel table: no table this reads runs to it, so it is not \
+                 the one the kernel prints there"
+            ),
+        ));
+    }
+    Ok(buf)
+}
+
+fn lossy(b: Vec<u8>) -> String {
+    String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 pub const MAX_MAPS_BYTES: u64 = 64 * 1024 * 1024;
@@ -186,9 +283,7 @@ pub fn read_kernel_text_capped(path: impl AsRef<Path>, cap: u64) -> std::io::Res
         let whole = buf.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
         buf.truncate(whole);
     }
-    let text = String::from_utf8(buf)
-        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-    Ok((text, truncated))
+    Ok((lossy(buf), truncated))
 }
 
 pub fn read_text(path: &Path) -> std::io::Result<String> {

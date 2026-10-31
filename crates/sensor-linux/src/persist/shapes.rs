@@ -165,12 +165,9 @@ pub(super) fn flag_after(command: &str, flag: &str, is_tool: impl Fn(&str) -> bo
 
 pub(super) fn arg_under_world_writable(command: &str) -> Option<&'static str> {
     under_world_writable(command.split_whitespace())?;
-    let tested = |words: &[&str]| {
-        effective(words).first().is_some_and(|h| ["[", "[[", "test"].contains(&basename(h)))
-    };
     simple_commands(command)
         .iter()
-        .filter(|(_, words)| !tested(words))
+        .filter(|(_, words)| !names_without_running(effective(words)))
         .find_map(|(_, words)| under_world_writable(words.iter().copied()))
         .or_else(|| {
             substitution_bodies(command)
@@ -189,6 +186,31 @@ fn under_world_writable<'w>(words: impl IntoIterator<Item = &'w str>) -> Option<
         let w = bare(w);
         WORLD_WRITABLE.iter().find(|d| w.starts_with(**d)).copied()
     })
+}
+
+fn names_without_running(e: &[&str]) -> bool {
+    let Some((&head, args)) = e.split_first() else { return false };
+    if under_world_writable([head]).is_some() {
+        return false;
+    }
+    match basename(head) {
+        "[" | "[[" | "test" | "mountpoint" | "umount" | "mkdir" | "rmdir" => true,
+        "mount" => args
+            .split_last()
+            .is_some_and(|(_, sources)| under_world_writable(sources.iter().copied()).is_none()),
+        "chmod" => {
+
+            let recursive = args.iter().any(|a| {
+                *a == "--recursive" || (a.starts_with('-') && !a.starts_with("--") && a.contains(['R', 'r']))
+            });
+            !recursive
+                && args.iter().all(|a| match under_world_writable([*a]) {
+                    Some(dir) => bare(a).trim_end_matches('/') == dir.trim_end_matches('/'),
+                    None => true,
+                })
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn routable_ip_literal(word: &str) -> bool {

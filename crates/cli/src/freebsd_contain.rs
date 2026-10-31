@@ -263,12 +263,12 @@ mod verb {
     }
 
     pub(super) fn seal_evidence(sys: &mut tools::System<'_>, id: &str, step: &str) -> Result<(String, [u8; 32]), String> {
-        use crate::freebsd_drift::{admit, open, prepare_in, seal};
+        use crate::freebsd_drift::{admit_reserved, open, prepare_in, seal};
         let dir = format!("{EVIDENCE_STORE}/{}-{id}-{step}", now());
         let prep = prepare_in("fw", &dir, sys)?;
         let config = saferead::read_bytes(Path::new(configxml::CONFIG_PATH), configxml::MAX_BYTES).map_err(|e| e.to_string());
         let recs = evidence_records(id, step, &config, &backups());
-        admit(&prep, recs.iter().map(Vec::len).sum())?;
+        admit_reserved(&prep, recs.iter().map(Vec::len).sum())?;
         hemostat_sensor_freebsd::store::create_private(Path::new(EVIDENCE_STORE)).map_err(|e| format!("{EVIDENCE_STORE}: {e}"))?;
         let seed = crate::identity::rand32().map_err(|e| format!("no entropy for the seal key: {e}"))?;
         let sealed = seal(&dir, seed, &recs, &prep.ids)?;
@@ -342,7 +342,9 @@ mod verb {
     pub(crate) fn arm(sys: &mut tools::System<'_>, ctx: &Armed<'_>, d: &DryRun, auth: &hemostat_enforce_pf::Authority, json: bool) -> u8 {
         use std::fmt::Write as _;
         let a = ctx.asked;
-        let f = h(&follow_flags(&ctx.manifest, ctx.meta.as_deref()));
+
+        let follow = follow_flags(&ctx.manifest, ctx.meta.as_deref());
+        let f = h(&follow);
         let mut o = render_stages(d, &ctx.host, "fw block", "ARMED");
         let doc = |outcome: &str, id: &str, detail: &str| {
             format!(
@@ -377,7 +379,7 @@ mod verb {
             return crate::EXIT_POLICY;
         }
 
-        if let Err(why) = apply::refuse_duplicate(&j, a.enrolled.alias, &a.cidr) {
+        if let Err(why) = apply::refuse_duplicate(&j, a.enrolled.alias, &a.cidr, &follow) {
             let _ = writeln!(o, "  REFUSED: {}. Nothing applied; the ticket is kept.", h(&why));
             print_doc(json, &o, &doc("refused", &id, &why));
             return crate::EXIT_POLICY;
@@ -432,7 +434,7 @@ mod verb {
                 return EXIT_FAILED;
             }
         };
-        match apply::apply(sys, &j, allowed, intent, &config) {
+        match apply::apply(sys, &j, allowed, intent, &config, &follow) {
             Ok(Applied::Live) => {}
             Ok(Applied::Existed(why)) => {
                 let _ = writeln!(o, "\n  ALREADY BLOCKED: {}. Journal {}.", h(&why), j.path(&id).display());
@@ -465,7 +467,7 @@ mod verb {
                 let _ = writeln!(o, "  WATCHER  could not be started ({}). A block with no deadline is not commit-confirm, so it is lifted now.", h(&why));
                 let _ = j.hold(&id).map(|_held| {
                     let mut no_seal = || Err("the watcher's lift writes no config".to_string());
-                    match apply::lift(sys, &j, &id, "watch-failed", false, &read_config, &mut no_seal) {
+                    match apply::lift(sys, &j, &id, "watch-failed", false, &read_config, &mut no_seal, &follow) {
                         Ok(l) => {
                             let _ = writeln!(o, "  LIFTED   {l:?}");
                         }
@@ -500,6 +502,8 @@ mod verb {
         let _ = tools::renice_self(&mut sys, 10);
         let j = Journals::at(journal::DIR);
 
+        let f = follow_flags(&l.mpath, l.given_meta.as_deref());
+
         let mut failed = 0u32;
         loop {
             let why = match j.read(&id).map(|e| apply::watch_step(&e, now())) {
@@ -509,7 +513,7 @@ mod verb {
                     continue;
                 }
                 Ok(WatchStep::Stop(_)) => return EXIT_OK,
-                Ok(WatchStep::Due) => match lift_due(&mut sys, &j, &id) {
+                Ok(WatchStep::Due) => match lift_due(&mut sys, &j, &id, &f) {
                     Ok(code) => return code,
                     Err(why) => why,
                 },
@@ -519,7 +523,6 @@ mod verb {
             match apply::lift_retry_after(failed) {
                 Some(s) => std::thread::sleep(std::time::Duration::from_secs(s)),
                 None => {
-                    let f = follow_flags(&l.mpath, l.given_meta.as_deref());
                     let what = format!(
                         "watcher: gave up after {failed} failed tries at the deadline, the last: {why}. The block may \
                          still be live: `hemostat undo {id}{f}` lifts it"
@@ -532,7 +535,7 @@ mod verb {
         }
     }
 
-    fn lift_due(sys: &mut tools::System<'_>, j: &Journals, id: &str) -> Result<u8, String> {
+    fn lift_due(sys: &mut tools::System<'_>, j: &Journals, id: &str, follow: &str) -> Result<u8, String> {
         let _held = j.hold(id)?;
         match apply::watch_step(&j.read(id)?, now()) {
             WatchStep::Due => {}
@@ -540,7 +543,7 @@ mod verb {
             WatchStep::Wait(_) => return Err("the deadline is not due yet by this box's clock".into()),
         }
         let mut no_seal = || Err("the watcher's lift writes no config".to_string());
-        match apply::lift(sys, j, id, "watch", false, &read_config, &mut no_seal)? {
+        match apply::lift(sys, j, id, "watch", false, &read_config, &mut no_seal, follow)? {
             Lifted::Left(why) => {
                 let _ = j.append(id, "note", &[("what", format!("watcher at the deadline: {why}"))]);
                 Ok(EXIT_PARTIAL)
@@ -583,6 +586,8 @@ mod verb {
             );
             return EXIT_FAILED;
         }
+
+        let follow = follow_flags(&l.mpath, l.given_meta.as_deref());
         let mut sys = tools::System::new(l.manifest.as_ref()).with_meta(l.meta.as_ref());
         let _ = tools::renice_self(&mut sys, 10);
         let (idn, _) = match crate::identity::gather_identity_with(&mut sys) {
@@ -614,13 +619,13 @@ mod verb {
 
         let width = hemostat_enforce_pf::protect::Width::of(&e.intent.cidr);
         if let Some(why) = golden_refusal(width, crate::golden::active()) {
-            let left = apply::held(&read_config(), &e).unwrap_or_else(|| format!("The block lifts at its deadline ({})", clock(e.intent.deadline)));
+            let left = apply::held(&read_config(), &e, &follow).unwrap_or_else(|| format!("The block lifts at its deadline ({})", clock(e.intent.deadline)));
             eprintln!("hemostat fw confirm: REFUSED — {why}. Nothing written. {}", h(&left));
             return EXIT_POLICY;
         }
         let own = read_config().as_ref().map(crate::golden::own_addrs_of).unwrap_or_default();
         if let Some(why) = crate::golden::block_scope_here(&e.intent.cidr, &own) {
-            let left = apply::held(&read_config(), &e).unwrap_or_else(|| format!("The block lifts at its deadline ({})", clock(e.intent.deadline)));
+            let left = apply::held(&read_config(), &e, &follow).unwrap_or_else(|| format!("The block lifts at its deadline ({})", clock(e.intent.deadline)));
             eprintln!("hemostat fw confirm: REFUSED — {}. Nothing written. {}", h(&why), h(&left));
             return EXIT_POLICY;
         }
@@ -674,14 +679,14 @@ mod verb {
         use std::fmt::Write as _;
 
         if !d.passed() || (armed && !matches!(d.armed(&auth, Evidence::Sealed), Decision::Allow(_))) {
-            let left = apply::held(&read_config(), &e).unwrap_or_else(|| lifts.clone());
+            let left = apply::held(&read_config(), &e, &follow).unwrap_or_else(|| lifts.clone());
             let _ = writeln!(o, "  Nothing written. {}", h(&left));
             print_doc(json, &o, &doc("refused", "a stage refused"));
             return exit_code(&d);
         }
         if !armed {
 
-            let (outcome, detail, code) = match apply::would_confirm(&mut sys, &j, &id, t, &read_config) {
+            let (outcome, detail, code) = match apply::would_confirm(&mut sys, &j, &id, t, &read_config, &follow) {
                 Ok(None) => {
                     let _ = writeln!(
                         o,
@@ -692,7 +697,7 @@ mod verb {
                         e.intent.alias.name(),
                         e.intent.cidr
                     );
-                    let f = h(&follow_flags(&l.mpath, l.given_meta.as_deref()));
+                    let f = h(&follow);
                     let _ = writeln!(
                         o,
                         "\n  DRY RUN: nothing was sealed or written. {lifts} To confirm it:\n\n      hemostat fw confirm {id} --arm{f}"
@@ -720,7 +725,7 @@ mod verb {
             sealed_at = Some(s);
             Ok(())
         };
-        let got = apply::confirm(&mut sys, &j, &id, t, &read_config, &mut seal, &verified);
+        let got = apply::confirm(&mut sys, &j, &id, t, &read_config, &mut seal, &verified, &follow);
         drop(held);
         if let Some((store, key)) = &sealed_at {
             let _ = writeln!(o, "    sealed   evidence      {} (key {})", h(store), hex32(key));
@@ -780,6 +785,7 @@ mod verb {
                 return EXIT_FAILED;
             }
         };
+        let follow = follow_flags(&l.mpath, l.given_meta.as_deref());
         let mut sys = tools::System::new(l.manifest.as_ref()).with_meta(l.meta.as_ref());
         let _ = tools::renice_self(&mut sys, 10);
         let j = Journals::at(journal::DIR);
@@ -818,9 +824,13 @@ mod verb {
                     apply::refuse_while_booting(booting())?;
                     seal_evidence(&mut seal_sys, id, "lift").map(|_| ())
                 };
-                Ok(match apply::lift(&mut sys, &j, id, "undo", true, &read_config, &mut seal)? {
-                    Lifted::Done { config: true } => format!("LIFTED {} from {} — config.xml and pf's table; -T test fails", e.intent.cidr, e.intent.alias.name()),
-                    Lifted::Done { config: false } => format!("LIFTED {} from pf's table {}; -T test fails", e.intent.cidr, e.intent.alias.name()),
+                Ok(match apply::lift(&mut sys, &j, id, "undo", true, &read_config, &mut seal, &follow)? {
+                    Lifted::Done { config: true, table: true } => format!("LIFTED {} from {} — config.xml and pf's table; -T test fails", e.intent.cidr, e.intent.alias.name()),
+                    Lifted::Done { config: false, table: true } => format!("LIFTED {} from pf's table {}; -T test fails", e.intent.cidr, e.intent.alias.name()),
+
+                    Lifted::Done { config, table: false } => {
+                        format!("LIFTED {} — {}", e.intent.cidr, apply::unloaded(e.intent.alias, &e.intent.cidr, config))
+                    }
                     Lifted::Covered => {
                         code = EXIT_PARTIAL;
                         format!("LIFTED {} from {}, but -T test still matches: another entry covers it", e.intent.cidr, e.intent.alias.name())
@@ -983,6 +993,7 @@ mod verb {
             let dir = format!("{EVIDENCE_STORE}/{t}-{id}-statekill");
             let prep = prepare_in("fw statekill", &dir, &mut sys)?;
             let recs = statekill_records(&id, &cidr.to_string(), &listing, &matched);
+
             admit(&prep, recs.iter().map(Vec::len).sum())?;
             hemostat_sensor_freebsd::store::create_private(Path::new(EVIDENCE_STORE)).map_err(|e| format!("{EVIDENCE_STORE}: {e}"))?;
             let seed = crate::identity::rand32().map_err(|e| format!("no entropy for the seal key: {e}"))?;

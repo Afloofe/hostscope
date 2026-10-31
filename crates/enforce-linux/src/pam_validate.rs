@@ -263,14 +263,36 @@ fn canary_name(pid: u32, n: u32) -> String {
     format!("hemostat-pamck-{pid}-{}", n % 1000)
 }
 
+const ACCOUNT_LIMIT: Duration = Duration::from_secs(30);
+
+fn run_within(cmd: &mut Command, stdin: Stdio, what: &str) -> Result<std::process::Output, String> {
+    run_bounded(cmd, stdin, what, ACCOUNT_LIMIT)
+}
+
+fn run_bounded(cmd: &mut Command, stdin: Stdio, what: &str, limit: Duration) -> Result<std::process::Output, String> {
+    match hemostat_sensor_linux::sshd::output_within(cmd, stdin, limit) {
+        Ok(Some(out)) => Ok(out),
+        Ok(None) => Err(format!("{what} had not finished after {limit:?}, and was stopped")),
+        Err(e) => Err(format!("{what}: {e}")),
+    }
+}
+
 fn make_canary(tools: &Tools, password: &str) -> Result<String, String> {
     let n = PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let user = canary_name(std::process::id(), n);
-    let _ = clean(&mut Command::new(&tools.userdel)).args(["-f", &user]).output();
-    let add = clean(&mut Command::new(&tools.useradd))
-        .args(["-M", "-s", "/bin/sh", &user])
-        .output()
-        .map_err(|e| format!("useradd: {e}"))?;
+    let _ = run_within(clean(&mut Command::new(&tools.userdel)).args(["-f", &user]), Stdio::null(), "userdel");
+    let add = match run_within(
+        clean(&mut Command::new(&tools.useradd)).args(["-M", "-s", "/bin/sh", &user]),
+        Stdio::null(),
+        "useradd",
+    ) {
+        Ok(out) => out,
+        Err(why) => {
+
+            remove_canary(tools, &user);
+            return Err(why);
+        }
+    };
     if !add.status.success() {
         return Err(format!("useradd failed: {}", String::from_utf8_lossy(&add.stderr).trim()));
     }
@@ -283,26 +305,59 @@ fn make_canary(tools: &Tools, password: &str) -> Result<String, String> {
 }
 
 fn set_password(tools: &Tools, user: &str, password: &str) -> Result<(), String> {
-    let mut ch = clean(&mut Command::new(&tools.chpasswd))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("chpasswd spawn: {e}"))?;
-
-    let fed = ch.stdin.take().ok_or_else(|| "chpasswd stdin".to_string()).and_then(|mut s| {
-        s.write_all(format!("{user}:{password}\n").as_bytes()).map_err(|e| format!("chpasswd write: {e}"))
-    });
-    let out = ch.wait_with_output().map_err(|e| format!("chpasswd wait: {e}"))?;
-    fed?;
+    let (line, mut feed) = std::io::pipe().map_err(|e| format!("chpasswd pipe: {e}"))?;
+    feed.write_all(format!("{user}:{password}\n").as_bytes()).map_err(|e| format!("chpasswd write: {e}"))?;
+    drop(feed);
+    let out = run_within(clean(&mut Command::new(&tools.chpasswd)), Stdio::from(line), "chpasswd")?;
     if !out.status.success() {
         return Err(format!("chpasswd failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
     Ok(())
 }
 
+pub fn set_and_prove(user: &str, password: &str) -> Result<Probe, String> {
+    if user.contains([':', '\n']) || password.contains([':', '\n']) {
+        return Err("a name or password with ':' or a line break, which chpasswd cannot carry".into());
+    }
+    let tools = Tools::find()?;
+    let caller = unprivileged_caller()?;
+    set_password(&tools, user, password)?;
+    let right = su_attempt(&tools.su, caller, user, password);
+    let control = matches!(&right, Ok(a) if a.took_the_password())
+        .then(|| su_attempt(&tools.su, caller, user, &wrong_password(password)));
+    clear_failures(user);
+    Ok(verdict(&right, control.as_ref()))
+}
+
+pub fn restore_hash(user: &str, hash: &str) -> Result<(), String> {
+    if user.contains([':', '\n']) || hash.contains([':', '\n']) || hash.is_empty() {
+        return Err("a name or hash that chpasswd cannot carry, or an empty hash".into());
+    }
+    let tools = Tools::find()?;
+    let (line, mut feed) = std::io::pipe().map_err(|e| format!("chpasswd pipe: {e}"))?;
+    feed.write_all(format!("{user}:{hash}\n").as_bytes()).map_err(|e| format!("chpasswd write: {e}"))?;
+    drop(feed);
+    let out = run_within(clean(&mut Command::new(&tools.chpasswd)).arg("-e"), Stdio::from(line), "chpasswd -e")?;
+    if !out.status.success() {
+        return Err(format!("chpasswd -e failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(())
+}
+
+fn clear_failures(user: &str) {
+    if let Ok(faillock) = system_tool(FAILLOCK, false) {
+        let _ = run_within(
+            clean(&mut Command::new(faillock)).args(["--user", user, "--reset"]),
+            Stdio::null(),
+            "faillock",
+        );
+    }
+}
+
+const FAILLOCK: &[&str] = &["/usr/sbin/faillock", "/sbin/faillock"];
+
 fn remove_canary(tools: &Tools, user: &str) {
-    let _ = clean(&mut Command::new(&tools.userdel)).args(["-f", user]).output();
+    let _ = run_within(clean(&mut Command::new(&tools.userdel)).args(["-f", user]), Stdio::null(), "userdel");
 }
 
 fn su_attempt(su: &Path, caller: Caller, user: &str, password: &str) -> Result<Attempt, String> {

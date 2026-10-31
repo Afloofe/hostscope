@@ -1,5 +1,10 @@
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
+use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, TRUE};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Console::{
+    FlushConsoleInputBuffer, GetConsoleMode, GetConsoleOutputCP, GetStdHandle, SetConsoleCtrlHandler,
+    SetConsoleOutputCP, CONSOLE_MODE, STD_INPUT_HANDLE,
+};
 
 #[cfg(target_os = "windows")]
 const CP_UTF8: u32 = 65001;
@@ -41,4 +46,26 @@ pub fn use_utf8_output() -> Encoding {
         return Encoding::Refused { from: before, error };
     }
     Encoding::Switched(before)
+}
+
+#[cfg(target_os = "windows")]
+pub fn ignore_ctrl_c() -> bool {
+
+    unsafe { SetConsoleCtrlHandler(None, TRUE) != 0 }
+}
+
+#[cfg(target_os = "windows")]
+pub fn discard_typeahead() {
+
+    let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if input.is_null() || input == INVALID_HANDLE_VALUE {
+        return;
+    }
+    let mut mode: CONSOLE_MODE = 0;
+
+    if unsafe { GetConsoleMode(input, &mut mode) } == 0 {
+        return;
+    }
+
+    unsafe { FlushConsoleInputBuffer(input) };
 }

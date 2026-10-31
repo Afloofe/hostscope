@@ -23,17 +23,27 @@ fn in_table(r: &mut dyn Runner, alias: Alias, cidr: &Cidr) -> Result<bool, Strin
     Ok(journal::table_entries(&show(r, alias)?).contains(cidr))
 }
 
-const NO_TABLE: &str = "Table does not exist";
+fn lists_table(tables: &str, alias: Alias) -> bool {
+    tables.lines().any(|l| l.split_whitespace().any(|w| w == alias.name()))
+}
 
-fn listed(r: &mut dyn Runner, alias: Alias, cidr: &Cidr) -> Result<bool, String> {
+fn shown(r: &mut dyn Runner, alias: Alias, cidr: &Cidr) -> Result<Option<bool>, String> {
     let inv = Invocation::new(Tool::Pfctl, &["-t", alias.name(), "-T", "show"]);
     let what = format!("{} {}", inv.tool(), inv.args().join(" "));
-    match r.run(&inv) {
-        Ok(o) if o.success() => Ok(journal::table_entries(&o.text()).contains(cidr)),
-        Ok(o) if String::from_utf8_lossy(&o.stderr).contains(NO_TABLE) => Ok(false),
-        Ok(o) => Err(format!("{what} exited {:?}: {}", o.status, String::from_utf8_lossy(&o.stderr).trim())),
-        Err(e) => Err(format!("{what}: {e}")),
+    let failed = match r.run(&inv) {
+        Ok(o) if o.success() => return Ok(Some(journal::table_entries(&o.text()).contains(cidr))),
+        Ok(o) => format!("{what} exited {:?}: {}", o.status, String::from_utf8_lossy(&o.stderr).trim()),
+        Err(e) => return Err(format!("{what}: {e}")),
+    };
+    match crate::preflight::text(r, Invocation::new(Tool::Pfctl, &["-sTables"])) {
+        Ok(tables) if !lists_table(&tables, alias) => Ok(None),
+        Ok(_) => Err(format!("{failed}, and pfctl -sTables lists {}: the table is loaded and did not read", alias.name())),
+        Err(e) => Err(format!("{failed}, and whether pf has the table loaded could not be read: {e}")),
     }
+}
+
+fn listed(r: &mut dyn Runner, alias: Alias, cidr: &Cidr) -> Result<bool, String> {
+    Ok(shown(r, alias, cidr)?.unwrap_or(false))
 }
 
 fn ran(what: &str, out: Result<Output, hemostat_sensor_freebsd::tools::RunError>) -> Result<Output, String> {
@@ -105,14 +115,14 @@ pub fn refuse_while_booting(booting: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn refuse_duplicate(j: &Journals, alias: Alias, cidr: &Cidr) -> Result<(), String> {
+pub fn refuse_duplicate(j: &Journals, alias: Alias, cidr: &Cidr, follow: &str) -> Result<(), String> {
     let (entries, bad) = j.scan();
     if let Some(e) = journal::open_block(&entries, alias, cidr) {
         let id = &e.intent.id;
         return Err(format!(
             "{cidr} in {} already has HEMOSTAT block {id} ({}). One HEMOSTAT block per CIDR, so replay \
-             can always tell whose entry it is: `hemostat fw confirm {id} --arm` keeps that one, `hemostat \
-             undo {id}` lifts it",
+             can always tell whose entry it is: `hemostat fw confirm {id} --arm{follow}` keeps that one, \
+             `hemostat undo {id}{follow}` lifts it",
             alias.name(),
             e.state().token()
         ));
@@ -140,6 +150,7 @@ pub fn apply(
     allowed: Allowed,
     mut intent: Intent,
     config: &Config,
+    follow: &str,
 ) -> Result<Applied, String> {
     let (alias, cidr) = (intent.alias, intent.cidr);
     let table = in_table(r, alias, &cidr)?;
@@ -147,7 +158,7 @@ pub fn apply(
         InConfig::Unknown(why) => return Err(format!("config.xml's alias could not be read: {why}")),
         c => c,
     };
-    refuse_duplicate(j, alias, &cidr)?;
+    refuse_duplicate(j, alias, &cidr, follow)?;
     intent.existed = table || conf != InConfig::Absent;
     let id = intent.id.clone();
     j.begin(&intent)?;
@@ -182,16 +193,19 @@ pub fn apply(
 }
 
 pub fn facts(r: &mut dyn Runner, alias: Alias, cidr: &Cidr, config: &Result<Config, String>) -> Result<Facts, String> {
-    Ok(Facts {
-        in_table: listed(r, alias, cidr)?,
-        config: match config {
-            Ok(c) => journal::in_config(c, alias, cidr),
-            Err(why) => InConfig::Unknown(why.clone()),
-        },
-    })
+    Ok(loaded_facts(r, alias, cidr, config)?.0)
 }
 
-pub fn held(config: &Result<Config, String>, e: &journal::Entry) -> Option<String> {
+fn loaded_facts(r: &mut dyn Runner, alias: Alias, cidr: &Cidr, config: &Result<Config, String>) -> Result<(Facts, bool), String> {
+    let table = shown(r, alias, cidr)?;
+    let config = match config {
+        Ok(c) => journal::in_config(c, alias, cidr),
+        Err(why) => InConfig::Unknown(why.clone()),
+    };
+    Ok((Facts { in_table: table.unwrap_or(false), config }, table.is_some()))
+}
+
+pub fn held(config: &Result<Config, String>, e: &journal::Entry, follow: &str) -> Option<String> {
     let (alias, cidr, id) = (e.intent.alias.name(), e.intent.cidr, &e.intent.id);
     let found = match config {
         Ok(c) => journal::in_config(c, e.intent.alias, &cidr),
@@ -201,7 +215,8 @@ pub fn held(config: &Result<Config, String>, e: &journal::Entry) -> Option<Strin
         InConfig::Absent => None,
         InConfig::Present(d) if d == e.marker() => Some(format!(
             "config.xml holds {cidr} in {alias} under {d:?}, so the block is persistent: it outlives filter \
-             reloads, reboots and its deadline, and the watcher does not lift it. `hemostat undo {id}` lifts it"
+             reloads, reboots and its deadline, and the watcher does not lift it. `hemostat undo {id}{follow}` \
+             lifts it"
         )),
         InConfig::Present(d) => Some(format!(
             "config.xml lists {cidr} in {alias} under {d:?}, not HEMOSTAT's marker, so neither the watcher nor \
@@ -209,8 +224,8 @@ pub fn held(config: &Result<Config, String>, e: &journal::Entry) -> Option<Strin
         )),
         InConfig::Unknown(why) => Some(format!(
             "config.xml could not be read to show it does not hold {cidr} ({why}), and until it can the watcher \
-             does not lift the block. `hemostat fw status` shows pf's table; `hemostat undo {id}` lifts it once \
-             config.xml reads"
+             does not lift the block. `hemostat fw status{follow}` shows pf's table; `hemostat undo {id}{follow}` \
+             lifts it once config.xml reads"
         )),
     }
 }
@@ -245,8 +260,8 @@ impl Unconfirmed {
     }
 }
 
-fn left(j: &Journals, e: &journal::Entry, step: &str, why: String, config: &Result<Config, String>) -> Unconfirmed {
-    match held(config, e) {
+fn left(j: &Journals, e: &journal::Entry, step: &str, why: String, config: &Result<Config, String>, follow: &str) -> Unconfirmed {
+    match held(config, e, follow) {
         None => Unconfirmed::Live(why),
         Some(h) => {
             let _ = j.append(&e.intent.id, "note", &[("what", format!("confirm stopped at {step}: {h}"))]);
@@ -261,11 +276,12 @@ pub fn would_confirm(
     id: &str,
     now: u64,
     read_config: &dyn Fn() -> Result<Config, String>,
+    follow: &str,
 ) -> Result<Option<String>, Unconfirmed> {
     let mut ro = crate::cmd::ReadOnly::new(r);
     let e = j.read(id).map_err(Unconfirmed::Held)?;
     let config = read_config();
-    let refused = |why: String| match held(&config, &e) {
+    let refused = |why: String| match held(&config, &e, follow) {
         None => Unconfirmed::Live(why),
         Some(h) => Unconfirmed::Held(format!("{why}. {h}")),
     };
@@ -277,6 +293,7 @@ pub fn would_confirm(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn confirm(
     r: &mut dyn Runner,
     j: &Journals,
@@ -285,26 +302,27 @@ pub fn confirm(
     read_config: &dyn Fn() -> Result<Config, String>,
     seal: &mut dyn FnMut() -> Result<(), String>,
     verified: &[String],
+    follow: &str,
 ) -> Result<Confirmed, Unconfirmed> {
     let e = j.read(id).map_err(|why| {
         Unconfirmed::Held(format!(
             "{why}. The journal did not read, so neither the watcher nor `undo` can act on this block from it: \
-             `hemostat fw status` shows what pf's table holds"
+             `hemostat fw status{follow}` shows what pf's table holds"
         ))
     })?;
     let (alias, cidr) = (e.intent.alias, e.intent.cidr);
 
     let config = read_config();
-    let f = facts(r, alias, &cidr, &config).map_err(|why| left(j, &e, "facts", why, &config))?;
+    let f = facts(r, alias, &cidr, &config).map_err(|why| left(j, &e, "facts", why, &config, follow))?;
     let k = match journal::judge_confirm(&e, &f, now) {
         Confirm::Go(k) => k,
         Confirm::Already(rev) => return Ok(Confirmed::Already(rev)),
-        Confirm::Refused(why) => return Err(left(j, &e, "judge", why, &config)),
+        Confirm::Refused(why) => return Err(left(j, &e, "judge", why, &config, follow)),
     };
 
     let fail = |step: &str, why: String| -> Unconfirmed {
         let _ = j.append(id, "failed", &[("step", step.to_string()), ("why", why.clone())]);
-        left(j, &e, step, why, &read_config())
+        left(j, &e, step, why, &read_config(), follow)
     };
     seal().map_err(|why| fail("seal", format!("the evidence could not be sealed, so nothing was written: {why}")))?;
     let w = WriteCommand::confirm(&k);
@@ -346,6 +364,8 @@ pub enum Lifted {
     Done {
 
         config: bool,
+
+        table: bool,
     },
 
     Covered,
@@ -355,6 +375,7 @@ pub enum Lifted {
     Nothing(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn lift(
     r: &mut dyn Runner,
     j: &Journals,
@@ -363,6 +384,7 @@ pub fn lift(
     config_writes: bool,
     read_config: &dyn Fn() -> Result<Config, String>,
     seal: &mut dyn FnMut() -> Result<(), String>,
+    follow: &str,
 ) -> Result<Lifted, String> {
     let e = j.read(id)?;
     let (alias, cidr) = (e.intent.alias, e.intent.cidr);
@@ -371,7 +393,7 @@ pub fn lift(
         why
     };
 
-    let f = facts(r, alias, &cidr, &read_config()).map_err(|why| fail("facts", why))?;
+    let (f, loaded) = loaded_facts(r, alias, &cidr, &read_config()).map_err(|why| fail("facts", why))?;
     let rep = match journal::judge_lift(&e, &f) {
         Judged::Lift(rep) => rep,
         Judged::Leave(why) => return Ok(Lifted::Left(why)),
@@ -388,7 +410,7 @@ pub fn lift(
         if !config_writes {
             return Ok(Lifted::Left(format!(
                 "config.xml holds {cidr} under {:?}: a confirm wrote it, so it is not the watcher's to lift. \
-                 `hemostat undo {id}` lifts it",
+                 `hemostat undo {id}{follow}` lifts it",
                 e.marker()
             )));
         }
@@ -402,21 +424,40 @@ pub fn lift(
         }
     }
 
-    if listed(r, alias, &cidr).map_err(|why| fail("delete", why))? {
-        let w = WriteCommand::lift(&rep);
-        let what = w.describe().to_string();
-        ran(&what, w.run(r)).map_err(|why| fail("delete", why))?;
-    }
+    let table = match shown(r, alias, &cidr).map_err(|why| fail("delete", why))? {
+        Some(true) => {
+            let w = WriteCommand::lift(&rep);
+            let what = w.describe().to_string();
+            ran(&what, w.run(r)).map_err(|why| fail("delete", why))?;
+            true
+        }
+        Some(false) | None => loaded,
+    };
     if listed(r, alias, &cidr).map_err(|why| fail("prove", why))? {
         return Err(fail("prove", format!("-T show still lists {cidr} after the delete")));
     }
     let covered = tests(r, alias, &cidr).map_err(|why| fail("prove", why))?;
     j.append(id, "lifted", &[("by", by.to_string())])?;
+    if !table {
+        let _ = j.append(id, "note", &[("what", unloaded(alias, &cidr, rep.config()))]);
+    }
     if covered {
         let _ = j.append(id, "note", &[("what", format!("-T test {} still matches after the lift: another entry in {} covers it", test_address(&cidr), alias.name()))]);
         return Ok(Lifted::Covered);
     }
-    Ok(Lifted::Done { config: rep.config() })
+    Ok(Lifted::Done { config: rep.config(), table })
+}
+
+pub fn unloaded(alias: Alias, cidr: &Cidr, config: bool) -> String {
+    let name = alias.name();
+    if config {
+        format!(
+            "pf had no table {name} loaded (its rule disabled or deleted), so there was nothing in pf to delete; \
+             {cidr} is out of config.xml's {name}, so the rule loads the alias without it once it is back"
+        )
+    } else {
+        format!("pf had no table {name} loaded any more (its rule disabled or deleted), so nothing of {cidr} was left in pf to delete")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

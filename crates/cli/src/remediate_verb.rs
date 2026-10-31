@@ -680,7 +680,9 @@ pub(crate) fn undo_verb(positional: &[&str], args: &[String], json: bool) -> u8 
             return EXIT_FAILED;
         }
     };
-    let records = match journal::decode(&text) {
+
+    let (whole, torn) = journal::split_torn(&text);
+    let records = match journal::decode(whole) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("hemostat undo: refusing to replay {path}: {e}");
@@ -703,6 +705,20 @@ pub(crate) fn undo_verb(positional: &[&str], args: &[String], json: bool) -> u8 
     let mut failed = 0usize;
     let mut rows: Vec<String> = Vec::new();
     let mut outcomes: Vec<String> = Vec::new();
+
+    if let Some(cut) = torn {
+        let was = format!("{cut:?}");
+        let msg = "the journal's last line was cut off as it was written (a full disk, or the run \
+                   killed mid-write), so it is not replayed. If it records an action, that action \
+                   is not undone: read it and undo it by hand";
+        eprintln!("hemostat undo: WARNING: {msg}: {was}");
+        refused += 1;
+        outcomes.push(format!("refused\t{was}\t{msg}"));
+        if json {
+            rows.push(format!("{{\"state\":\"refused\",\"was\":\"{}\",\"detail\":\"{}\"}}", jesc(&was), jesc(msg)));
+        }
+    }
+    let mut undone = Vec::new();
     for rec in records.iter().rev() {
         let outcome = undo_with(rec, &opts, auth);
         let (state, msg) = match &outcome {
@@ -712,7 +728,10 @@ pub(crate) fn undo_verb(positional: &[&str], args: &[String], json: bool) -> u8 
             Outcome::Failed(f) => ("failed", f.reason.clone()),
         };
         match &outcome {
-            Outcome::Applied(_) => ok += 1,
+            Outcome::Applied(_) => {
+                ok += 1;
+                undone.push(&rec.undo);
+            }
 
             Outcome::Planned(_) | Outcome::Refused(_) => refused += 1,
             Outcome::Failed(_) => failed += 1,
@@ -728,21 +747,98 @@ pub(crate) fn undo_verb(positional: &[&str], args: &[String], json: bool) -> u8 
         }
     }
 
+    let (systemd, udev) = stale_after_undo(undone);
+    let reload = reload_after_undo(systemd, udev);
+    match &reload {
+        Ok(Some(note)) => outcomes.push(format!("reloaded\treload\t{note}")),
+        Err(why) => outcomes.push(format!("failed\treload\t{why}")),
+        Ok(None) => {}
+    }
+    let reload_failed = reload.is_err();
+
     let recorded = record_replay(path, &outcomes);
     let bad = refused + failed;
 
     if json {
-        jprintln!("{{\"journal\":\"{}\",\"undone\":{ok},\"problems\":{bad},\"items\":[{}]}}", jesc(path), rows.join(","));
+        let note = match &reload {
+            Ok(n) => n.unwrap_or(""),
+            Err(why) => why.as_str(),
+        };
+        jprintln!(
+            "{{\"journal\":\"{}\",\"undone\":{ok},\"problems\":{bad},\"reload_failed\":{reload_failed},\"reload\":\"{}\",\"items\":[{}]}}",
+            jesc(path), jesc(note), rows.join(",")
+        );
     } else {
+        match &reload {
+            Ok(Some(note)) => println!("  [reloaded] {note}"),
+            Err(why) => println!("  [failed] {why}"),
+            Ok(None) => {}
+        }
         println!("\n  {ok} undone · {bad} not undone");
-        if bad == 0 {
+        if bad == 0 && !reload_failed {
             println!("  The journal has been fully replayed; it can be archived with the case.");
         }
     }
     if let Err(why) = &recorded {
         eprintln!("hemostat undo: the replay was not recorded: {why}");
     }
-    undo_exit(failed, refused, recorded.is_ok())
+
+    undo_exit(failed + usize::from(reload_failed), refused, recorded.is_ok())
+}
+
+#[cfg(target_os = "linux")]
+fn reload_after_undo(touched_systemd: bool, touched_udev: bool) -> Result<Option<&'static str>, String> {
+    let mut not: Vec<String> = Vec::new();
+    if touched_udev {
+        if let Err(e) = hemostat_enforce_linux::udev_reload() {
+            not.push(format!(
+                "udev was NOT reloaded ({e}) — run `udevadm control --reload-rules`, or the \
+                 restored rules are not the ones it runs"
+            ));
+        }
+    }
+    if touched_systemd {
+        if let Err(e) = hemostat_enforce_linux::daemon_reload() {
+            not.push(format!(
+                "systemd was NOT reloaded ({e}) — run `systemctl daemon-reload` by hand, or \
+                 the restored units are not the ones it runs"
+            ));
+        }
+    }
+    if !not.is_empty() {
+        return Err(not.join("; "));
+    }
+    Ok(match (touched_systemd, touched_udev) {
+        (false, false) => None,
+        (true, false) => Some("systemd reloaded"),
+        (false, true) => Some("udev reloaded"),
+        (true, true) => Some("systemd and udev reloaded"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn undone_path(kind: &hemostat_enforce_linux::UndoKind) -> Option<&std::path::Path> {
+    use hemostat_enforce_linux::UndoKind as K;
+    match kind {
+        K::RestoreFile { original, .. }
+        | K::RestoreUnit { original, .. }
+        | K::RestoreStripped { original, .. }
+        | K::RestoreAnchor { original, .. }
+        | K::RestoreBootParams { original, .. }
+        | K::RemoveCreatedFile { original, .. } => Some(original),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stale_after_undo<'a>(
+    undone: impl IntoIterator<Item = &'a hemostat_enforce_linux::UndoKind>,
+) -> (bool, bool) {
+    undone
+        .into_iter()
+        .filter_map(undone_path)
+        .map(reload_needed_for)
+        .fold((false, false), |(s, u), (s2, u2)| (s || s2, u || u2))
 }
 
 fn undo_exit(failed: usize, refused: usize, recorded: bool) -> u8 {
@@ -891,7 +987,7 @@ pub(crate) fn append_record(f: Option<&mut std::fs::File>, rec: &hemostat_enforc
     use hemostat_enforce_linux::{journal, DEFAULT_VAULT};
     use std::io::Write as _;
     let Some(f) = f else { return true };
-    match f.write_all(journal::line(rec).as_bytes()).and_then(|()| f.flush()) {
+    match f.write_all(journal::line(rec).as_bytes()).and_then(|()| f.flush()).and_then(|()| f.sync_data()) {
         Ok(()) => true,
         Err(e) => {
             eprintln!(
@@ -904,7 +1000,7 @@ pub(crate) fn append_record(f: Option<&mut std::fs::File>, rec: &hemostat_enforc
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "mod-enf-persistence"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn reload_needed_for(path: &std::path::Path) -> (bool, bool) {
     let p = path.to_string_lossy();
     (p.contains("/systemd/"), p.contains("/udev/rules.d/"))

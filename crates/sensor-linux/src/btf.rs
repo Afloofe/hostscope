@@ -279,6 +279,8 @@ pub fn member_offset(buf: &[u8], structure: &str, member: &str) -> Result<u32, N
 }
 
 pub fn vmlinux() -> Result<Vec<u8>, i32> {
-    std::fs::read("/sys/kernel/btf/vmlinux")
-        .map_err(|e| e.raw_os_error().unwrap_or(libc::ENOENT))
+    crate::saferead::read_kernel_bytes("/sys/kernel/btf/vmlinux").map_err(|e| {
+        e.raw_os_error()
+            .unwrap_or(if e.kind() == std::io::ErrorKind::NotFound { libc::ENOENT } else { libc::EINVAL })
+    })
 }

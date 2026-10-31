@@ -86,7 +86,7 @@ fn parse_table_names(text: &str) -> Vec<String> {
 }
 
 fn legacy_tables() -> Result<Vec<String>, String> {
-    match std::fs::read_to_string("/proc/net/ip_tables_names") {
+    match crate::saferead::read_kernel_text("/proc/net/ip_tables_names") {
         Ok(text) => Ok(parse_table_names(&text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!(

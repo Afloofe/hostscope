@@ -8,7 +8,7 @@ use crate::outcome::{
     ApplyOptions, Failure, Outcome, Plan, RefuseCause, Refusal, UndoKind, UndoRecord,
 };
 use crate::paths::{
-    path_refusal, resolve_tool, run_tool,
+    path_refusal, resolve_tool, run_tool_within, unit_active, TOOL_LIMIT,
 };
 
 fn undo_restore_mode(path: &Path, mode: u32, opts: &ApplyOptions) -> Outcome {
@@ -209,8 +209,20 @@ fn undo_unlock_account(
         });
     }
 
-    let out = match std::process::Command::new(&usermod).args(&args).env_clear().output() {
-        Ok(o) => o,
+    let mut cmd = std::process::Command::new(&usermod);
+    cmd.args(&args).env_clear();
+    let out = match hemostat_sensor_linux::sshd::output_within(&mut cmd, std::process::Stdio::null(), TOOL_LIMIT) {
+        Ok(Some(o)) => o,
+        Ok(None) => {
+            return Outcome::Failed(Failure {
+                action: format!("unlock {user}"),
+                reason: format!(
+                    "usermod had not finished after {} seconds and was stopped, so what it changed \
+                     is not known: read `{user}` back with `passwd -S {user}` and `getent passwd {user}`",
+                    TOOL_LIMIT.as_secs()
+                ),
+            })
+        }
         Err(e) => {
             return Outcome::Failed(Failure {
                 action: format!("unlock {user}"),
@@ -409,7 +421,13 @@ fn undo_restore_sysctl(was: &[(String, String)], opts: &ApplyOptions) -> Outcome
     }
 
     let keys: Vec<&str> = was.iter().map(|(k, _)| k.as_str()).collect();
-    let persist_note = match sysctlpolicy::unpersist(&keys) {
+    sysctl_restored(&restored, &problems, sysctlpolicy::unpersist(&keys))
+}
+
+pub(crate) fn sysctl_restored(restored: &[String], problems: &[String], unpersisted: Result<(), String>) -> Outcome {
+    use hemostat_sensor_linux::sysctlpolicy;
+
+    let persist_note = match unpersisted {
         Ok(()) => String::new(),
         Err(e) => format!(
             " — but the boot-time record could NOT be cleared ({e}), so these values come \
@@ -423,14 +441,25 @@ fn undo_restore_sysctl(was: &[(String, String)], opts: &ApplyOptions) -> Outcome
             reason: format!("{}{persist_note}", problems.join("; ")),
         });
     }
-    let partial = if problems.is_empty() {
-        String::new()
-    } else {
-        format!(" — {} key(s) did NOT go back: {}", problems.len(), problems.join("; "))
-    };
+    if !problems.is_empty() || !persist_note.is_empty() {
+        let cleared = if persist_note.is_empty() {
+            format!(" and cleared their line(s) from {}", sysctlpolicy::DROP_IN)
+        } else {
+            String::new()
+        };
+        let partial = if problems.is_empty() {
+            String::new()
+        } else {
+            format!(" — {} key(s) did NOT go back: {}", problems.len(), problems.join("; "))
+        };
+        return Outcome::Failed(Failure {
+            action: "restore kernel tunables".into(),
+            reason: format!("restored {}{cleared}{partial}{persist_note}", restored.join(", ")),
+        });
+    }
     Outcome::Applied(UndoRecord {
         did: format!(
-            "restored {} and cleared their line(s) from {}{partial}{persist_note}",
+            "restored {} and cleared their line(s) from {}",
             restored.join(", "),
             sysctlpolicy::DROP_IN
         ),
@@ -455,11 +484,43 @@ fn vault_of(kind: &UndoKind) -> Option<&Path> {
 }
 
 fn inside_vault(vault: &Path, vault_dir: &Path) -> bool {
+    in_vault_dir(vault, vault_dir) && std::fs::symlink_metadata(vault).is_ok_and(|m| m.is_file())
+}
+
+fn in_vault_dir(vault: &Path, vault_dir: &Path) -> bool {
     let (Ok(dir), Some(parent)) = (std::fs::canonicalize(vault_dir), vault.parent()) else {
         return false;
     };
     std::fs::canonicalize(parent).is_ok_and(|p| p.starts_with(&dir))
-        && std::fs::symlink_metadata(vault).is_ok_and(|m| m.is_file())
+}
+
+fn vault_refusal(did: &str, vault: &Path, vault_dir: &Path) -> Refusal {
+    let gone = in_vault_dir(vault, vault_dir)
+        && std::fs::symlink_metadata(vault).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    if gone {
+        return Refusal {
+            action: did.to_string(),
+            cause: RefuseCause::InvalidTarget("the vault copy is gone".into()),
+            message: format!(
+                "refused: this record restores from {}, which is not there any more — the vault \
+                 was cleared, the copy was removed, or the journal is another run's. Nothing was \
+                 changed",
+                vault.display()
+            ),
+            suggested_alternative: None,
+        };
+    }
+    Refusal {
+        action: did.to_string(),
+        cause: RefuseCause::InvalidTarget("the vault copy is outside the vault".into()),
+        message: format!(
+            "refused: this record restores from {}, which is not a file inside the vault \
+             {}. A journal entry pointing elsewhere was not written by this tool",
+            vault.display(),
+            vault_dir.display()
+        ),
+        suggested_alternative: None,
+    }
 }
 
 pub fn undo(record: &UndoRecord, opts: &ApplyOptions) -> Outcome {
@@ -469,17 +530,7 @@ pub fn undo(record: &UndoRecord, opts: &ApplyOptions) -> Outcome {
 pub fn undo_with(record: &UndoRecord, opts: &ApplyOptions, allow_auth: bool) -> Outcome {
     if let Some(vault) = vault_of(&record.undo) {
         if !inside_vault(vault, &opts.vault_dir) {
-            return Outcome::Refused(Refusal {
-                action: record.did.clone(),
-                cause: RefuseCause::InvalidTarget("the vault copy is outside the vault".into()),
-                message: format!(
-                    "refused: this record restores from {}, which is not a file inside the vault \
-                     {}. A journal entry pointing elsewhere was not written by this tool",
-                    vault.display(),
-                    opts.vault_dir.display()
-                ),
-                suggested_alternative: None,
-            });
+            return Outcome::Refused(vault_refusal(&record.did, vault, &opts.vault_dir));
         }
     }
     match &record.undo {
@@ -671,41 +722,7 @@ pub fn undo_with(record: &UndoRecord, opts: &ApplyOptions, allow_auth: bool) -> 
                     reason: "systemctl not found".into(),
                 });
             };
-            if let Err(reason) = run_tool(&systemctl, &["unmask", unit]) {
-                return Outcome::Failed(Failure { action: format!("unmask {unit}"), reason });
-            }
-
-            let applied = |did: String| {
-                Outcome::Applied(UndoRecord {
-                    did,
-                    undo: UndoKind::Irreversible { note: "unmask is the undo".into() },
-                    reversible: false,
-                })
-            };
-            match was_active {
-                Some(false) => applied(format!(
-                    "unmasked unit `{unit}` — it was not running when it was masked, so it was \
-                     not started"
-                )),
-                None => Outcome::Failed(Failure {
-                    action: format!("restart {unit}"),
-                    reason: format!(
-                        "`{unit}` was unmasked, but this journal does not record whether it was \
-                         running when it was masked, so it is still stopped. `systemctl start \
-                         {unit}` if it should be running"
-                    ),
-                }),
-                Some(true) => match run_tool(&systemctl, &["start", unit]) {
-                    Ok(()) => applied(format!("unmasked and started unit `{unit}`")),
-                    Err(reason) => Outcome::Failed(Failure {
-                        action: format!("restart {unit}"),
-                        reason: format!(
-                            "`{unit}` was unmasked, but `systemctl start {unit}` failed \
-                             ({reason}); it is still stopped"
-                        ),
-                    }),
-                },
-            }
+            undo_unmask_service(&systemctl, unit, *was_active, TOOL_LIMIT)
         }
         UndoKind::RestoreServiceState { unit, was_enabled, was_active } => {
 
@@ -750,22 +767,7 @@ pub fn undo_with(record: &UndoRecord, opts: &ApplyOptions, allow_auth: bool) -> 
                     reason: "systemctl not found".into(),
                 });
             };
-
-            if disable {
-                if let Err(reason) = run_tool(&systemctl, &["disable", unit]) {
-                    return Outcome::Failed(Failure { action: format!("disable {unit}"), reason });
-                }
-            }
-            if stop {
-                if let Err(reason) = run_tool(&systemctl, &["stop", unit]) {
-                    return Outcome::Failed(Failure { action: format!("stop {unit}"), reason });
-                }
-            }
-            Outcome::Applied(UndoRecord {
-                did: format!("restored `{unit}` to its prior state"),
-                undo: UndoKind::Irreversible { note: "re-run the start to re-apply".into() },
-                reversible: false,
-            })
+            undo_restore_service_state(&systemctl, unit, disable, stop, TOOL_LIMIT)
         }
         UndoKind::RestoreFile { vault, original, moved } => {
             if let Some(r) = restore_refusal(vault, original, *moved) {
@@ -834,36 +836,133 @@ pub fn undo_with(record: &UndoRecord, opts: &ApplyOptions, allow_auth: bool) -> 
                     ),
                 });
             };
-
-            if let Err(reason) = run_tool(&systemctl, &["daemon-reload"]) {
-                return Outcome::Failed(Failure {
-                    action: format!("re-enable {unit}"),
-                    reason: format!(
-                        "{} was restored, but `systemctl daemon-reload` failed ({reason}), so \
-                         `{unit}` is still disabled and stopped.",
-                        original.display()
-                    ),
-                });
-            }
-            match run_tool(&systemctl, &["enable", "--now", unit]) {
-                Ok(()) => Outcome::Applied(UndoRecord {
-                    did: format!(
-                        "restored {} and re-enabled `{unit}`",
-                        original.display()
-                    ),
-                    undo: UndoKind::Irreversible { note: "restore is the undo".into() },
-                    reversible: false,
-                }),
-                Err(reason) => Outcome::Failed(Failure {
-                    action: format!("re-enable {unit}"),
-                    reason: format!(
-                        "{} was restored, but `systemctl enable --now {unit}` failed ({reason}); \
-                         the unit is on disk and still stopped.",
-                        original.display()
-                    ),
-                }),
-            }
+            undo_reenable_unit(&systemctl, unit, original, TOOL_LIMIT)
         }
+    }
+}
+
+pub(crate) fn undo_unmask_service(
+    systemctl: &Path,
+    unit: &str,
+    was_active: Option<bool>,
+    limit: std::time::Duration,
+) -> Outcome {
+    if let Err(reason) = run_tool_within(systemctl, &["unmask", unit], limit) {
+        return Outcome::Failed(Failure { action: format!("unmask {unit}"), reason });
+    }
+
+    let applied = |did: String| {
+        Outcome::Applied(UndoRecord {
+            did,
+            undo: UndoKind::Irreversible { note: "unmask is the undo".into() },
+            reversible: false,
+        })
+    };
+    match was_active {
+        Some(false) => applied(format!(
+            "unmasked unit `{unit}` — it was not running when it was masked, so it was \
+             not started"
+        )),
+        None => Outcome::Failed(Failure {
+            action: format!("restart {unit}"),
+            reason: format!(
+                "`{unit}` was unmasked, but this journal does not record whether it was \
+                 running when it was masked, so it is still stopped. `systemctl start \
+                 {unit}` if it should be running"
+            ),
+        }),
+
+        Some(true) => match run_tool_within(systemctl, &["start", unit], limit) {
+            Ok(()) if unit_active(systemctl, unit, limit) => {
+                applied(format!("unmasked and started unit `{unit}`"))
+            }
+            Ok(()) => Outcome::Failed(Failure {
+                action: format!("restart {unit}"),
+                reason: format!(
+                    "`{unit}` was unmasked and `systemctl start {unit}` returned success, but \
+                     the unit is not active — it failed to start (see `journalctl -xeu {unit}`)"
+                ),
+            }),
+            Err(reason) => Outcome::Failed(Failure {
+                action: format!("restart {unit}"),
+                reason: format!(
+                    "`{unit}` was unmasked, but `systemctl start {unit}` failed \
+                     ({reason}); it is not running"
+                ),
+            }),
+        },
+    }
+}
+
+pub(crate) fn undo_restore_service_state(
+    systemctl: &Path,
+    unit: &str,
+    disable: bool,
+    stop: bool,
+    limit: std::time::Duration,
+) -> Outcome {
+
+    if disable {
+        if let Err(reason) = run_tool_within(systemctl, &["disable", unit], limit) {
+            return Outcome::Failed(Failure { action: format!("disable {unit}"), reason });
+        }
+    }
+    if stop {
+        if let Err(reason) = run_tool_within(systemctl, &["stop", unit], limit) {
+            return Outcome::Failed(Failure { action: format!("stop {unit}"), reason });
+        }
+    }
+    Outcome::Applied(UndoRecord {
+        did: format!("restored `{unit}` to its prior state"),
+        undo: UndoKind::Irreversible { note: "re-run the start to re-apply".into() },
+        reversible: false,
+    })
+}
+
+pub(crate) fn undo_reenable_unit(
+    systemctl: &Path,
+    unit: &str,
+    original: &Path,
+    limit: std::time::Duration,
+) -> Outcome {
+
+    if let Err(reason) = run_tool_within(systemctl, &["daemon-reload"], limit) {
+        return Outcome::Failed(Failure {
+            action: format!("re-enable {unit}"),
+            reason: format!(
+                "{} was restored, but `systemctl daemon-reload` failed ({reason}), so \
+                 `{unit}` is still disabled and stopped.",
+                original.display()
+            ),
+        });
+    }
+    match run_tool_within(systemctl, &["enable", "--now", unit], limit) {
+
+        Ok(()) if unit_active(systemctl, unit, limit) => Outcome::Applied(UndoRecord {
+            did: format!(
+                "restored {} and re-enabled `{unit}`",
+                original.display()
+            ),
+            undo: UndoKind::Irreversible { note: "restore is the undo".into() },
+            reversible: false,
+        }),
+        Ok(()) => Outcome::Failed(Failure {
+            action: format!("re-enable {unit}"),
+            reason: format!(
+                "{} was restored and `systemctl enable --now {unit}` returned success, but the \
+                 unit is not active: it failed to start, or it is a oneshot that has already run \
+                 (see `systemctl status {unit}`)",
+                original.display()
+            ),
+        }),
+        Err(reason) => Outcome::Failed(Failure {
+            action: format!("re-enable {unit}"),
+            reason: format!(
+                "{} was restored, but `systemctl enable --now {unit}` failed ({reason}); \
+                 the unit is on disk and not running.",
+                original.display()
+            ),
+        }),
     }
 }
 

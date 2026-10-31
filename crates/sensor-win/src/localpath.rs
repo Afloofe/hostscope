@@ -240,6 +240,23 @@ pub fn open(path: &str) -> Result<std::fs::File, String> {
 }
 
 #[cfg(target_os = "windows")]
+pub fn link_count(f: &std::fs::File) -> Result<u32, u32> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { core::mem::zeroed() };
+
+    if unsafe { GetFileInformationByHandle(f.as_raw_handle(), core::ptr::addr_of_mut!(info)) } == 0 {
+
+        return Err(unsafe { GetLastError() });
+    }
+    Ok(info.nNumberOfLinks)
+}
+
+#[cfg(target_os = "windows")]
 pub fn fixed_drives() -> Vec<(char, String)> {
     use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
 

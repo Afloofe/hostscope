@@ -256,7 +256,7 @@ pub fn declared_exec_paths(declared: &[Declared]) -> Result<Vec<(String, PathBuf
 
 fn init_other_than_systemd() -> Option<String> {
     crate::enablement::other_init(
-        fs::read_to_string("/proc/1/comm").ok().as_deref(),
+        crate::saferead::read_pid_text("/proc/1/comm").ok().as_deref(),
         fs::read_link("/proc/1/exe").ok().as_deref(),
         Path::new("/run/systemd/system").is_dir(),
     )

@@ -198,17 +198,41 @@ pub fn apply(
             prefer_instead: None,
         });
     }
+    install_at(name, k, supplied, &bytes, Path::new(k.install_to), &opts.vault_dir)
+}
 
-    let dest = Path::new(k.install_to);
+fn install_at(
+    name: &str,
+    k: &Known,
+    supplied: &Supplied,
+    bytes: &[u8],
+    dest: &Path,
+    vault_dir: &Path,
+) -> crate::Outcome {
+    let kept = match crate::strip::snapshot(dest, bytes, vault_dir) {
+        Ok(v) => v,
+        Err(why) => {
+            return crate::Outcome::Failed(crate::Failure {
+                action: format!("install the {name} sidecar"),
+                reason: format!("{why}, so there would be no undo. Nothing was installed"),
+            })
+        }
+    };
+
+    let unkeep = || {
+        let _ = std::fs::remove_file(&kept);
+    };
     if let Some(parent) = dest.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
+            unkeep();
             return crate::Outcome::Failed(crate::Failure {
                 action: format!("install the {name} sidecar"),
                 reason: format!("could not create {}: {e}", parent.display()),
             });
         }
     }
-    if let Err(e) = std::fs::write(dest, &bytes) {
+    if let Err(e) = std::fs::write(dest, bytes) {
+        unkeep();
         return crate::Outcome::Failed(crate::Failure {
             action: format!("install the {name} sidecar"),
             reason: format!("could not write {}: {e}", dest.display()),
@@ -219,6 +243,7 @@ pub fn apply(
     {
         use std::os::unix::fs::PermissionsExt as _;
         if let Err(e) = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)) {
+            unkeep();
             return crate::Outcome::Failed(crate::Failure {
                 action: format!("install the {name} sidecar"),
                 reason: format!(
@@ -238,14 +263,11 @@ pub fn apply(
              to you, because a telemetry service that appears without anyone deciding to start \
              it is a change to the host nobody chose",
             k.name,
-            k.install_to,
+            dest.display(),
             bytes.len(),
             supplied.declared_sha256.to_lowercase()
         ),
-        undo: crate::UndoKind::RemoveCreatedFile {
-            vault: PathBuf::from(&supplied.path),
-            original: dest.to_path_buf(),
-        },
+        undo: crate::UndoKind::RemoveCreatedFile { vault: kept, original: dest.to_path_buf() },
         reversible: true,
     })
 }

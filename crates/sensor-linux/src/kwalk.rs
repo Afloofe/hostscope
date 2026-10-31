@@ -153,7 +153,7 @@ fn proc_pids() -> BTreeSet<u32> {
 }
 
 pub(crate) fn in_nested_pid_namespace() -> bool {
-    fs::read_to_string("/proc/self/status")
+    crate::saferead::read_pid_text("/proc/self/status")
         .ok()
         .and_then(|s| {
             s.lines()
@@ -180,7 +180,7 @@ fn kallsyms_module_tags(text: &str) -> BTreeSet<String> {
 }
 
 fn proc_module_names() -> Option<BTreeSet<String>> {
-    Some(module_names(&crate::kmod::name_key(&fs::read("/proc/modules").ok()?)))
+    Some(module_names(&crate::kmod::name_key(&crate::saferead::read_kernel_bytes("/proc/modules").ok()?)))
 }
 
 fn module_names(text: &str) -> BTreeSet<String> {
@@ -263,7 +263,7 @@ pub fn report() -> Report {
     let mut hidden_modules: Vec<String> = Vec::new();
     let mut gaps: Vec<String> = Vec::new();
 
-    let kallsyms_raw = match fs::read("/proc/kallsyms") {
+    let kallsyms_raw = match crate::saferead::read_kernel_bytes("/proc/kallsyms") {
         Ok(t) => t,
 
         Err(e) => return unavailable(&format!("/proc/kallsyms unreadable ({e})")),

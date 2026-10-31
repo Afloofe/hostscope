@@ -183,6 +183,19 @@ pub fn encode(records: &[UndoRecord]) -> String {
     out
 }
 
+pub fn split_torn(text: &str) -> (&str, Option<&str>) {
+    if text.ends_with('\n') {
+        return (text, None);
+    }
+    let Some((whole, torn)) = text.rfind('\n').and_then(|i| text.split_at_checked(i + 1)) else {
+        return (text, None);
+    };
+    if torn.trim().is_empty() || torn.starts_with('#') {
+        return (text, None);
+    }
+    (whole, Some(torn))
+}
+
 pub fn decode(text: &str) -> Result<Vec<UndoRecord>, String> {
     let mut out = Vec::new();
     for (n, line) in tsvjournal::records(text, HEADER, "an undo journal")? {

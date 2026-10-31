@@ -1309,6 +1309,17 @@ pub(crate) struct Recorded<'a> {
     pub(crate) gid: u32,
 }
 
+fn owner_moved(uid: u32, gid: u32, rec_uid: u32, rec_gid: u32) -> Option<String> {
+    (uid != rec_uid || gid != rec_gid).then(|| {
+        format!(
+            "it is owned by uid {uid} gid {gid} now, and the strip recorded uid {rec_uid} gid \
+             {rec_gid}: the account may have been removed and made again since. Putting the line \
+             back hands the file to the recorded owner, and an authorized_keys whose owner is not \
+             its account is one sshd refuses whole"
+        )
+    })
+}
+
 pub(crate) fn undo(rec: Recorded<'_>, opts: &ApplyOptions, allow_auth: bool) -> Outcome {
     let path = rec.original;
     let summary = format!("restore {} from the vault", path.display());
@@ -1360,6 +1371,10 @@ pub(crate) fn undo(rec: Recorded<'_>, opts: &ApplyOptions, allow_auth: bool) -> 
             rec.vault.display()
         ));
     }
+
+    if let Some(why) = owner_moved(r.md.uid(), r.md.gid(), rec.uid, rec.gid) {
+        return deny(format!("{why}. Nothing was written; the vault copy is {}", rec.vault.display()));
+    }
     if kind.is_auth() && !allow_auth {
         return deny(format!(
             "it is {}, and putting `{}` back into it is granting it again. That is never done from \
@@ -1387,8 +1402,34 @@ pub(crate) fn undo(rec: Recorded<'_>, opts: &ApplyOptions, allow_auth: bool) -> 
             prefer_instead: None,
         });
     }
+
+    let live_ok_before = validator.as_ref().map(|v| v.check_live().is_ok());
     if let Err(why) = replace(&r, &snap, meta, validator.as_ref(), &after) {
         return Outcome::Failed(Failure { action: summary, reason: format!("{why}; {} is unchanged", path.display()) });
+    }
+    if let (Some(v), Some(true)) = (&validator, live_ok_before) {
+        if let Err(e) = v.check_live() {
+            let left = Meta { mode: r.md.mode(), uid: r.md.uid(), gid: r.md.gid() };
+            let put_back = read_for_edit(path).and_then(|now| replace(&now, &r.bytes, left, None, &sha256(&snap)));
+            return Outcome::Failed(Failure {
+                action: summary,
+                reason: match put_back {
+                    Ok(()) => format!(
+                        "the whole configuration stopped parsing with the line back ({e}), so {} \
+                         was put back as the strip left it. Nothing was restored",
+                        path.display()
+                    ),
+                    Err(why) => format!(
+                        "the whole configuration stopped parsing with the line back ({e}) and \
+                         putting {} back as the strip left it FAILED ({why}). Take line {} `{}` \
+                         out again by hand NOW, or fix what it conflicts with",
+                        path.display(),
+                        loc.line_no,
+                        loc.text
+                    ),
+                },
+            });
+        }
     }
     Outcome::Applied(UndoRecord {
         did: format!(

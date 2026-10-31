@@ -196,7 +196,7 @@ mod verb {
     use hemostat_sensor_freebsd::{saferead, tools};
 
     use super::*;
-    use crate::freebsd_drift::{admit, open, prepare, seal};
+    use crate::freebsd_drift::{admit, open, prepare_in, seal};
     use crate::{EXIT_FAILED, EXIT_NOT_BUILT, EXIT_USAGE};
 
     fn read_file(path: &str) -> Result<Option<Vec<u8>>, String> {
@@ -261,13 +261,6 @@ mod verb {
             .map(|r| r.iter().take(4).map(|b| format!("{b:02x}")).collect())
             .unwrap_or_default();
         let dir = format!("{base}/{secs}-{tag}");
-        let prep = match prepare("fw rules", &dir) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("hemostat fw rules: DID NOT RUN — {}", h(&e));
-                return EXIT_FAILED;
-            }
-        };
         let open_file = |p: &std::path::Path| saferead::open_regular(p, saferead::NOT_REGULAR);
 
         let mpath = args.iter().position(|a| a == "--manifest").and_then(|i| args.get(i + 1)).map(String::as_str);
@@ -280,6 +273,13 @@ mod verb {
         };
         let mut sys = tools::System::new(loaded.as_ref());
         let _ = tools::renice_self(&mut sys, 10);
+        let prep = match prepare_in("fw rules", &dir, &mut sys) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("hemostat fw rules: DID NOT RUN — {}", h(&e));
+                return EXIT_FAILED;
+            }
+        };
         let mut collected = pfrules::collect(&mut sys, &mut read_file);
         match sys.verify(tools::Tool::Pfctl, &[]) {
             Ok(v) => collected.tools.push(("pfctl".into(), v.digest().map(|d| hex32(&d)).unwrap_or_default())),

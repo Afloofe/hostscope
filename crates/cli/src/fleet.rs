@@ -69,7 +69,7 @@ pub(crate) fn ship(args: &[String], json: bool) -> u8 {
 
 #[cfg(all(target_os = "linux", feature = "mod-collector"))]
 pub(crate) fn login() -> (Option<u32>, Option<u32>, String) {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let status = hemostat_sensor_linux::saferead::read_pid_text("/proc/self/status").unwrap_or_default();
     let ids: Vec<u32> = status
         .lines()
         .find_map(|l| l.strip_prefix("Uid:"))

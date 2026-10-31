@@ -161,7 +161,7 @@ pub fn report() -> Report {
 
     let Some((path, text)) = ENABLED_FUNCTIONS
         .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok().map(|t| (*p, t)))
+        .find_map(|p| crate::saferead::read_kernel_text(p).ok().map(|t| (*p, t)))
     else {
         return unavailable(
             "tracefs enabled_functions could not be read (tried /sys/kernel/tracing and \

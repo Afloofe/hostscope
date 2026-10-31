@@ -11,7 +11,7 @@ pub struct Report {
 }
 
 fn read_state(path: &str) -> std::io::Result<String> {
-    Ok(fs::read_to_string(path)?.trim().to_string())
+    Ok(crate::saferead::read_kernel_text(path)?.trim().to_string())
 }
 
 struct Knob {
@@ -137,7 +137,7 @@ fn unread_state(path: &str, e: &std::io::Error) -> (String, String) {
 }
 
 pub(crate) fn euid() -> Option<u32> {
-    parse_euid(&fs::read_to_string("/proc/self/status").ok()?)
+    parse_euid(&crate::saferead::read_pid_text("/proc/self/status").ok()?)
 }
 
 fn parse_euid(status: &str) -> Option<u32> {
@@ -158,7 +158,7 @@ fn kallsyms_readable() -> bool {
 }
 
 fn kcore_readable() -> bool {
-    fs::File::open("/proc/kcore").is_ok()
+    crate::saferead::open_kernel_file(std::path::Path::new("/proc/kcore")).is_ok()
 }
 
 fn tracefs_available() -> bool {
@@ -254,7 +254,7 @@ pub fn report() -> Report {
 
     let sb_var = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
     if fs::metadata("/sys/firmware/efi").is_ok() {
-        match fs::read(sb_var).ok().and_then(|b| b.last().copied()) {
+        match crate::saferead::read_kernel_bytes(sb_var).ok().and_then(|b| b.last().copied()) {
             Some(1) => f.push(Finding::flag(
                 Severity::Note,
                 "Secure Boot",

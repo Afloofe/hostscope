@@ -1,5 +1,3 @@
-use std::fs;
-
 use crate::rootkit::{Finding, Severity};
 
 #[derive(Debug, Clone, Default)]
@@ -229,11 +227,11 @@ fn finding_for_event(ev: &KprobeEvent, reason: &str) -> Finding {
 }
 
 fn read_first(paths: &[&str]) -> Option<String> {
-    paths.iter().find_map(|p| fs::read_to_string(p).ok())
+    paths.iter().find_map(|p| crate::saferead::read_kernel_text(p).ok())
 }
 
 pub fn report() -> Report {
-    let Ok(list_text) = fs::read_to_string("/sys/kernel/debug/kprobes/list") else {
+    let Ok(list_text) = crate::saferead::read_kernel_text("/sys/kernel/debug/kprobes/list") else {
         return Report {
             available: false,
             reason: Some(

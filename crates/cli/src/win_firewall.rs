@@ -9,6 +9,100 @@ pub(crate) fn marker(port: u16) -> String {
     format!("mahoraga-allow-{port}")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NamedRule {
+
+    pub(crate) enabled: String,
+
+    pub(crate) direction: String,
+
+    pub(crate) action: String,
+
+    pub(crate) protocol: String,
+
+    pub(crate) local_port: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Named {
+
+    Absent,
+
+    Allows,
+
+    NotOurs(String),
+}
+
+pub(crate) fn named_rules_script(name: &str) -> String {
+    format!(
+        r#"$rules = @(Get-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue)
+foreach ($r in $rules) {{
+  $pf = @($r | Get-NetFirewallPortFilter -ErrorAction Stop)
+  $proto = ($pf | ForEach-Object {{ "$($_.Protocol)" }}) -join ','
+  $ports = ($pf | ForEach-Object {{ ($_.LocalPort | ForEach-Object {{ "$_" }}) -join ',' }}) -join ';'
+  Write-Output ("rule|" + $r.Enabled + "|" + $r.Direction + "|" + $r.Action + "|" + $proto + "|" + $ports)
+}}
+Write-Output ("count|" + $rules.Count)"#
+    )
+}
+
+pub(crate) fn parse_named_rules(out: &str) -> Result<Vec<NamedRule>, String> {
+    let mut rules = Vec::new();
+    let mut count = None;
+    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(rest) = line.strip_prefix("rule|") {
+            let fields: Vec<&str> = rest.split('|').collect();
+            let [enabled, direction, action, protocol, local_port] = fields.as_slice() else {
+                return Err(format!("a rule line the check does not write: {line}"));
+            };
+            rules.push(NamedRule {
+                enabled: (*enabled).to_string(),
+                direction: (*direction).to_string(),
+                action: (*action).to_string(),
+                protocol: (*protocol).to_string(),
+                local_port: (*local_port).to_string(),
+            });
+        } else if let Some(n) = line.strip_prefix("count|") {
+            count = n.trim().parse::<usize>().ok();
+        }
+    }
+    match count {
+        Some(n) if n == rules.len() => Ok(rules),
+        Some(n) => Err(format!("the check printed {} of the {n} rule(s) it counted", rules.len())),
+        None => Err("the check did not finish".to_string()),
+    }
+}
+
+pub(crate) fn judge_named(port: u16, rules: &[NamedRule]) -> Named {
+    let want = port.to_string();
+    for r in rules {
+        let mut wrong: Vec<String> = Vec::new();
+        if !r.enabled.eq_ignore_ascii_case("True") {
+            wrong.push("disabled".into());
+        }
+        if !r.direction.eq_ignore_ascii_case("Inbound") {
+            wrong.push(format!("{} rather than inbound", r.direction));
+        }
+        if !r.action.eq_ignore_ascii_case("Allow") {
+            wrong.push(format!("a {} rule rather than an Allow", r.action));
+        }
+        if !r.protocol.eq_ignore_ascii_case("TCP") {
+            wrong.push(format!("for protocol {} rather than TCP", r.protocol));
+        }
+        if r.local_port != want {
+            wrong.push(format!("on local port {} rather than {port} alone", r.local_port));
+        }
+        if !wrong.is_empty() {
+            return Named::NotOurs(format!("a rule named {} is {}", marker(port), wrong.join(", ")));
+        }
+    }
+    if rules.is_empty() {
+        Named::Absent
+    } else {
+        Named::Allows
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn ps(script: &str) -> Result<String, String> {
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
@@ -33,17 +127,9 @@ fn ps(script: &str) -> Result<String, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn audit(what: &str) {
-    use std::io::Write as _;
-
-    let Some(dir) = crate::win_private::log_dir(what) else { return };
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("fixes.log")) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(f, "epoch={now} {what}");
-    }
+fn named_rules(port: u16) -> Result<Named, String> {
+    let out = ps(&named_rules_script(&marker(port)))?;
+    Ok(judge_named(port, &parse_named_rules(&out)?))
 }
 
 #[cfg(target_os = "windows")]
@@ -110,13 +196,33 @@ pub(crate) fn allow(args: &[String], _json: bool) -> u8 {
         return EXIT_USAGE;
     };
     let name = marker(port);
-    let exists = ps(&format!(
-        "if (Get-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue) {{'yes'}} else {{'no'}}"
-    ))
-    .unwrap_or_default();
-    if exists == "yes" {
-        eprintln!("hemostat firewall: tcp/{port} is already allowed by a mahoraga rule ({name}); nothing to do");
-        return EXIT_POLICY;
+
+    match named_rules(port) {
+        Ok(Named::Absent) => {}
+        Ok(Named::Allows) => {
+            eprintln!(
+                "hemostat firewall: tcp/{port} is already allowed by a mahoraga rule ({name}: enabled, inbound, \
+                 Allow, TCP {port}); nothing to do"
+            );
+            return EXIT_POLICY;
+        }
+        Ok(Named::NotOurs(why)) => {
+            eprintln!(
+                "hemostat firewall: refused — {}. A rule that carries this tool's name is not trusted for it: look \
+                 at it (Get-NetFirewallRule -DisplayName '{name}'), remove or rename it by hand, then run this \
+                 again. Nothing was changed",
+                crate::render::h(&why)
+            );
+            return EXIT_POLICY;
+        }
+        Err(e) => {
+            eprintln!(
+                "hemostat firewall: the rules named {name} could not be read ({}), so whether one is there, and \
+                 what it does, is unknown. Nothing was changed",
+                crate::render::h(&e)
+            );
+            return EXIT_ENFORCER;
+        }
     }
 
     let armed = args.iter().any(|a| a == "--arm");
@@ -131,21 +237,36 @@ pub(crate) fn allow(args: &[String], _json: bool) -> u8 {
     match ps(&format!(
         "New-NetFirewallRule -DisplayName '{name}' -Direction Inbound -Protocol TCP -LocalPort {port} -Action Allow -Profile Any -ErrorAction Stop | Out-Null; 'ok'"
     )) {
-        Ok(_) => {
-            let ok = ps(&format!(
-                "if (Get-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue) {{'yes'}} else {{'no'}}"
-            ))
-            .unwrap_or_default();
-            if ok == "yes" {
-                audit(&format!("firewall allow tcp/{port} ({name})"));
+
+        Ok(_) => match named_rules(port) {
+            Ok(Named::Allows) => {
+
+                crate::win_restore::audit_or_warn(&format!("firewall allow tcp/{port} ({name})"));
                 println!("allowed inbound tcp/{port} through Windows Firewall (rule `{name}`)");
                 println!("  undo: Remove-NetFirewallRule -DisplayName '{name}'");
                 EXIT_OK
-            } else {
+            }
+            Ok(Named::Absent) => {
                 eprintln!("hemostat firewall: added the rule but could not find it afterward — the change did not take");
                 EXIT_ENFORCER
             }
-        }
+            Ok(Named::NotOurs(why)) => {
+                eprintln!(
+                    "hemostat firewall: the rule was added, but {} — the port may still be shut. Look at the rules \
+                     named {name} (Get-NetFirewallRule -DisplayName '{name}')",
+                    crate::render::h(&why)
+                );
+                EXIT_ENFORCER
+            }
+            Err(e) => {
+                eprintln!(
+                    "hemostat firewall: the rule was added but could not be read back ({}); look at the rules named \
+                     {name} (Get-NetFirewallRule -DisplayName '{name}')",
+                    crate::render::h(&e)
+                );
+                EXIT_ENFORCER
+            }
+        },
         Err(e) => {
             eprintln!("hemostat firewall: New-NetFirewallRule failed: {e}");
             EXIT_ENFORCER

@@ -155,6 +155,11 @@ fn digest_key(t: Tool) -> String {
 
 #[cfg(unix)]
 pub fn collect(runner: &mut dyn crate::tools::Runner, root: &std::path::Path) -> Evidence {
+    collect_within(runner, root, u64::MAX)
+}
+
+#[cfg(unix)]
+pub fn collect_within(runner: &mut dyn crate::tools::Runner, root: &std::path::Path, room: u64) -> Evidence {
     use crate::evidence::{Collector, Kind};
     let mut c = Collector::new(KIND, root);
     let t0 = std::time::Instant::now();
@@ -173,6 +178,7 @@ pub fn collect(runner: &mut dyn crate::tools::Runner, root: &std::path::Path) ->
             c.ev.obs.insert(digest_key(inv.tool()), Obs::Digest { sha256: d, len: 0 });
         }
     }
+    c.keep_within(room);
 
     for f in crate::persist::LOADER_FILES {
         c.file(f, MAX_FILE);

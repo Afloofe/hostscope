@@ -338,12 +338,14 @@ pub(crate) fn quarantine(args: &[String], path: &str, _json: bool) -> u8 {
         eprintln!("hemostat quarantine: refused — {}. Nothing was changed", h(&why));
         return EXIT_POLICY;
     }
+
+    let orig = spellings.first().map_or_else(|| path.to_string(), |s| drive_path(s).to_string());
     let base = p.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let uniq = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let dest_name = format!("{base}.{uniq}.quarantined");
     let dest = crate::win_private::root().join(QUARANTINE_DIR).join(&dest_name);
     let dest_s = h(&dest.display().to_string());
-    let path_h = h(path);
+    let path_h = h(&orig);
 
     let armed = crate::win_wmi::is_armed(args, path);
     if !armed {
@@ -369,19 +371,43 @@ pub(crate) fn quarantine(args: &[String], path: &str, _json: bool) -> u8 {
         return EXIT_FAILED;
     }
 
+    let sidecar = format!("{dest_name}.orig");
+    if let Err(e) = crate::win_private::write_atomic(&dir, &sidecar, orig.as_bytes()) {
+        eprintln!(
+            "hemostat quarantine: where {path_h} came from could not be recorded ({}), so it was not moved. Nothing \
+             was changed",
+            h(&e)
+        );
+        return EXIT_FAILED;
+    }
+
     let moved = std::fs::rename(path, &dest).or_else(|_| {
         std::fs::copy(path, &dest).and_then(|_| std::fs::remove_file(path)).map(|_| ())
     });
     match moved {
         Ok(()) => {
-            let _ = crate::win_private::write_atomic(&dir, &format!("{dest_name}.orig"), path.as_bytes());
-            crate::win_restore::audit_or_warn(&format!("quarantine {} -> {}", path, dest.display()));
+
+            let digest = match crate::win_private::read_regular(&dest, crate::win_binvault::MAX_BINARY) {
+                Ok(b) => format!("sha256 {}", crate::win_binvault::sha256_hex(&b)),
+                Err(e) => format!("sha256 not taken: {e}"),
+            };
+            crate::win_restore::audit_or_warn(&format!("quarantine {orig} -> {} ({digest})", dest.display()));
             println!("quarantined {path_h}");
-            println!("  vault: {dest_s}");
-            println!("  undo: move \"{dest_s}\" \"{path_h}\"");
+            println!("  vault: {dest_s} ({})", h(&digest));
+            match move_back_command(&dest.display().to_string(), &orig) {
+                Some(undo) => println!("  undo: {undo}"),
+                None => println!(
+                    "  undo: move the vault file back to the path its .orig sidecar records — no command is printed, \
+                     as a path holds a character a shell could read as something other than itself"
+                ),
+            }
             EXIT_OK
         }
         Err(e) => {
+
+            if !dest.exists() {
+                let _ = std::fs::remove_file(dir.join(&sidecar));
+            }
             eprintln!("hemostat quarantine: could not move {path_h}: {e}");
             EXIT_ENFORCER
         }
@@ -406,6 +432,65 @@ pub(crate) fn task_file_stem(name: &str) -> String {
     format!("{}-{}", if safe.is_empty() { "task" } else { safe.as_str() }, tag.get(..8).unwrap_or(&tag))
 }
 
+pub(crate) fn task_undo_file_name(name: &str, stamp: u128) -> String {
+    format!("{}-{stamp}.xml", task_file_stem(name))
+}
+
+fn utf16le(bytes: &[u8]) -> Result<String, String> {
+    let (units, odd) = bytes.as_chunks::<2>();
+    if !odd.is_empty() {
+        return Err("it is UTF-16 with an odd byte at its end".into());
+    }
+    let units: Vec<u16> = units.iter().copied().map(u16::from_le_bytes).collect();
+    String::from_utf16(&units).map_err(|_| "it is UTF-16 that does not decode".to_string())
+}
+
+pub(crate) fn exported_task_xml(out: &[u8]) -> Result<String, String> {
+
+    let text = match out {
+        [0xFF, 0xFE, rest @ ..] => utf16le(rest)?,
+        [_, 0, ..] => utf16le(out)?,
+        _ => match out.iter().find(|b| !b.is_ascii()) {
+            Some(b) => {
+                return Err(format!(
+                    "it holds the byte 0x{b:02X}, past ASCII, and schtasks writes through the console's code page, \
+                     so it may not be the character the task holds"
+                ))
+            }
+            None => out.iter().map(|&b| char::from(b)).collect(),
+        },
+    };
+    if let Some(c) = text.chars().find(|c| c.is_control() && !matches!(c, '\t' | '\r' | '\n')) {
+        return Err(format!("it holds a control character (U+{:04X})", u32::from(c)));
+    }
+    let doc = text.trim_start_matches('\u{FEFF}').trim();
+    let body = match doc.strip_prefix("<?xml") {
+        Some(rest) => {
+            let (decl, body) = rest.split_once("?>").ok_or("its XML declaration is not closed")?;
+            let decl: String = decl.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+            if !decl.replace('\'', "\"").contains("encoding=\"utf-16\"") {
+                return Err("its XML declaration does not name UTF-16, the encoding it is kept in".into());
+            }
+            body.trim_start()
+        }
+        None => doc,
+    };
+
+    let opens_at = |i: usize| body.get(i + 5..).and_then(|r| r.chars().next()).is_some_and(|c| c.is_whitespace() || c == '>');
+    let one_task = body.starts_with("<Task")
+        && opens_at(0)
+        && body.match_indices("<Task").filter(|(i, _)| opens_at(*i)).count() == 1
+        && body.matches("</Task>").count() == 1
+        && body.ends_with("</Task>")
+        && !body.contains("<?xml");
+    if !one_task {
+        return Err("it is not one task's document, a single <Task> element, which is all `schtasks /create /xml` \
+                    takes back"
+            .into());
+    }
+    Ok(doc.to_string())
+}
+
 #[cfg(target_os = "windows")]
 fn schtasks() -> String {
     sys32("schtasks.exe")
@@ -413,29 +498,58 @@ fn schtasks() -> String {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn remove_task(args: &[String], name: &str, _json: bool) -> u8 {
+
+    if let Some(why) = paste_refusal(name) {
+        eprintln!("hemostat remediate: refused — {}. Nothing was run; remove this task by hand", h(&why));
+        return EXIT_POLICY;
+    }
     if is_system_task(name) {
         eprintln!("hemostat remediate: refused — `{name}` is a Microsoft/system task and is never removed");
         return EXIT_POLICY;
     }
 
-    let q = std::process::Command::new(schtasks()).args(["/query", "/tn", name, "/xml", "ONE"]).output();
-    let xml = match q {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+    let q = std::process::Command::new(schtasks()).args(["/query", "/tn", name, "/xml"]).output();
+    let raw = match q {
+        Ok(o) if o.status.success() => o.stdout,
         _ => {
             eprintln!("hemostat remediate: scheduled task `{name}` not found");
             return EXIT_POLICY;
         }
     };
+    let xml = match exported_task_xml(&raw) {
+        Ok(x) => x,
+        Err(why) => {
+            eprintln!(
+                "hemostat remediate: refused — the XML of `{name}` cannot be kept as an undo that works ({}), so it is \
+                 not removed. Export it from Task Scheduler and remove it by hand",
+                h(&why)
+            );
+            return EXIT_POLICY;
+        }
+    };
+
+    if run_is_protected(name, &xml) {
+        eprintln!("hemostat remediate: refused — `{name}` is DataDog's (its name or its XML says so; protected, packet rule 14)");
+        return EXIT_POLICY;
+    }
 
     let armed = crate::win_wmi::is_armed(args, name);
-    let file = format!("{}.xml", task_file_stem(name));
-    let xml_path = crate::win_private::root().join(REMOVED_TASKS_DIR).join(&file);
+    let stem = task_file_stem(name);
+    let dir_s = crate::win_private::root().join(REMOVED_TASKS_DIR).display().to_string();
+
+    if task_undo_command(name, &format!(r"{dir_s}\{}", task_undo_file_name(name, 0))).is_none() {
+        eprintln!(
+            "hemostat remediate: refused — its undo would be kept under {}, a path a shell could read as something \
+             else, so it is not removed",
+            h(&dir_s)
+        );
+        return EXIT_POLICY;
+    }
     let name_h = h(name);
-    let xml_s = h(&xml_path.display().to_string());
     if !armed {
         println!("remove scheduled task `{name_h}`  —  schtasks /delete /tn \"{name_h}\" /f");
-        println!("  its XML is exported to {xml_s} first, so it is reversible:");
-        println!("  undo: schtasks /create /tn \"{name_h}\" /xml \"{xml_s}\"");
+        println!("  its XML is kept first, as UTF-16, in a file no other removal uses, so it is reversible:");
+        println!("  undo: schtasks /create /tn \"{name_h}\" /xml \"{}\\{stem}-<time>.xml\"  (the file is named when armed)", h(&dir_s));
         if let Err(e) = crate::win_private::verify(&[REMOVED_TASKS_DIR]) {
             println!("  REFUSED when armed: {}", h(&e));
         }
@@ -450,19 +564,44 @@ pub(crate) fn remove_task(args: &[String], name: &str, _json: bool) -> u8 {
             return EXIT_FAILED;
         }
     };
-    if let Err(e) = crate::win_private::write_atomic(&dir, &file, xml.as_bytes()) {
-        eprintln!("hemostat remediate: could not export the task XML to {xml_s}: {}", h(&e));
+
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let file = task_undo_file_name(name, stamp);
+    let xml_path = dir.join(&file);
+    let xml_s = h(&xml_path.display().to_string());
+    match std::fs::symlink_metadata(&xml_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        _ => {
+            eprintln!("hemostat remediate: {xml_s} is already there; nothing was changed. Run it again");
+            return EXIT_FAILED;
+        }
+    }
+
+    let bytes = reg_file_bytes(&xml);
+    if let Err(e) = crate::win_private::write_atomic(&dir, &file, &bytes) {
+        eprintln!("hemostat remediate: could not keep the task XML at {xml_s}: {}", h(&e));
         return EXIT_ENFORCER;
     }
 
-    if let Err(e) = crate::win_restore::audit(&format!("remove-task {} (xml: {})", name, xml_path.display())) {
+    if !crate::win_private::read_regular(&xml_path, bytes.len() as u64).is_ok_and(|back| back == bytes) {
+        eprintln!("hemostat remediate: the task XML kept at {xml_s} does not read back as written, so `{name_h}` was not removed");
+        return EXIT_ENFORCER;
+    }
+    let Some(undo) = task_undo_command(name, &xml_path.display().to_string()) else {
+        eprintln!("hemostat remediate: its undo was kept at {xml_s}, a path a shell could misread, so `{name_h}` was not removed");
+        return EXIT_ENFORCER;
+    };
+    let sha = crate::win_binvault::sha256_hex(&bytes);
+
+    if let Err(e) = crate::win_restore::audit(&format!("remove-task {name} (xml: {}, sha256 {sha}); undo: {undo}", xml_path.display())) {
         eprintln!("hemostat remediate: the fix log could not be written ({e}), so `{name_h}` was not removed");
         return EXIT_ENFORCER;
     }
     match std::process::Command::new(schtasks()).args(["/delete", "/tn", name, "/f"]).output() {
         Ok(o) if o.status.success() => {
             println!("removed scheduled task `{name_h}`");
-            println!("  undo: schtasks /create /tn \"{name_h}\" /xml \"{xml_s}\"");
+            println!("  kept: {xml_s} (sha256 {}…)", crate::win_binvault::short(&sha));
+            println!("  undo: {}", h(&undo));
             EXIT_OK
         }
         Ok(o) => {
@@ -536,6 +675,29 @@ pub(crate) fn reg_string(ty: &str, data: &[u8]) -> Option<String> {
     let (pairs, _odd) = data.as_chunks::<2>();
     let units: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).take_while(|u| *u != 0).collect();
     Some(String::from_utf16_lossy(&units))
+}
+
+pub(crate) fn undo_not_exact(ty: &str, data: &[u8]) -> Option<String> {
+    if ty != "REG_SZ" && ty != "REG_EXPAND_SZ" {
+        return None;
+    }
+    let n = data.len();
+    let (units, odd) = data.as_chunks::<2>();
+    if !odd.is_empty() {
+
+        return Some(format!(
+            "its {n} bytes are an odd count, not whole UTF-16 characters, and how `reg import` ends such a \
+             string was not tested: a NUL added after the odd last byte would make one more character, so \
+             the undo may put back neither these exact {n} bytes nor the same text"
+        ));
+    }
+    units.last().is_some_and(|last| *last != [0, 0]).then(|| {
+        format!(
+            "it is stored without the NUL that ends a string, and `reg import` adds one: the undo puts back \
+             the same text in {} bytes, not these exact {n}",
+            n.saturating_add(2)
+        )
+    })
 }
 
 fn reg_sz_text(data: &[u8]) -> Option<String> {
@@ -619,6 +781,32 @@ pub(crate) fn reg_import_command(path: &str) -> Option<String> {
         .then(|| format!("reg import \"{path}\""))
 }
 
+pub(crate) fn paste_refusal(s: &str) -> Option<String> {
+    if let Some(why) = crate::win_wmi::name_refusal(s) {
+        return Some(why);
+    }
+    if let Some(c) = s.chars().find(|c| matches!(c, '%' | '!')) {
+        return Some(format!("the name holds `{c}`, which cmd.exe expands even inside quotes"));
+    }
+    (crate::render::h(s) != s).then(|| "the name holds characters the screen would not show as themselves".to_string())
+}
+
+pub(crate) fn task_undo_command(name: &str, xml: &str) -> Option<String> {
+    let plain = xml.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '\\' | ':' | '.' | '_' | '-' | ' '));
+    (plain && paste_refusal(name).is_none()).then(|| format!("schtasks /create /tn \"{name}\" /xml \"{xml}\""))
+}
+
+pub(crate) fn move_back_command(vault: &str, orig: &str) -> Option<String> {
+    (paste_refusal(vault).is_none() && paste_refusal(orig).is_none()).then(|| format!("move \"{vault}\" \"{orig}\""))
+}
+
+pub(crate) fn drive_path(p: &str) -> &str {
+    match p.strip_prefix(r"\\?\") {
+        Some(rest) if local(&norm(rest)) => rest,
+        _ => p,
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn remove_run(args: &[String], name: &str, _json: bool) -> u8 {
     if name.trim().is_empty() {
@@ -680,11 +868,16 @@ pub(crate) fn remove_run(args: &[String], name: &str, _json: bool) -> u8 {
     }
     let (name_h, data_h, key_h) = (h(name), h(&shown), h(key));
 
+    let inexact = undo_not_exact(&ty, &raw);
+
     let armed = crate::win_wmi::is_armed(args, name);
     if !armed {
         println!("remove Run entry `{name_h}` ({key_h}, {ty})  ->  {data_h}");
         println!("  its type and exact data ({} bytes) are kept first in an admin-only .reg file, so it is reversible:", raw.len());
         println!("  undo: reg import \"{}\\removed-run-<time>\\{file_name}\"  (the file is named when armed)", h(&base));
+        if let Some(why) = &inexact {
+            println!("  not byte for byte: {why}");
+        }
         println!("\nNothing was changed. Add --arm to apply.");
         return EXIT_DRYRUN;
     }
@@ -716,7 +909,9 @@ pub(crate) fn remove_run(args: &[String], name: &str, _json: bool) -> u8 {
         return EXIT_POLICY;
     }
 
-    if let Err(e) = crate::win_restore::audit(&format!("remove-run {name:?} ({key}, {ty}) -> {shown:?}; undo: {undo}")) {
+    let tail = inexact.as_deref().map_or_else(String::new, |why| format!("; not byte for byte: {why}"));
+    let sha = crate::win_binvault::sha256_hex(&reg_file_bytes(&text));
+    if let Err(e) = crate::win_restore::audit(&format!("remove-run {name:?} ({key}, {ty}) -> {shown:?}; undo: {undo} (sha256 {sha}){tail}")) {
         eprintln!(
             "hemostat remediate --remove-run: the fix log could not be written ({}), so `{name_h}` was not removed (its undo is kept in {})",
             h(&e.to_string()),
@@ -727,8 +922,11 @@ pub(crate) fn remove_run(args: &[String], name: &str, _json: bool) -> u8 {
     match std::process::Command::new(&reg).args(["delete", key, "/v", name, "/f"]).output() {
         Ok(o) if o.status.success() => {
             println!("removed Run entry `{name_h}` ({key_h})");
-            println!("  kept: {}", h(&file));
+            println!("  kept: {} (sha256 {}…)", h(&file), crate::win_binvault::short(&sha));
             println!("  undo: {}", h(&undo));
+            if let Some(why) = &inexact {
+                println!("  not byte for byte: {why}");
+            }
             EXIT_OK
         }
         Ok(o) => {

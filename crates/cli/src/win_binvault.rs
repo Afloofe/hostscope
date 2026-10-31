@@ -230,7 +230,9 @@ pub(crate) fn restore(args: &[String], path: &str, _json: bool) -> u8 {
     crate::win_restore::audit_or_warn(&format!("restore-binary {} <- arrival (sha {}), tampered kept at {}", path, &sha[..16], aside));
     println!("restored {path_h} from its arrival copy (sha {}…)", short(&sha));
     println!("  the tampered binary is kept at {aside_h}");
-    println!("  RESTART the service so it runs the clean binary (e.g. `mahoraga services --restore --arm`)");
+
+    println!("  RESTART its service onto the clean binary: `sc stop <service>`, then `mahoraga services --restore --arm`,");
+    println!("  which starts a scored service only while it is configured to run its stock binary (`sc qc <service>`)");
     println!("  undo: del \"{path_h}\" && ren \"{aside_h}\" \"<name>\"");
     EXIT_OK
 }

@@ -177,22 +177,6 @@ pub(crate) fn verify(parts: &[&str]) -> Result<Option<PathBuf>, String> {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn log_dir(what: &str) -> Option<PathBuf> {
-    match ensure(&[]) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            eprintln!(
-                "hemostat: this was NOT written to the fix log ({}): {}\n  {}",
-                crate::render::h(&root().join("fixes.log").display().to_string()),
-                crate::render::h(what),
-                crate::render::h(&e)
-            );
-            None
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
 pub(crate) fn private_file(path: &std::path::Path) -> Result<(), String> {
     let s = text(path)?;
     match dacl_refusal(s, &acl::dacl_of_read(s)) {
@@ -232,6 +216,20 @@ pub(crate) fn not_regular(attributes: u32, is_file: bool) -> Option<&'static str
         return Some("not a regular file (a directory or a device)");
     }
     None
+}
+
+pub(crate) fn not_appendable(attributes: u32, is_file: bool, links: Result<u32, u32>) -> Option<String> {
+    if let Some(why) = not_regular(attributes, is_file) {
+        return Some(why.to_string());
+    }
+    match links {
+        Ok(1) => None,
+        Ok(n) => Some(format!(
+            "one of {n} names for one file (a hard link), so a line written here lands in that file wherever its \
+             other name is"
+        )),
+        Err(rc) => Some(format!("a file whose number of names could not be read (error {rc}), so it may be a hard link")),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -287,6 +285,30 @@ pub(crate) fn write_atomic(dir: &std::path::Path, name: &str, bytes: &[u8]) -> R
         return Err(format!("{} could not be put in place: {e}", dest.display()));
     }
     Ok(dest)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn append_regular(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    if !component_ok(name) {
+        return Err(format!("`{name}` is not one file name"));
+    }
+    let path = dir.join(name);
+    let shown = path.display().to_string();
+
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .custom_flags(OPEN_REPARSE_POINT | BACKUP_SEMANTICS)
+        .open(&path)
+        .map_err(|e| format!("{shown} could not be opened without following a link: {e}"))?;
+    let md = f.metadata().map_err(|e| format!("{shown} could not be examined: {e}"))?;
+    if let Some(why) = not_appendable(md.file_attributes(), md.is_file(), hemostat_sensor_win::localpath::link_count(&f)) {
+        return Err(format!("{shown} is {why}; nothing was written to it. {}", aside(&shown, now())));
+    }
+    f.write_all(bytes).map_err(|e| format!("{shown} could not be appended to: {e}"))
 }
 
 pub(crate) const WATCHDOG_BIN: &str = "bin";

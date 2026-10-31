@@ -129,7 +129,8 @@ pub const REGISTRY: &[VerbSpec] = &[
     ]),
     v("export", &["export"], &[L], R, &[], &[pos_opt("FORMAT", Fixed(&["report", "jsonl", "stix", "misp"]), "the handover format (default report)")]),
     v("brief", &["brief"], &[L, W], R, &[], &[]),
-    v("drift", &["drift"], &[L, W, F], R, &[], &[STORE]),
+    v("drift", &["drift"], &[L, W], R, &[], &[STORE]),
+    v("drift", &["drift"], &[F], R, &[], &[MANIFEST, STORE]),
 
     v("watch", &["watch"], &[L], Wa, &[], &[]),
     v("fswatch", &["fswatch"], &[L], Wa, &["mod-sensor-fanotify"], &[
@@ -153,7 +154,7 @@ pub const REGISTRY: &[VerbSpec] = &[
         OPERATOR_KEY,
         switch("--session-key-unknown", "say you cannot name the key your session came in on"),
         switch("--last-admin-key", "allow removing what may be the last admin key"),
-    ], "Each removal is moved into the vault and journalled; `hemostat undo <journal>` puts it back. The authentication surface is never removed by this run, and a unit that brings the network up (networking, systemd-networkd, NetworkManager, network, systemd-resolved, wicked, ifup@), its unit file and its drop-ins are never stopped, masked or moved. With HEMOSTAT_GOLDEN set the same holds for the units this box's role runs its scored services in (MariaDB on scrutineering: mariadb, mysqld, mysql), while the service is down too: a finding in one is left to you, to restore the unit from its package by hand."),
+    ], "Each removal is moved into the vault and journalled; `hemostat undo <journal>` puts it back. The authentication surface is never removed by this run, and a unit that brings the network up (networking, systemd-networkd, NetworkManager, network, systemd-resolved, wicked, ifup@), its unit file and its drop-ins are never stopped, masked or moved. A line flagged in a file its package manager vouches for as shipped is a note, and nothing is offered for it. With HEMOSTAT_GOLDEN set the same holds for the units this box's role runs its scored services in (MariaDB on scrutineering: mariadb, mysqld, mysql), while the service is down too: a finding in one is left to you, to restore the unit from its package by hand."),
     v("remediate --lines", &["remediate", "--lines"], &[L], R, &["mod-enf-persistence"], &[pos("FILE", Live("path"), "a shared file whose lines to list, each with its token")]),
     v("remediate --anchors", &["remediate", "--anchors"], &[L], R, &["mod-enf-persistence"], &[]),
     act("remediate --remove-anchor", &["remediate", "--remove-anchor"], &[L], &["mod-enf-persistence"], &[
@@ -170,7 +171,7 @@ pub const REGISTRY: &[VerbSpec] = &[
     v("remediate --log", &["remediate", "--log"], &[L], R, &["mod-enf-persistence"], &[]),
     act("remediate --restore-pam", &["remediate", "--restore-pam"], &[L], &["mod-enf-persistence"], &[
         pos("PATH", Live("path"), "the module path, from `remediate --pam`"),
-    ], "The distribution's stock module is written back atomically (owner, mode and SELinux label kept): the build baked for the installed package version, and if none is baked it is refused, naming the baked builds. The current file goes to the vault and `hemostat undo <journal>` restores it. Armed, a throwaway login is tried from an unprivileged account before and after the swap, with the right password and a wrong one; if it got in before and not after, or a wrong password is taken after but was refused before, the swap is rolled back."),
+    ], "The distribution's stock module is written back atomically (owner, mode and SELinux label kept): the build baked for the installed package version, and if none is baked it is refused, naming the baked builds; on a release nothing is baked for it is refused (exit 4), naming the release and the baked ones. The current file goes to the vault and `hemostat undo <journal>` restores it. Armed, a throwaway login is tried from an unprivileged account before and after the swap, with the right password and a wrong one; if it got in before and not after, or a wrong password is taken after but was refused before, the swap is rolled back."),
 
     VerbSpec {
         name: "remediate --seal-binaries",
@@ -213,7 +214,7 @@ pub const REGISTRY: &[VerbSpec] = &[
         pos_opt("PATH", Live("path"), "the binary to stop starting again"),
         opt("--pid", "N", Live("pid"), "the binary this process runs"),
         switch("--lift", "remove a block instead"),
-    ], "The file is left byte-identical (a bind mount of /dev/null over it); the journal undoes it. Refused for sshd, a listening process's binary, anything a declared service starts, anything a unit of this box's scored services starts with HEMOSTAT_GOLDEN set, or the systemd-networkd and systemd-resolved binaries."),
+    ], "The file is left byte-identical (a bind mount of /dev/null over it); the journal undoes it. Refused for sshd, a listening process's binary, anything a declared service starts, anything a unit of this box's scored services starts with HEMOSTAT_GOLDEN set, or the systemd-networkd and systemd-resolved binaries; run as anyone but root, refused for every binary, since another user's processes cannot be read to say which socket each holds."),
     act("account", &["account"], &[L], &["mod-enf-account"], &[
         pos("USER", Live("user"), "the account"),
         switch("--end-sessions", "end its sessions"),
@@ -224,20 +225,20 @@ pub const REGISTRY: &[VerbSpec] = &[
     ], "Account changes are only ever made by you, here or at the CLI: no rule fires them. Name one of the five flags. whiteteam and the DataDog accounts (dd-agent, ddagentuser, datadog) are always refused."),
     act("account --disable", &["account", "--disable"], &[W], &["mod-enf-account"], &[
         pos("USER", Live("user"), "the rogue local user to disable (reversible: net user /active:yes)"),
-    ], "Windows only: disables a rogue local user (net user /active:no). Refuses a protected (whiteteam/datadog) or built-in Windows account, the account this session runs as (by SID), and the last enabled administrator."),
+    ], "Windows only: disables a rogue local user (net user /active:no); the undo and the fix log name its SID, and the undo is for that account only. Refuses a protected (whiteteam/datadog) or built-in Windows account (by name, and by relative id 500-504 whatever it is called), the account this session runs as (by SID), and the last enabled administrator."),
     act("kill", &["kill"], &[W], &["mod-enf-proc"], &[
         opt("--pid", "N", Typed, "the PID to terminate"),
         switch("--allow-listener", "it listens and it is the red team's (a bind shell); every other refusal still holds"),
     ], "Windows: terminates a process. Refuses System/Idle, the critical Windows processes, a shared svchost, a scored service's image, DataDog, this session's own processes, one whose image cannot be read, and a listener unless --allow-listener. Irreversible — acquire it first if it is wanted as evidence."),
     act("quarantine", &["quarantine"], &[W], &["mod-enf-file"], &[
         pos("PATH", Live("path"), "the malicious file to move into the vault"),
-    ], "Windows: moves a file into the vault, reversible (it prints the command to move it back). Refuses a file under a system or program directory or DataDog's, judged where it really is, and anything but one regular file."),
+    ], "Windows: moves a file into the vault, reversible (where it came from is recorded first, and the command to move it back is printed when the path holds nothing a shell reads as syntax). Refuses a file under a system or program directory or DataDog's, judged where it really is, and anything but one regular file."),
     act("remediate --remove-task", &["remediate", "--remove-task"], &[W], &["mod-enf-persistence"], &[
         pos("NAME", Typed, "the rogue scheduled task to delete"),
-    ], "Windows: deletes a rogue scheduled task after exporting its XML to the vault (reversible: schtasks /create /xml). Refuses Microsoft/system tasks."),
+    ], "Windows: deletes a rogue scheduled task after keeping its own XML, as UTF-16, in a file no other removal uses (reversible: schtasks /create /xml); a task whose XML would not re-create it is not removed. Refuses Microsoft/system tasks, DataDog's, and a NAME with a quote, backtick, $, %, ! or control character."),
     act("remediate --remove-run", &["remediate", "--remove-run"], &[W], &["mod-enf-persistence"], &[
         pos("NAME", Typed, "the rogue autostart Run value to delete (from `drift`)"),
-    ], "Windows: deletes a rogue HKLM/HKCU Run autostart value (reversible: its type and exact data are kept first in an admin-only .reg file, and `reg import` of that file is the undo; a value that cannot be kept exactly is not removed). Refuses a DataDog value."),
+    ], "Windows: deletes a rogue HKLM/HKCU Run autostart value (reversible: its type and exact data are kept first in an admin-only .reg file, and `reg import` of that file is the undo, though a string stored without its closing NUL comes back with one, as the dry run says; a value that cannot be kept exactly is not removed). Refuses a DataDog value."),
     act("remediate --remove-wmi", &["remediate", "--remove-wmi"], &[W], &["mod-enf-persistence"], &[
         pos("NAME", Typed, "the WMI event consumer to remove (from `wmi`)"),
     ], "Windows: removes a permanent-WMI subscription from root\\subscription: the __EventConsumer named exactly NAME, the __FilterToConsumerBinding instances that reference it, and each bound __EventFilter no other binding uses. Killing the payload does not stop it re-firing; this does. Every property and the MOF of each object is written to the fix log first, and nothing is removed if that fails (WMI has no one-command undo). Refuses a NAME with a quote, backtick, $ or control character, and any object that mentions DataDog."),
@@ -258,7 +259,7 @@ pub const REGISTRY: &[VerbSpec] = &[
     },
     act("remediate --restore-binary", &["remediate", "--restore-binary"], &[W], &["mod-enf-persistence"], &[
         pos("PATH", Live("path"), "the absolute path of the tampered binary to restore"),
-    ], "Windows: writes the arrival copy back over a tampered binary after sha-verifying the sealed copy against its manifest, and checking again that the vault is admin-only (a tampered or user-owned vault is refused). The tampered binary is renamed aside (kept, not deleted); restart the service to run the clean bytes."),
+    ], "Windows: writes the arrival copy back over a tampered binary after sha-verifying the sealed copy against its manifest, and checking again that the vault is admin-only (a tampered or user-owned vault is refused). The tampered binary is renamed aside (kept, not deleted); restart its service to run the clean bytes — sc stop it, then services --restore --arm, which starts a scored service only while it is configured to run its stock binary."),
     v("harden-boot", &["harden-boot"], &[L], R, &[], &[]),
     act("harden-boot --set", &["harden-boot", "--set"], &[L], &["mod-harden-reboot"], &[
         pos("PARAM", Live("boot-param"), "a kernel parameter from the listing"),
@@ -364,7 +365,8 @@ pub const REGISTRY: &[VerbSpec] = &[
     v("wmi", &["wmi"], &[W], R, &[], &[]),
     v("modules", &["modules"], &[W], R, &[], &[]),
 
-    v("snapshot", &["snapshot"], &[L, W, F], Wr, &[], &[STORE, switch("--replace", "keep the old store renamed and record a new one")]),
+    v("snapshot", &["snapshot"], &[L, W], Wr, &[], &[STORE, switch("--replace", "keep the old store renamed and record a new one")]),
+    v("snapshot", &["snapshot"], &[F], Wr, &[], &[MANIFEST, STORE, switch("--replace", "keep the old store renamed and record a new one")]),
     v("collect", &["collect"], &[L], Wr, &["mod-collect"], &[pos_opt("DIR", Live("store"), "the new store (default ./hemostat-evidence)")]),
     v("verify", &["verify"], &[P], R, &[], &[pos("DIR", Live("store"), "the store")]),
     v("read", &["read"], &[P], R, &[], &[pos("DIR", Live("store"), "the store; the key comes from $HEMOSTAT_RECOVERY_KEY as the view started")]),
@@ -458,6 +460,12 @@ pub const REGISTRY: &[VerbSpec] = &[
 pub const NOT_OFFERED: &[(&str, &str)] = &[
     ("tui", "it is the Posture view itself; its print-once form is the `posture` entry"),
     ("console", "it is the Findings console itself; its print-once form is `console --once`"),
+    ("gui", "it is the Findings console itself, drawn as pixels; its print-once form is `console --once`"),
+    ("passwd", "it asks for the new password on the terminal with echo off, which a run from this tab cannot; run it from a shell, or over `ssh -t`"),
+    ("passwd --users", "a flag of `passwd`, which runs from a shell, not from this tab"),
+    ("passwd --arm", "a flag of `passwd`, which runs from a shell, not from this tab"),
+    ("gui --every", "a flag of the GUI when it is launched: the view in front of you already has its interval"),
+    ("gui --rules", "a flag of the Windows GUI when it is launched: the view in front of you already read its rules"),
     ("queue", "it is the collector's queue view itself; ack, investigating, resolve and note are its Alerts tab, and `queue --once` prints it"),
     ("console --rules", "a flag of the Windows console when it is launched: the view in front of you already read its rules"),
     ("fw watch", "the watcher `fw block` starts under daemon(8); never run by hand"),

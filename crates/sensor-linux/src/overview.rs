@@ -173,7 +173,7 @@ impl Report {
 }
 
 fn first_line(path: &str) -> String {
-    fs::read_to_string(path)
+    crate::saferead::read_kernel_text(path)
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
 }
@@ -190,7 +190,7 @@ fn distro() -> String {
 }
 
 fn meminfo(key: &str) -> u64 {
-    let Ok(text) = fs::read_to_string("/proc/meminfo") else {
+    let Ok(text) = crate::saferead::read_kernel_text("/proc/meminfo") else {
         return 0;
     };
     text.lines()
@@ -375,8 +375,8 @@ fn inode_owners() -> (BTreeMap<u64, Vec<SocketOwner>>, usize) {
             }
         };
 
-        let comm = fs::read(format!("/proc/{pid}/comm"))
-            .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+        let comm = crate::saferead::read_pid_text(format!("/proc/{pid}/comm"))
+            .map(|s| s.trim().to_string())
             .unwrap_or_default();
         let exe = fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
@@ -473,7 +473,7 @@ fn netns_by_task(
 }
 
 fn task_table(pid: u32, tid: u32, table: &str) -> std::io::Result<String> {
-    fs::read_to_string(format!("/proc/{pid}/task/{tid}/net/{table}"))
+    crate::saferead::read_kernel_text(format!("/proc/{pid}/task/{tid}/net/{table}"))
 }
 
 fn read_from_any<T: Copy>(
@@ -589,11 +589,11 @@ pub fn report() -> Report {
     r.identity.hostname = first_line("/proc/sys/kernel/hostname");
     r.identity.kernel = first_line("/proc/sys/kernel/osrelease");
     r.identity.distro = distro();
-    r.identity.uptime_secs = fs::read_to_string("/proc/uptime")
+    r.identity.uptime_secs = crate::saferead::read_kernel_text("/proc/uptime")
         .ok()
         .and_then(|s| s.split('.').next().and_then(|v| v.parse().ok()))
         .unwrap_or(0);
-    r.identity.boot_epoch = fs::read_to_string("/proc/stat")
+    r.identity.boot_epoch = crate::saferead::read_kernel_text("/proc/stat")
         .ok()
         .and_then(|s| {
             s.lines()
@@ -637,7 +637,7 @@ pub fn report() -> Report {
         }
     };
     for (proto, table) in TABLES {
-        match fs::read_to_string(format!("/proc/net/{table}")) {
+        match crate::saferead::read_kernel_text(format!("/proc/net/{table}")) {
             Ok(t) => add_rows(&mut r, proto, &t, None),
 
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

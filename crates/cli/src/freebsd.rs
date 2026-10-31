@@ -587,7 +587,16 @@ pub(crate) fn print_posture_sweep(args: &[String], json: bool) -> u8 {
     let mut throttle = saferead::Throttle::new(saferead::HASH_BYTES_PER_SEC);
     let mut raw = posture::collect(&mut sys, std::path::Path::new("/"), &mut throttle, std::process::id());
 
-    raw.integrity = Some(hemostat_sensor_freebsd::integrity::collect(&mut sys, std::path::Path::new("/")));
+    let held: u64 = raw.records().iter().map(|r| r.len() as u64).sum();
+    let room = st.room().saturating_sub(held).saturating_sub(64 * 1024);
+    raw.integrity = Some(hemostat_sensor_freebsd::integrity::collect_within(&mut sys, std::path::Path::new("/"), room));
+
+    let total: u64 = raw.records().iter().map(|r| r.len() as u64).sum();
+    let over = total.saturating_sub(st.room().saturating_sub(64 * 1024));
+    if let Some(ev) = raw.integrity.as_mut().filter(|_| over > 0) {
+        let own = u64::try_from(ev.size()).unwrap_or(u64::MAX);
+        ev.shed_to(own.saturating_sub(over));
+    }
     let records = raw.records();
     drop(raw);
 

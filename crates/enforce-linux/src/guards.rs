@@ -501,33 +501,96 @@ pub(crate) fn socket_inode(link_target: &str) -> Option<u64> {
 }
 
 pub(crate) fn pids_owning_inodes(inodes: &BTreeSet<u64>) -> (BTreeSet<u32>, bool) {
-    let mut owners = BTreeSet::new();
-    if inodes.is_empty() {
-
-        return (owners, fs::read_dir("/proc").is_ok());
-    }
     let Ok(dir) = fs::read_dir("/proc") else {
-        return (owners, false);
+        return (BTreeSet::new(), false);
     };
-    for entry in dir.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
-            continue;
-        };
-        let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
-            continue;
-        };
-        for fd in fds.flatten() {
-            if let Ok(target) = fs::read_link(fd.path()) {
-                if let Some(inode) = socket_inode(&target.to_string_lossy()) {
-                    if inodes.contains(&inode) {
-                        owners.insert(pid);
-                        break;
+
+    let mut listed_whole = true;
+    let pids = dir.filter_map(|e| match e {
+        Ok(e) => e.file_name().to_str()?.parse::<u32>().ok(),
+        Err(_) => {
+            listed_whole = false;
+            None
+        }
+    });
+    let (owners, complete) = owners_across(pids, |pid| {
+        walk_fds(
+            inodes,
+            || fs::read_dir(format!("/proc/{pid}/fd")),
+            |fd: &fs::DirEntry| fs::read_link(fd.path()).map(|t| t.to_string_lossy().into_owned()),
+            || !fs::symlink_metadata(format!("/proc/{pid}")).is_err_and(|e| gone(&e)),
+        )
+    });
+    (owners, complete && listed_whole)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FdWalk {
+
+    Owner,
+
+    NotOwner,
+
+    Unread,
+}
+
+pub(crate) fn gone(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
+}
+
+pub(crate) fn walk_fds<I, P>(
+    inodes: &BTreeSet<u64>,
+    list: impl FnOnce() -> std::io::Result<I>,
+    link: impl Fn(&P) -> std::io::Result<String>,
+    alive: impl FnOnce() -> bool,
+) -> FdWalk
+where
+    I: IntoIterator<Item = std::io::Result<P>>,
+{
+    let mut unread = false;
+    match list() {
+        Err(e) => unread = !gone(&e),
+
+        Ok(_) if inodes.is_empty() => {}
+        Ok(fds) => {
+            for fd in fds {
+                match fd.and_then(|fd| link(&fd)) {
+                    Ok(target) => {
+                        if socket_inode(&target).is_some_and(|i| inodes.contains(&i)) {
+                            return FdWalk::Owner;
+                        }
                     }
+
+                    Err(e) if e.raw_os_error() == Some(libc::ENAMETOOLONG) => {}
+                    Err(e) => unread |= !gone(&e),
                 }
             }
         }
     }
-    (owners, true)
+    if unread && alive() {
+        FdWalk::Unread
+    } else {
+        FdWalk::NotOwner
+    }
+}
+
+pub(crate) fn owners_across(
+    pids: impl IntoIterator<Item = u32>,
+    walk: impl Fn(u32) -> FdWalk,
+) -> (BTreeSet<u32>, bool) {
+    let mut owners = BTreeSet::new();
+    let (mut complete, mut init) = (true, false);
+    for pid in pids {
+        init |= pid == 1;
+        match walk(pid) {
+            FdWalk::Owner => {
+                owners.insert(pid);
+            }
+            FdWalk::NotOwner => {}
+            FdWalk::Unread => complete = false,
+        }
+    }
+    (owners, complete && init)
 }
 
 pub(crate) fn remove_preload_entry(text: &str, entry: &str) -> (String, bool) {

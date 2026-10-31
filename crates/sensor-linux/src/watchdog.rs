@@ -69,13 +69,15 @@ const INTERPRETERS: &[&str] =
     &["sh", "bash", "dash", "zsh", "ksh", "python", "python2", "python3", "perl", "ruby", "php"];
 
 pub fn script_of(p: &ProcSnapshot) -> Option<String> {
-    let exe = p.exe.as_deref()?;
+    script_in(p.exe.as_deref()?, p.cmdline.as_deref()?)
+}
+
+fn script_in(exe: &str, cmd: &str) -> Option<String> {
     let base = exe.rsplit('/').next()?;
     let base = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
     if !INTERPRETERS.contains(&base) && !INTERPRETERS.contains(&exe.rsplit('/').next()?) {
         return None;
     }
-    let cmd = p.cmdline.as_deref()?;
     let mut toks = cmd.split_whitespace();
     let _argv0 = toks.next()?;
     for t in toks {
@@ -260,6 +262,10 @@ pub fn own_names(p: &ProcSnapshot) -> Vec<String> {
 
 fn reads_program_elsewhere(p: &ProcSnapshot) -> bool {
     let (Some(exe), Some(cmd)) = (p.exe.as_deref(), p.cmdline.as_deref()) else { return false };
+    reads_elsewhere(exe, cmd)
+}
+
+fn reads_elsewhere(exe: &str, cmd: &str) -> bool {
     let full = exe.rsplit('/').next().unwrap_or(exe);
     let (shell, inline): (bool, &[char]) = match full.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.') {
         "sh" | "bash" | "dash" | "zsh" | "ksh" => (true, &['s', 'c']),
@@ -282,7 +288,7 @@ fn reads_program_elsewhere(p: &ProcSnapshot) -> bool {
     false
 }
 
-fn is_interpreter(path: &str) -> bool {
+pub(crate) fn is_interpreter(path: &str) -> bool {
     let full = path.rsplit('/').next().unwrap_or(path);
     let base = full.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
     INTERPRETERS.contains(&base) || INTERPRETERS.contains(&full)
@@ -359,7 +365,7 @@ pub fn attribute(p: &ProcSnapshot, unit: Option<&str>, procs: &[ProcSnapshot]) -
 }
 
 pub fn supervisor_of(p: &ProcSnapshot, procs: &[ProcSnapshot]) -> Supervisor {
-    let text = std::fs::read_to_string(format!("/proc/{}/cgroup", p.pid)).unwrap_or_default();
+    let text = crate::saferead::read_pid_text(format!("/proc/{}/cgroup", p.pid)).unwrap_or_default();
     attribute_cgroup(p, &text, procs)
 }
 
@@ -635,8 +641,23 @@ pub fn report() -> Report {
         out.push(loop_finding(p, &target, live, &unit));
     }
 
+    out.extend(cmdline_note(&procs).map(|f| (f, Vec::new())));
+
     let (findings, seeds): (Vec<Finding>, Vec<Vec<Pinned>>) = out.into_iter().unzip();
     Report { available: true, reason: None, findings, seeds }
+}
+
+fn cmdline_note(procs: &[ProcSnapshot]) -> Option<Finding> {
+    let what = crate::procfs::cmdline_gap(procs)?;
+    Some(Finding {
+        severity: Severity::Note,
+        subject: "command-line coverage".to_string(),
+        what,
+        why: "a command line padded past what the walk keeps costs the agent its head and tail and no more, so \
+              one process cannot spend the console's memory; a guard-pair partner or a restart loop's target named \
+              only in the middle is not in this sweep. `tr '\\0' ' ' < /proc/PID/cmdline` shows the whole of one"
+            .to_string(),
+    })
 }
 
 fn pair_finding(pa: &ProcSnapshot, ia: &str, pb: &ProcSnapshot, ib: &str) -> (Finding, Vec<Pinned>) {
@@ -690,5 +711,7 @@ pub fn watch(secs: u64) -> Vec<Finding> {
 
     let packages = crate::pkg::manager();
     let owned = |exe: &str| packages.as_ref().is_some_and(|m| m.owns(std::path::Path::new(exe)));
-    findings(&seen, &owned, &|_| false)
+    let mut out = findings(&seen, &owned, &|_| false);
+    out.extend(cmdline_note(&after).or_else(|| cmdline_note(&before)));
+    out
 }

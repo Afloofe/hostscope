@@ -17,6 +17,8 @@ pub struct ProcSnapshot {
 
     pub cmdline: Option<String>,
 
+    pub cmdline_cut: bool,
+
     pub starttime_ticks: u64,
 }
 
@@ -54,46 +56,66 @@ pub const PPID: FieldName = fields::PARENT_PROCESS_ID;
 
 const MAX_STAT_BYTES: u64 = 64 * 1024;
 
-const NOT_PROCFS: &str = "not a regular file on procfs — something is mounted over this process's \
-     entry, and it is neither opened nor read";
-
 fn read_pid_file(path: &Path, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
-    use std::os::fd::AsRawFd as _;
-    let refuse = || std::io::Error::new(std::io::ErrorKind::InvalidInput, NOT_PROCFS);
-    let at = crate::saferead::open_o_path(path)?;
-    let md = at.metadata()?;
-    if !md.is_file() {
-        return Err(refuse());
-    }
-    let asked = match on_procfs(&at) {
-        Ok(true) => true,
-        Ok(false) => return Err(refuse()),
-        Err(e) if e.raw_os_error() == Some(libc::EBADF) => false,
-        Err(e) => return Err(e),
-    };
-    let pinned = format!("/proc/self/fd/{}", at.as_raw_fd());
-    let (f, _) = crate::saferead::open_regular(Path::new(&pinned), NOT_PROCFS)?;
-    if !asked && !on_procfs(&f)? {
-        return Err(refuse());
-    }
-
-    crate::saferead::read_bounded(&f, cap)
+    crate::saferead::read_procfs(path, cap)
 }
 
-fn on_procfs(f: &fs::File) -> std::io::Result<bool> {
-    use std::os::fd::AsRawFd as _;
+pub const MAX_CMDLINE_KEPT: usize = 64 * 1024;
 
-    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+pub const MAX_WALK_CMDLINE_BYTES: usize = 32 * 1024 * 1024;
 
-    let rc = unsafe { libc::fstatfs(f.as_raw_fd(), &mut sfs) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
+const MAX_CMDLINE_FLOOR: usize = 2 * hs_core::MAX_FIELD_BYTES;
+
+pub(crate) fn keep_ends(s: String, keep: usize) -> (String, bool) {
+    use hs_core::event::CUT_MARK;
+    if s.len() <= keep {
+        return (s, false);
     }
-    Ok(is_proc_magic(sfs.f_type))
+    let half = keep / 2;
+    let mut head = half;
+    while head > 0 && !s.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = s.len().saturating_sub(half);
+    while tail < s.len() && !s.is_char_boundary(tail) {
+        tail += 1;
+    }
+    let mut out = String::with_capacity(head + CUT_MARK.len() + (s.len() - tail));
+    out.push_str(s.get(..head).unwrap_or_default());
+    out.push_str(CUT_MARK);
+    out.push_str(s.get(tail..).unwrap_or_default());
+    (out, true)
 }
 
-fn is_proc_magic(f_type: impl Into<i128>) -> bool {
-    f_type.into() == i128::from(libc::PROC_SUPER_MAGIC)
+pub(crate) fn charge_cmdline(budget: &mut usize, cmd: &mut String) -> bool {
+    if cmd.len() <= *budget {
+        *budget -= cmd.len();
+        return false;
+    }
+    *budget = 0;
+    let (kept, cut) = keep_ends(std::mem::take(cmd), MAX_CMDLINE_FLOOR);
+    *cmd = kept;
+    cut
+}
+
+pub fn cmdline_gap(procs: &[ProcSnapshot]) -> Option<String> {
+    let cut: Vec<u32> = procs.iter().filter(|p| p.cmdline_cut).map(|p| p.pid).collect();
+    if cut.is_empty() {
+        return None;
+    }
+    let shown: Vec<String> = cut.iter().take(10).map(u32::to_string).collect();
+    let more = cut.len() - shown.len();
+    Some(format!(
+        "{} of {} process(es) have a command line longer than the walk keeps of it ({} KiB each, {} MiB over every \
+         process) — pid {}{}. Only its head and tail were examined, so a rule or a match keyed on text in the cut \
+         middle has not been evaluated for those",
+        cut.len(),
+        procs.len(),
+        MAX_CMDLINE_KEPT / 1024,
+        MAX_WALK_CMDLINE_BYTES / (1024 * 1024),
+        shown.join(", "),
+        if more > 0 { format!(" and {more} more") } else { String::new() }
+    ))
 }
 
 pub fn read_process(pid: u32) -> Option<ProcSnapshot> {
@@ -121,16 +143,20 @@ pub fn read_process(pid: u32) -> Option<ProcSnapshot> {
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
 
+    let mut cmdline_cut = false;
     let cmdline = read_pid_file(&Path::new(&base).join("cmdline"), crate::saferead::MAX_PROC_BYTES)
         .ok()
-        .map(|(raw, _)| raw)
-        .map(|raw| {
-        raw.split(|b| *b == 0)
-            .filter(|s| !s.is_empty())
-            .map(String::from_utf8_lossy)
-            .collect::<Vec<_>>()
-            .join(" ")
-    });
+        .map(|(raw, read_cut)| {
+            let joined = raw
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(String::from_utf8_lossy)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (kept, kept_cut) = keep_ends(joined, MAX_CMDLINE_KEPT);
+            cmdline_cut = read_cut || kept_cut;
+            kept
+        });
 
     Some(ProcSnapshot {
         pid,
@@ -138,6 +164,7 @@ pub fn read_process(pid: u32) -> Option<ProcSnapshot> {
         uid,
         exe,
         cmdline: cmdline.filter(|c| !c.is_empty()),
+        cmdline_cut,
         starttime_ticks,
     })
 }
@@ -146,11 +173,17 @@ pub fn walk() -> Vec<ProcSnapshot> {
     let Ok(dir) = fs::read_dir("/proc") else {
         return Vec::new();
     };
-    let mut out: Vec<ProcSnapshot> = dir
-        .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+    let mut pids: Vec<u32> =
+        dir.flatten().filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok()).collect();
+    pids.sort_unstable();
+    let mut budget = MAX_WALK_CMDLINE_BYTES;
+    pids.into_iter()
         .filter_map(read_process)
-        .collect();
-    out.sort_by_key(|p| p.pid);
-    out
+        .map(|mut p| {
+            if let Some(cmd) = p.cmdline.as_mut() {
+                p.cmdline_cut |= charge_cmdline(&mut budget, cmd);
+            }
+            p
+        })
+        .collect()
 }

@@ -6,6 +6,10 @@ pub const STORE_DIR: &str = "/root/hemostat";
 
 pub const QUOTA_BYTES: u64 = 256 * 1024 * 1024;
 
+pub const RESERVED_BYTES: u64 = 32 * 1024 * 1024;
+
+pub const SHARED_BYTES: u64 = QUOTA_BYTES - RESERVED_BYTES;
+
 pub const DISK_FILESYSTEMS: &[&str] = &["ufs", "zfs"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,11 +258,25 @@ pub struct OverQuota {
     pub used: u64,
 
     pub wanted: u64,
+
+    pub limit: u64,
 }
 
 impl core::fmt::Display for OverQuota {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "the store holds {} bytes; {} more would pass its {QUOTA_BYTES}-byte quota", self.used, self.wanted)
+        if self.limit < QUOTA_BYTES {
+            write!(
+                f,
+                "the store holds {} bytes; {} more would reach into its last {} MiB, which are kept for the seals \
+                 fw block, fw confirm and undo make before a config write. Ship or copy the older stores under \
+                 {STORE_DIR} off the box, then remove them, to make room",
+                self.used,
+                self.wanted,
+                RESERVED_BYTES / (1024 * 1024)
+            )
+        } else {
+            write!(f, "the store holds {} bytes; {} more would pass its {QUOTA_BYTES}-byte quota", self.used, self.wanted)
+        }
     }
 }
 
@@ -279,10 +297,26 @@ impl Store {
     }
 
     pub fn admit(&self, wanted: u64) -> Result<(), OverQuota> {
-        let used = used(&self.path).unwrap_or(u64::MAX);
-        if used.saturating_add(wanted) > QUOTA_BYTES {
-            return Err(OverQuota { used, wanted });
-        }
-        Ok(())
+        admitted(self.held(), wanted, SHARED_BYTES)
     }
+
+    pub fn admit_reserved(&self, wanted: u64) -> Result<(), OverQuota> {
+        admitted(self.held(), wanted, QUOTA_BYTES)
+    }
+
+    pub fn room(&self) -> u64 {
+        SHARED_BYTES.saturating_sub(self.held())
+    }
+
+    fn held(&self) -> u64 {
+        used(&self.path).unwrap_or(u64::MAX)
+    }
+}
+
+#[cfg(unix)]
+fn admitted(used: u64, wanted: u64, limit: u64) -> Result<(), OverQuota> {
+    if used.saturating_add(wanted) > limit {
+        return Err(OverQuota { used, wanted, limit });
+    }
+    Ok(())
 }

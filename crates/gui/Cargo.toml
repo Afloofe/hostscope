@@ -1,0 +1,23 @@
+[package]
+name = "hemostat-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "On-host operator GUI: the console's own views, drawn as pixels with real buttons and fed real mouse and keyboard events."
+
+# Nothing here touches a window, a framebuffer or a device. The platform layers
+# that do live in the FFI crates (`sensor-win`, `sensor-linux`) and are adapted
+# to `backend::Backend` by the cli, so this crate stays `forbid(unsafe_code)`
+# and every piece of it can be unit-tested with no display at all.
+[dependencies]
+# The views, their state machines and the `Surface` this crate implements.
+# Everything that decides what a key or a click means stays there.
+hemostat-tui = { path = "../tui" }
+# The cell buffer the views render into, which is what gets drawn as pixels.
+# The same version and features `hemostat-tui` already uses, so nothing new is
+# compiled.
+ratatui-core = { version = "0.1.2", default-features = false }
+
+[lints]
+workspace = true

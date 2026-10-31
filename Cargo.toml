@@ -28,6 +28,7 @@ members = [
     "crates/enforce-pf",
     "crates/cli",
     "crates/tui",
+    "crates/gui",
     "crates/safestr",
 ]
 

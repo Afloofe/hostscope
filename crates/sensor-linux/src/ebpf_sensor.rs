@@ -717,8 +717,8 @@ pub fn gather_facts(ev: &Event) -> ExecFacts {
         f.exe_path = Some(path.to_string());
         f.deleted = deleted;
     }
-    if let Ok(stat) = std::fs::read(format!("/proc/{}/stat", ev.pid)) {
-        f.tty_nr = parse_tty_nr(&String::from_utf8_lossy(&stat));
+    if let Ok(stat) = crate::saferead::read_pid_text(format!("/proc/{}/stat", ev.pid)) {
+        f.tty_nr = parse_tty_nr(&stat);
     }
     f
 }

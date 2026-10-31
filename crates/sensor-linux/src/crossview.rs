@@ -59,7 +59,7 @@ fn hidepid_of(mountinfo: &str) -> Option<String> {
 }
 
 fn kernel_task_total() -> Option<u64> {
-    fs::read_to_string("/proc/loadavg").ok().and_then(|s| loadavg_total(&s))
+    crate::saferead::read_kernel_text("/proc/loadavg").ok().and_then(|s| loadavg_total(&s))
 }
 
 fn loadavg_total(text: &str) -> Option<u64> {
@@ -185,12 +185,12 @@ pub fn report() -> Report {
 
     let mut net_read = false;
     for path in ["/proc/net/raw", "/proc/net/raw6"] {
-        if let Ok(t) = fs::read_to_string(path) {
+        if let Ok(t) = crate::saferead::read_kernel_text(path) {
             net_read = true;
             report.raw_sockets += count_raw_rows(&t);
         }
     }
-    if let Ok(t) = fs::read_to_string("/proc/net/packet") {
+    if let Ok(t) = crate::saferead::read_kernel_text("/proc/net/packet") {
         net_read = true;
         report.packet_sockets = count_packet_rows(&t);
     }
@@ -232,7 +232,7 @@ pub fn report() -> Report {
     }
 
     let mut hidepid = None;
-    match fs::read_to_string("/proc/self/mountinfo") {
+    match crate::saferead::read_kernel_text("/proc/self/mountinfo") {
         Err(_) => skipped.push(("hidepid", "/proc/self/mountinfo was unreadable")),
         Ok(mi) => {
             report.available = true;

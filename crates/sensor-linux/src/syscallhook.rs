@@ -148,7 +148,8 @@ pub(crate) struct Kcore {
 impl Kcore {
 
     pub(crate) fn open() -> std::io::Result<Self> {
-        let mut file = File::open("/proc/kcore")?;
+
+        let mut file = crate::saferead::open_kernel_file(std::path::Path::new("/proc/kcore"))?;
         let mut ehdr = [0u8; 64];
         file.read_exact(&mut ehdr)?;
         if ehdr.get(0..4) != Some(b"\x7fELF".as_slice()) || ehdr.get(4) != Some(&2) {

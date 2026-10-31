@@ -14,6 +14,8 @@ pub mod reg;
 pub mod rng;
 pub mod etw;
 pub mod evtlog;
+pub mod gui_window;
+pub mod gui_window_logic;
 pub mod streams;
 pub mod sysmon;
 pub mod usn;

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::golden::{self, ScoredService};
-use crate::winservice::WinStep;
+use crate::winservice::{StartError, Streak, Strike, WinStep};
 use crate::{EXIT_DRYRUN, EXIT_ENFORCER, EXIT_OK, EXIT_PARTIAL, EXIT_POLICY};
 
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -16,7 +16,9 @@ pub(crate) fn watch(args: &[String], json: bool, every_secs: u64) -> u8 {
     }
     let armed = args.iter().any(|a| a == "--arm");
     let every = every_secs.max(1);
-    let mut failures: BTreeMap<String, u32> = BTreeMap::new();
+    let mut failures: BTreeMap<String, Streak> = BTreeMap::new();
+
+    let mut handed: BTreeSet<String> = BTreeSet::new();
 
     if !json {
         println!(
@@ -56,6 +58,7 @@ pub(crate) fn watch(args: &[String], json: bool, every_secs: u64) -> u8 {
                 for &w in golden::win_services_for(s.probe) {
                     if !down.iter().any(|(_, d, _)| *d == w) {
                         failures.remove(w);
+                        handed.remove(w);
                     }
                 }
             }
@@ -72,10 +75,13 @@ pub(crate) fn watch(args: &[String], json: bool, every_secs: u64) -> u8 {
             for (s, w, step) in down {
                 did = true;
                 let port = s.port.map_or_else(|| "its port".to_string(), |p| p.to_string());
-                let backed_off = failures.get(w).copied().unwrap_or(0) >= MAX_CONSECUTIVE_FAILURES;
-                if backed_off {
+                let streak = failures.get(w).copied().unwrap_or_default();
+                if streak.total() >= MAX_CONSECUTIVE_FAILURES {
                     if !json {
-                        println!("[{now}] BACKED-OFF {} → {} (sc start keeps failing — needs a human)", s.service, w);
+                        println!(
+                            "[{now}] BACKED-OFF {} → {} ({})",
+                            s.service, w, streak.backed_off_why(&port, crate::winservice::port_closed_hint(s.probe))
+                        );
                     }
                     continue;
                 }
@@ -84,7 +90,7 @@ pub(crate) fn watch(args: &[String], json: bool, every_secs: u64) -> u8 {
 
                     WinStep::NeedsHuman => {
                         if armed {
-                            *failures.entry(w.to_string()).or_default() += 1;
+                            failures.entry(w.to_string()).or_default().strike(Strike::RunningPortClosed);
                         }
                         if !json {
                             println!(
@@ -103,18 +109,28 @@ pub(crate) fn watch(args: &[String], json: bool, every_secs: u64) -> u8 {
                 }
                 if !armed {
                     if !json {
-                        println!("[{now}] DOWN   {} → sc start {} (dry run)", s.service, w);
+
+                        match crate::winservice::stock_refusal(w) {
+                            None => println!("[{now}] DOWN   {} → sc start {} (dry run)", s.service, w),
+                            Some(why) => println!(
+                                "[{now}] DOWN   {} → {} would NOT be started: {} — needs a human (dry run)",
+                                s.service,
+                                w,
+                                crate::render::h(&why)
+                            ),
+                        }
                     }
                     continue;
                 }
                 match crate::winservice::start_and_verify(w) {
                     Ok(()) => {
+                        handed.remove(w);
 
                         let back = crate::winservice::back_after_start(s.port, s.port.and_then(await_port));
                         if back {
                             failures.remove(w);
                         } else {
-                            *failures.entry(w.to_string()).or_default() += 1;
+                            failures.entry(w.to_string()).or_default().strike(Strike::StartedPortClosed);
                         }
                         audit_or_warn(&format!("watchdog {} -> sc start {} [running]", s.service, w));
                         if !json {
@@ -128,10 +144,24 @@ pub(crate) fn watch(args: &[String], json: bool, every_secs: u64) -> u8 {
                             }
                         }
                     }
-                    Err(e) => {
-                        *failures.entry(w.to_string()).or_default() += 1;
+
+                    Err(StartError::NotStock(why)) => {
+                        if handed.insert(w.to_string()) {
+                            audit_or_warn(&format!("watchdog {} -> {} NOT STARTED, needs a human: {why}", s.service, w));
+                        }
                         if !json {
-                            println!("[{now}] FAILED {} → {}: {}", s.service, w, e);
+                            println!(
+                                "[{now}] NOT STARTED {} → {}: {} — needs a human: put back its stock binary (`sc qc {w}`)",
+                                s.service,
+                                w,
+                                crate::render::h(&why)
+                            );
+                        }
+                    }
+                    Err(StartError::Failed(e)) => {
+                        failures.entry(w.to_string()).or_default().strike(Strike::StartFailed);
+                        if !json {
+                            println!("[{now}] FAILED {} → {}: {}", s.service, w, crate::render::h(&e));
                         }
                     }
                 }
@@ -265,16 +295,30 @@ pub(crate) fn restore_scored(args: &[String], json: bool) -> u8 {
     }
 
     if !armed {
+
+        let judged: Vec<(&ScoredService, &str, Option<String>)> =
+            plan.iter().map(|(s, w)| (*s, *w, crate::winservice::stock_refusal(w))).collect();
         if json {
-            let rows: Vec<String> = plan
+            let rows: Vec<String> = judged
                 .iter()
-                .map(|(s, w)| format!("{{\"service\":\"{}\",\"unit\":\"{}\",\"outcome\":\"planned\"}}", s.service, w))
+                .map(|(s, w, why)| {
+                    let outcome = if why.is_some() { "not-stock" } else { "planned" };
+                    format!("{{\"service\":\"{}\",\"unit\":\"{}\",\"outcome\":\"{outcome}\"}}", s.service, w)
+                })
                 .collect();
             println!("{{\"restore\":{{\"os\":\"windows\",\"armed\":false{role_json},\"planned\":[{}],{}}}}}", rows.join(","), extra_json());
         } else {
             println!("scored services — {} down (dry run — add --arm to restart):", plan.len());
-            for (s, w) in &plan {
-                println!("  [plan] {} → sc start {}", s.service, w);
+            for (s, w, why) in &judged {
+                match why {
+                    None => println!("  [plan] {} → sc start {}", s.service, w),
+                    Some(why) => println!(
+                        "  [would not start] {} → {}: {} — needs a human",
+                        s.service,
+                        w,
+                        crate::render::h(why)
+                    ),
+                }
             }
             print_extra();
         }
@@ -285,6 +329,7 @@ pub(crate) fn restore_scored(args: &[String], json: bool) -> u8 {
         println!("scored services — restarting {} down service(s)", plan.len());
     }
     let mut any_fail = false;
+    let mut hand_off = false;
     let mut rows: Vec<String> = Vec::new();
     for (s, w) in &plan {
         match crate::winservice::start_and_verify(w) {
@@ -306,10 +351,23 @@ pub(crate) fn restore_scored(args: &[String], json: bool) -> u8 {
                 let outcome = if back { "running" } else { "started-port-closed" };
                 rows.push(format!("{{\"service\":\"{}\",\"unit\":\"{}\",\"outcome\":\"{outcome}\"}}", s.service, w));
             }
-            Err(e) => {
+
+            Err(StartError::NotStock(why)) => {
+                hand_off = true;
+                if !json {
+                    eprintln!(
+                        "  [not started] {} → {}: {} — needs a human: put back its stock binary (`sc qc {w}`)",
+                        s.service,
+                        w,
+                        crate::render::h(&why)
+                    );
+                }
+                rows.push(format!("{{\"service\":\"{}\",\"unit\":\"{}\",\"outcome\":\"not-stock\"}}", s.service, w));
+            }
+            Err(StartError::Failed(e)) => {
                 any_fail = true;
                 if !json {
-                    eprintln!("  [failed] {} → {}: {}", s.service, w, e);
+                    eprintln!("  [failed] {} → {}: {}", s.service, w, crate::render::h(&e));
                 }
                 rows.push(format!("{{\"service\":\"{}\",\"unit\":\"{}\",\"outcome\":\"failed\"}}", s.service, w));
             }
@@ -322,6 +380,8 @@ pub(crate) fn restore_scored(args: &[String], json: bool) -> u8 {
     }
     if any_fail {
         EXIT_ENFORCER
+    } else if hand_off {
+        EXIT_POLICY
     } else {
         rest
     }
@@ -534,16 +594,15 @@ pub(crate) fn uninstall_watchdog(args: &[String]) -> u8 {
 }
 
 pub(crate) fn audit(what: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
 
     let dir = crate::win_private::ensure(&[]).map_err(std::io::Error::other)?;
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("fixes.log"))?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    f.write_all(format!("epoch={now} {what}\n").as_bytes())
+    let line = format!("epoch={now} {}\n", what.replace(['\r', '\n'], " "));
+    crate::win_private::append_regular(&dir, "fixes.log", line.as_bytes()).map_err(std::io::Error::other)
 }
 
 pub(crate) fn audit_or_warn(what: &str) {

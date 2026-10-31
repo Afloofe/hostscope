@@ -101,7 +101,7 @@ const TAINT_OOT_MODULE: u64 = 1 << 12;
 const TAINT_UNSIGNED_MODULE: u64 = 1 << 13;
 
 fn global_taint() -> Option<u64> {
-    fs::read_to_string("/proc/sys/kernel/tainted")
+    crate::saferead::read_kernel_text("/proc/sys/kernel/tainted")
         .ok()?
         .trim()
         .parse()
@@ -114,7 +114,7 @@ fn accounted_taint_letters() -> Option<BTreeSet<char>> {
     for entry in dir.flatten() {
 
         let path = entry.path().join("taint");
-        if let Ok(s) = fs::read_to_string(&path) {
+        if let Ok(s) = crate::saferead::read_kernel_text(&path) {
             out.extend(s.trim().chars());
         }
     }
@@ -223,7 +223,7 @@ fn cross_views(v: &Views) -> Vec<Finding> {
 
 pub fn report() -> Report {
 
-    let Ok(proc_text) = fs::read("/proc/modules").map(|b| name_key(&b).into_owned()) else {
+    let Ok(proc_text) = crate::saferead::read_kernel_bytes("/proc/modules").map(|b| name_key(&b).into_owned()) else {
         return Report {
             available: false,
             reason: Some("/proc/modules could not be read, so no baseline to compare against".into()),
@@ -233,7 +233,7 @@ pub fn report() -> Report {
     let v = Views {
         proc: proc_module_names(&proc_text),
         sysfs: sysfs_loaded_modules(),
-        tags: fs::read("/proc/kallsyms").ok().map(|t| kallsyms_module_tags(&name_key(&t))),
+        tags: crate::saferead::read_kernel_bytes("/proc/kallsyms").ok().map(|t| kallsyms_module_tags(&name_key(&t))),
         taint: global_taint(),
         accounted: accounted_taint_letters(),
     };

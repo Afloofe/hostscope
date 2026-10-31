@@ -55,7 +55,7 @@ pub(crate) fn pids_via_readdir() -> Option<BTreeSet<u32>> {
 }
 
 fn pid_max() -> u32 {
-    fs::read_to_string("/proc/sys/kernel/pid_max")
+    crate::saferead::read_kernel_text("/proc/sys/kernel/pid_max")
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(32768)
@@ -63,11 +63,11 @@ fn pid_max() -> u32 {
 
 fn is_hidden_leader_candidate(pid: u32) -> bool {
 
-    let Ok(status) = std::fs::read(format!("/proc/{pid}/status")) else {
+    let Ok(status) = crate::saferead::read_pid_text(format!("/proc/{pid}/status")) else {
 
         return false;
     };
-    String::from_utf8_lossy(&status)
+    status
         .lines()
         .find_map(|l| l.strip_prefix("Tgid:"))
         .and_then(|v| v.trim().parse::<u32>().ok())
@@ -680,7 +680,7 @@ fn service_pids(names: &[&str]) -> Vec<(u32, String)> {
         let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
             continue;
         };
-        if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        if let Ok(comm) = crate::saferead::read_pid_text(format!("/proc/{pid}/comm")) {
             let comm = comm.trim();
             if let Some(name) = names.iter().find(|n| **n == comm) {
                 out.push((pid, (*name).to_string()));

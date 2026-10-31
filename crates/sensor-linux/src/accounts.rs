@@ -302,7 +302,7 @@ fn sudoers_from(roots: &[&str], out: &mut Vec<Finding>, unread: &mut Vec<String>
 
     let mut cut: Vec<String> = Vec::new();
 
-    let host = fs::read_to_string("/proc/sys/kernel/hostname")
+    let host = crate::saferead::read_kernel_text("/proc/sys/kernel/hostname")
         .ok()
         .map(|h| h.trim().to_string());
 

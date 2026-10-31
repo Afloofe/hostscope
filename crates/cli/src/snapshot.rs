@@ -305,19 +305,29 @@ pub(crate) fn service_baseline(dir: &str) -> hemostat_sensor_linux::services::Ba
 }
 
 pub(crate) fn anchor_baseline(dir: &str) -> hemostat_sensor_linux::trust::Baseline {
+    arrival_anchors(dir).0
+}
+
+pub(crate) fn arrival_anchors(dir: &str) -> (hemostat_sensor_linux::trust::Baseline, Option<String>) {
     use hemostat_sensor_linux::trust::Baseline;
-    if !Path::new(dir).exists() {
-        return Baseline::None(format!("no arrival snapshot at {dir} (`hemostat snapshot` takes one)"));
+    let refused = |why: String| (Baseline::None(why.clone()), Some(why));
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (Baseline::None(format!("no arrival snapshot at {dir} (`hemostat snapshot` takes one)")), None);
+        }
+        Err(e) => return refused(format!("whether there is an arrival snapshot at {dir} could not be told: {e}")),
     }
-    match read(dir) {
-        Err(e) => Baseline::None(format!("the arrival snapshot at {dir} was not read: {e}")),
+    let baseline = match read(dir) {
+        Err(e) => return refused(format!("the arrival snapshot at {dir} was not read: {e}")),
         Ok(st) if st.snap.scope < 4 => Baseline::None(format!(
             "the arrival snapshot at {dir} was taken by an earlier build that did not record trust anchors              (`snapshot --replace` records them from now on)"
         )),
         Ok(st) => Baseline::Anchors(
             st.snap.items.keys().filter_map(|k| k.strip_prefix("anchor/")).map(str::to_string).collect(),
         ),
-    }
+    };
+    (baseline, None)
 }
 
 pub(crate) fn drift(args: &[String], json: bool) -> u8 {

@@ -361,8 +361,8 @@ fn canary_line(path: &std::path::Path, pid: u32, who: &str) -> String {
 
 #[cfg(all(target_os = "linux", any(feature = "mod-deceive", feature = "mod-sensor-fanotify")))]
 pub(crate) fn comm_of(pid: u32) -> String {
-    std::fs::read(format!("/proc/{pid}/comm"))
-        .map_or_else(|_| "?".into(), |c| String::from_utf8_lossy(&c).trim().to_string())
+    hemostat_sensor_linux::saferead::read_pid_text(format!("/proc/{pid}/comm"))
+        .map_or_else(|_| "?".into(), |c| c.trim().to_string())
 }
 
 #[cfg(all(target_os = "linux", feature = "mod-acquire"))]
@@ -2150,7 +2150,7 @@ pub(crate) fn print_narrow(
     };
 
     if let Some(pid) = pid {
-        let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
+        let Ok(text) = hemostat_sensor_linux::saferead::read_pid_text(format!("/proc/{pid}/cgroup")) else {
             eprintln!(
                 "hemostat network: pid {pid} has no /proc/{pid}/cgroup — it has exited, or this \
                  run cannot read it. Nothing was changed"

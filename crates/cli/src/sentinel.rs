@@ -150,8 +150,8 @@ fn parse_uids(status: &str) -> Option<(u32, u32)> {
 #[cfg(target_os = "linux")]
 fn uids_of(pid: u32) -> Option<(u32, u32)> {
 
-    let status = std::fs::read(format!("/proc/{pid}/status")).ok()?;
-    parse_uids(&String::from_utf8_lossy(&status))
+    let status = hemostat_sensor_linux::saferead::read_pid_text(format!("/proc/{pid}/status")).ok()?;
+    parse_uids(&status)
 }
 
 #[cfg(target_os = "linux")]

@@ -381,12 +381,18 @@ pub fn scan(root: &Path) -> (Vec<Redirect>, Vec<String>) {
             }
         }
     }
-    let (procs, refused) = processes(root);
+    let (procs, refused, mounted) = processes(root);
     out.extend(procs);
     if refused > 0 {
         unread.push(format!(
             "the environments of {refused} process(es) could not be read, so a setting in force only in a running \
              process would not be seen there; re-run as root"
+        ));
+    }
+    if mounted > 0 {
+        unread.push(format!(
+            "the environments of {mounted} process(es) have something mounted over them and were not read, so a \
+             setting in force only there would not be seen; `grep /proc/PID /proc/self/mountinfo` names the mount"
         ));
     }
     out.dedup();
@@ -417,10 +423,11 @@ fn redirect(root: &Path, var: String, value: String, at_: &str, line: Option<Str
     Redirect { var, value, target, at: at_.to_string(), line, system, exists }
 }
 
-fn processes(root: &Path) -> (Vec<Redirect>, usize) {
+fn processes(root: &Path) -> (Vec<Redirect>, usize, usize) {
     let mut seen: BTreeMap<(String, String), (u32, String, usize)> = BTreeMap::new();
     let mut refused = 0usize;
-    let Ok(rd) = std::fs::read_dir(at(root, "/proc")) else { return (Vec::new(), 0) };
+    let mut mounted = 0usize;
+    let Ok(rd) = std::fs::read_dir(at(root, "/proc")) else { return (Vec::new(), 0, 0) };
     let mut pids: Vec<u32> = rd.flatten().filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok())).collect();
     pids.sort_unstable();
     for pid in pids {
@@ -429,6 +436,10 @@ fn processes(root: &Path) -> (Vec<Redirect>, usize) {
             Ok((b, _)) => b,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 refused += 1;
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                mounted += 1;
                 continue;
             }
             Err(_) => continue,
@@ -457,5 +468,5 @@ fn processes(root: &Path) -> (Vec<Redirect>, usize) {
             redirect(root, var, value, &at_, None, None)
         })
         .collect();
-    (out, refused)
+    (out, refused, mounted)
 }

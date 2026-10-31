@@ -17,6 +17,8 @@ pub use sweep::report;
 
 use walk::home_dirs;
 
+pub(crate) use walk::boot_time;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Category {
 

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::authenticode::Trust;
 use crate::posture::{Finding, Severity};
 use crate::provenance::{self, Chronology, Dating, Install, Mark};
 
@@ -505,6 +506,10 @@ pub struct Sweep {
 
     pub present: BTreeMap<u64, String>,
 
+    pub now_at: BTreeMap<u64, AtPathNow>,
+
+    pub own: Option<OwnDir>,
+
     pub findings: Vec<Finding>,
 }
 
@@ -740,6 +745,120 @@ pub fn attribute_to_successor(f: &mut Finding, s: &FileStory, successor: &FileSt
     true
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtPathNow {
+
+    pub path: String,
+
+    pub trust: Trust,
+
+    pub signer: Option<String>,
+}
+
+pub const MICROSOFT_SIGNERS: &[&str] = &["Microsoft Windows", "Microsoft Corporation"];
+
+pub fn microsoft_signer(now: &AtPathNow) -> Result<&str, String> {
+    match (&now.trust, now.signer.as_deref()) {
+        (Trust::Valid, Some(by)) if MICROSOFT_SIGNERS.contains(&by) => Ok(by),
+        (Trust::Valid, Some(by)) => Err(format!("it is signed by {by}, not by Microsoft")),
+        (Trust::Valid, None) => Err("its signature verifies and its signer could not be named".into()),
+        (Trust::Unsigned, _) => Err("it is unsigned".into()),
+        (Trust::Broken(why), _) => Err(format!("its signature is broken: {why}")),
+        (Trust::Untrusted(why), _) => Err(format!("its signature is not trusted here: {why}")),
+        (Trust::Unknown(why), _) => Err(format!("its signature could not be checked: {why}")),
+    }
+}
+
+pub fn now_path(parent: &str, name: &str) -> String {
+    format!(r"{}\{name}", parent.trim_start_matches(r"\\?\").trim_end_matches('\\'))
+}
+
+pub fn in_windows_own_dir(path: &str, system_root: Option<&str>) -> Option<String> {
+    const SWAP: &str = "one Microsoft binary put in place of another (cmd.exe as sethc.exe) is itself the attack";
+    let Some(root) = system_root.map(norm_path).filter(|r| !r.is_empty()) else {
+        return Some(format!(
+            "and %SystemRoot% is not known, so whether it is in Windows' own directory, where {SWAP}, could not be told"
+        ));
+    };
+    norm_path(path).starts_with(&format!(r"{root}\")).then(|| {
+        let shown = system_root.unwrap_or_default().trim_start_matches(r"\\?\").trim_end_matches('\\');
+        format!("under {shown}, Windows' own directory, where every binary is Microsoft's and {SWAP}")
+    })
+}
+
+pub fn attribute_to_signed(f: &mut Finding, s: &FileStory, now: &AtPathNow, system_root: Option<&str>) -> bool {
+    if f.severity != Severity::Critical || s.lifecycle != Lifecycle::CreatedThenDeleted {
+        return false;
+    }
+    let signed = microsoft_signer(now).and_then(|by| match in_windows_own_dir(&now.path, system_root) {
+        None => Ok(by),
+        Some(why) => Err(format!("it is signed by {by} {why}")),
+    });
+    let signer = match signed {
+        Ok(by) => by,
+        Err(why) => {
+            let sep = if f.why.ends_with('.') { " " } else { ". " };
+            f.why = format!(
+                "{}{sep}A file of this name is at that path now, {}, but {why}, so it does not lower this",
+                f.why, now.path
+            );
+            return false;
+        }
+    };
+    f.severity = Severity::Note;
+    f.subject = format!("{} — replaced by a Microsoft-signed file", f.subject);
+    f.what = format!("{}; a file of the same name is at that path now, {}, signed by {signer}", f.what, now.path);
+    f.why = format!(
+        "software that updates itself replaces its own executables where they stand, as OneDrive does \
+         under the user's profile and under Program Files, so a copy an update replaced inside the \
+         window reads as created and deleted. The file at that path now, outside Windows' own \
+         directory, verifies, embedded or through a catalog, as signed by {signer}. The name did not \
+         lower this: the same shape with nothing at that path now, with a file there that is unsigned \
+         or signed by anyone else, or under %SystemRoot%, where one Microsoft binary put in place of \
+         another is itself the attack, is still Critical. It is a Note and not nothing because only the \
+         file there now was verified, not the one that ran: whoever can write that directory can run a \
+         payload of this name and then put a Microsoft-signed file in its place"
+    );
+    true
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnDir {
+
+    pub dir: String,
+
+    pub names: Vec<String>,
+}
+
+pub fn own_file<'p>(s: &FileStory, parents: &'p BTreeMap<u64, String>, own: &OwnDir) -> Option<&'p str> {
+    if s.origin_ref != s.parent_ref || !own.names.iter().any(|n| n.eq_ignore_ascii_case(&s.name)) {
+        return None;
+    }
+    let dir = parents.get(&s.parent_ref)?;
+    (norm_path(dir) == norm_path(&own.dir)).then_some(dir.as_str())
+}
+
+pub fn attribute_to_own(f: &mut Finding, s: &FileStory, dir: &str) -> bool {
+    if f.severity < Severity::Warn || !matches!(s.lifecycle, Lifecycle::CreatedThenDeleted | Lifecycle::Deleted) {
+        return false;
+    }
+    let dir = dir.trim_start_matches(r"\\?\");
+    f.severity = Severity::Note;
+    f.subject = format!("{} — the agent's own file", f.subject);
+    f.what = format!("{}, in {dir}, the agent's own directory", f.what);
+    f.why = format!(
+        "the agent writes this file in its own directory and writes it again as it works: the \
+         watchdog's wrapper is written fresh by every `services --install-watchdog` and removed by \
+         `--uninstall-watchdog`, so the copy it replaced reads as created and deleted. {dir} was \
+         checked just before this sweep and is owned by SYSTEM or Administrators, grants nothing to \
+         anyone else and is not a link, so nobody but an administrator can write in it, and the \
+         journal's first and last records of the file both place it there. The name did not lower \
+         this alone: the same name in any other directory, or one moved in from another, is graded \
+         as before. It is a Note and not nothing because an administrator can write there too"
+    );
+    true
+}
+
 impl Sweep {
 
     pub const fn complete(&self) -> bool {
@@ -798,6 +917,10 @@ pub enum Fold {
     Diagnostic,
 
     Replaced,
+
+    Signed,
+
+    Own,
 }
 
 impl Fold {
@@ -827,6 +950,15 @@ impl Fold {
                 "executables deleted — replaced by a newer copy",
                 "each deleted with its directory after a file of the same name was created in a new \
                  directory beside it, which is on disk now",
+            ),
+            Fold::Signed => (
+                "executables created and deleted — replaced by a Microsoft-signed file",
+                "each created and then deleted inside the journal window, at a path outside %SystemRoot% \
+                 that holds a file of the same name signed by Microsoft now",
+            ),
+            Fold::Own => (
+                "the agent's own files — rewritten in its own directory",
+                "each a file the agent writes in its own private directory, written again or removed there",
             ),
         }
     }
@@ -926,6 +1058,24 @@ pub fn judge(s: &Sweep) -> Vec<Finding> {
             if let Some((successor, at)) = successor_for(st, &idx, &s.present) {
                 if attribute_to_successor(&mut finding, st, successor, at) {
                     fold = Some(Fold::Replaced);
+                }
+            }
+        }
+        if finding.severity == Severity::Critical {
+            if let Some(now) = s.now_at.get(&st.file_ref) {
+                if attribute_to_signed(&mut finding, st, now, s.system_root.as_deref()) {
+                    fold = Some(Fold::Signed);
+                    tie = Some(now.signer.as_deref().map_or_else(|| now.path.clone(), |by| format!("{} ({by})", now.path)));
+                }
+            }
+        }
+
+        if let Some(dir) = s.own.as_ref().and_then(|o| own_file(st, &s.parents, o)) {
+            if let Some(mut own) = judge_lifecycle(st) {
+                if attribute_to_own(&mut own, st, dir) {
+                    finding = own;
+                    fold = Some(Fold::Own);
+                    tie = Some(dir.trim_start_matches(r"\\?\").to_string());
                 }
             }
         }
@@ -1249,10 +1399,24 @@ pub fn journal_id(_volume: &str) -> Result<Option<u64>, String> {
 }
 
 #[cfg(target_os = "windows")]
+fn at_path_now(path: &str) -> Option<AtPathNow> {
+    let (p, md) = crate::localpath::vet(path).ok()??;
+    if !md.is_file() {
+        return None;
+    }
+    let (trust, signer) = crate::authenticode::verify_signer(&p);
+    Some(AtPathNow { path: p, trust, signer })
+}
+
 pub fn sweep(volume: &str) -> Sweep {
+    sweep_with(volume, None)
+}
+
+#[cfg(target_os = "windows")]
+pub fn sweep_with(volume: &str, own: Option<OwnDir>) -> Sweep {
     use windows_sys::Win32::Foundation::CloseHandle;
 
-    let mut s = Sweep { volume: volume.to_string(), ..Default::default() };
+    let mut s = Sweep { volume: volume.to_string(), own, ..Default::default() };
 
     let h = match open_volume(volume) {
         Ok(h) => h,
@@ -1296,11 +1460,29 @@ pub fn sweep(volume: &str) -> Sweep {
                     }
                 }
             }
+
+            if let Some(o) = &s.own {
+                for st in s.stories.iter().filter(|st| o.names.iter().any(|n| n.eq_ignore_ascii_case(&st.name))) {
+                    want.push(st.parent_ref);
+                }
+            }
             for r in want {
                 if let std::collections::btree_map::Entry::Vacant(slot) = s.parents.entry(r) {
                     if let Some(path) = path_of_id(h, r) {
                         slot.insert(path);
                     }
+                }
+            }
+
+            let mut checked: BTreeMap<String, Option<AtPathNow>> = BTreeMap::new();
+            for st in &s.stories {
+                let critical = st.lifecycle == Lifecycle::CreatedThenDeleted
+                    && !windows_own_churn(&st.name)
+                    && judge_lifecycle(st).is_some_and(|f| f.severity == Severity::Critical);
+                let Some(parent) = s.parents.get(&st.parent_ref).filter(|_| critical) else { continue };
+                let path = now_path(parent, &st.name);
+                if let Some(now) = checked.entry(path.to_ascii_lowercase()).or_insert_with(|| at_path_now(&path)) {
+                    s.now_at.insert(st.file_ref, now.clone());
                 }
             }
 
@@ -1337,10 +1519,11 @@ pub fn sweep(volume: &str) -> Sweep {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn sweep(volume: &str) -> Sweep {
+pub fn sweep_with(volume: &str, own: Option<OwnDir>) -> Sweep {
     Sweep {
         volume: volume.to_string(),
         error: Some("this build does not run on Windows, so no journal was read".into()),
+        own,
         ..Default::default()
     }
 }

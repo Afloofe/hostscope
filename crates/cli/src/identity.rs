@@ -24,11 +24,11 @@ pub(crate) fn gather_identity() -> std::io::Result<Identity> {
         ),
         (
             "/sys/class/dmi/id/product_uuid",
-            std::fs::read_to_string("/sys/class/dmi/id/product_uuid").ok(),
+            hemostat_sensor_linux::saferead::read_kernel_text("/sys/class/dmi/id/product_uuid").ok(),
         ),
         (
             "/proc/sys/kernel/hostname",
-            std::fs::read_to_string("/proc/sys/kernel/hostname").ok(),
+            hemostat_sensor_linux::saferead::read_kernel_text("/proc/sys/kernel/hostname").ok(),
         ),
     ]
     .into_iter()
@@ -146,7 +146,7 @@ pub(crate) fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn read_boot_id() -> Option<[u8; 16]> {
-    let s = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let s = hemostat_sensor_linux::saferead::read_kernel_text("/proc/sys/kernel/random/boot_id").ok()?;
     parse_hex16(&s)
 }
 

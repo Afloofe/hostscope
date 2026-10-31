@@ -701,7 +701,8 @@ fn running_daemons() -> Running {
         let Ok(exe) = std::fs::read_link(base.join("exe")) else { continue };
         let exe = exe.to_string_lossy();
         if Path::new(exe.strip_suffix(" (deleted)").unwrap_or(&exe)).file_name() != Some("sshd".as_ref())
-            || !std::fs::read(base.join("status")).is_ok_and(|s| runs_as_root(&s))
+            || !crate::saferead::read_proc(&base.join("status"), crate::saferead::MAX_PID_FILE_BYTES)
+                .is_ok_and(|(s, _)| runs_as_root(&s))
             || ns(&base, "net").as_ref() != Some(&our_net)
         {
             continue;

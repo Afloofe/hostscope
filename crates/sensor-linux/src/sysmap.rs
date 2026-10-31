@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs;
 
 use crate::rootkit::{Finding, Severity};
 
@@ -305,7 +304,7 @@ fn findings_for(
 }
 
 fn kernel_release() -> Option<String> {
-    fs::read_to_string("/proc/sys/kernel/osrelease")
+    crate::saferead::read_kernel_text("/proc/sys/kernel/osrelease")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())

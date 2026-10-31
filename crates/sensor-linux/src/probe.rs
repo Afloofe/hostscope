@@ -1,5 +1,3 @@
-use std::fs;
-
 use crate::SensorError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -196,7 +194,7 @@ impl TierReport {
 }
 
 fn kernel_config() -> Option<String> {
-    let release = fs::read_to_string("/proc/sys/kernel/osrelease").ok()?;
+    let release = crate::saferead::read_kernel_text("/proc/sys/kernel/osrelease").ok()?;
     crate::saferead::read_scan_target(std::path::Path::new(&format!(
         "/boot/config-{}",
         release.trim()
@@ -250,7 +248,7 @@ fn lsm_boot_line(cmdline: Option<&str>, config: Option<&str>) -> LsmBootLine {
 }
 
 fn cmdline_lsm() -> Option<String> {
-    fs::read_to_string("/proc/cmdline")
+    crate::saferead::read_kernel_text("/proc/cmdline")
         .ok()
         .and_then(|c| crate::kernposture::boot_param(&c, "lsm").map(str::to_string))
 }
@@ -281,7 +279,7 @@ fn precondition_tier(
 }
 
 fn kernel_version() -> Result<(u32, u32), SensorError> {
-    let s = fs::read_to_string("/proc/sys/kernel/osrelease")
+    let s = crate::saferead::read_kernel_text("/proc/sys/kernel/osrelease")
         .map_err(|e| SensorError::Probe("cannot read /proc/sys/kernel/osrelease", e.to_string()))?;
     let mut parts = s.trim().split(['.', '-', '+']);
     let major = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -290,7 +288,7 @@ fn kernel_version() -> Result<(u32, u32), SensorError> {
 }
 
 fn cap_effective() -> Option<u64> {
-    fs::read_to_string("/proc/self/status").ok().and_then(|s| {
+    crate::saferead::read_pid_text("/proc/self/status").ok().and_then(|s| {
         s.lines()
             .find_map(|l| l.strip_prefix("CapEff:"))
             .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
@@ -329,7 +327,7 @@ pub fn probe() -> TierReport {
         },
     ));
 
-    let lsm_raw = fs::read_to_string("/sys/kernel/security/lsm").unwrap_or_default();
+    let lsm_raw = crate::saferead::read_kernel_text("/sys/kernel/security/lsm").unwrap_or_default();
     let lsm_list: Vec<&str> = lsm_raw.trim().split(',').filter(|s| !s.is_empty()).collect();
     let bpf_lsm = lsm_list.contains(&"bpf");
     findings.push(Finding::new(
@@ -382,7 +380,8 @@ pub fn probe() -> TierReport {
     ));
 
     let cfg = kernel_config();
-    let audit_host = audit_available(cfg.as_deref(), fs::read_to_string("/proc/cmdline").ok().as_deref());
+    let audit_host =
+        audit_available(cfg.as_deref(), crate::saferead::read_kernel_text("/proc/cmdline").ok().as_deref());
     findings.push(Finding::new(
         "kernel audit available",
         audit_host != Some(false),

@@ -382,8 +382,9 @@ pub(crate) fn console_model() -> hemostat_tui::ConsoleModel {
     cov.note(Source::KernelPosture, crate::coverage::kernel_posture(&kpo).into());
     push_t(&mut rows, Source::KernelPosture, &kpo.findings);
 
-    let tr = hemostat_sensor_linux::trust::report_with(&crate::snapshot::anchor_baseline(crate::snapshot::DEFAULT_STORE));
-    cov.note(Source::Trust, crate::coverage::trust(&tr).into());
+    let (anchors, refused) = crate::snapshot::arrival_anchors(crate::snapshot::DEFAULT_STORE);
+    let tr = hemostat_sensor_linux::trust::report_with(&anchors);
+    cov.note(Source::Trust, crate::coverage::trust_against_arrival(&tr, refused.as_deref()).into());
     push_t_with(&mut rows, Source::Trust, &tr.findings, &|f, sev| trust_remedy(&tr, f, sev));
 
     #[cfg(feature = "mod-scan-yara")]
@@ -404,7 +405,7 @@ pub(crate) fn console_model() -> hemostat_tui::ConsoleModel {
         ),
     );
 
-    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+    let host = hemostat_sensor_linux::saferead::read_kernel_text("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown-host".into());
 

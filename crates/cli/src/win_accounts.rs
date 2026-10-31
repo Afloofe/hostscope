@@ -54,6 +54,33 @@ pub(crate) fn rogue_among(accounts: &[Account], is_session: impl Fn(&str) -> boo
         .collect()
 }
 
+pub(crate) fn builtin_rid_refusal(sid: &str) -> Option<String> {
+    let rid = hemostat_sensor_win::accounts::local_rid(sid, None)?;
+    let builtin = match rid {
+        500 => "Administrator",
+        501 => "Guest",
+        502 => "krbtgt",
+        503 => "DefaultAccount",
+        504 => "WDAGUtilityAccount",
+        _ => return None,
+    };
+    Some(format!("its SID, {sid}, ends in relative id {rid}: it is the built-in {builtin}, whatever it is called now"))
+}
+
+pub(crate) fn net_user_command(user: &str, flag: &str) -> Option<String> {
+    crate::win_respond::paste_refusal(user).is_none().then(|| format!("net user \"{user}\" {flag}"))
+}
+
+pub(crate) fn enable_undo(user: &str, sid: &str) -> String {
+    match net_user_command(user, "/active:yes") {
+        Some(cmd) => format!("{cmd}  (for SID {sid} only: check the name is still that account first)"),
+        None => format!(
+            "re-enable the account whose SID is {sid} by hand — no command is printed, as its name holds a character a \
+             shell could read as something other than itself"
+        ),
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn session() -> Option<Session> {
     static SESSION: std::sync::OnceLock<Option<Session>> = std::sync::OnceLock::new();
@@ -115,20 +142,6 @@ fn is_active(user: &str) -> Option<bool> {
 }
 
 #[cfg(target_os = "windows")]
-fn audit(what: &str) {
-    use std::io::Write as _;
-
-    let Some(dir) = crate::win_private::log_dir(what) else { return };
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("fixes.log")) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(f, "epoch={now} {what}");
-    }
-}
-
-#[cfg(target_os = "windows")]
 pub(crate) fn disable(args: &[String], _json: bool) -> u8 {
     let Some(i) = args.iter().position(|a| a == "--disable") else {
         eprintln!("hemostat account --disable <user> [--arm]: name the local user to disable");
@@ -166,7 +179,19 @@ pub(crate) fn disable(args: &[String], _json: bool) -> u8 {
             return EXIT_POLICY;
         }
     };
-    if is_session_account(user, target_sid.as_deref(), &me) {
+
+    let Some(sid) = target_sid else {
+        eprintln!(
+            "hemostat account: refused — `{}` names no account here (it resolves to no SID). Nothing was changed",
+            h(user)
+        );
+        return EXIT_POLICY;
+    };
+    if let Some(why) = builtin_rid_refusal(&sid) {
+        eprintln!("hemostat account: refused — `{}`: {}, and is never disabled. Nothing was changed", h(user), h(&why));
+        return EXIT_POLICY;
+    }
+    if is_session_account(user, Some(&sid), &me) {
         eprintln!(
             "hemostat account: refused — `{user}` is the account this session runs as ({}). Disabling it keeps \
              this session and fails your next RDP, WinRM or SSH logon. Nothing was changed",
@@ -183,33 +208,38 @@ pub(crate) fn disable(args: &[String], _json: bool) -> u8 {
         );
         return EXIT_POLICY;
     }
+
+    let disable_cmd = net_user_command(user, "/active:no").unwrap_or_else(|| "net user, with its name in quotes".to_string());
     if leaves_no_admin(user, &report.accounts, &me) {
         eprintln!(
             "hemostat account: refused — `{user}` is the last enabled member of Administrators this host lists, and \
              this session ({}) is not an account that can log on as one, so disabling it could leave nobody able \
-             to. If administrators log on through a group (Domain Admins), disable it by hand: \
-             net user {user} /active:no. Nothing was changed",
-            h(&me.name)
+             to. If administrators log on through a group (Domain Admins), disable it by hand: {}. Nothing was \
+             changed",
+            h(&me.name),
+            h(&disable_cmd)
         );
         return EXIT_POLICY;
     }
 
     let armed = args.iter().any(|a| a == "--arm");
     if !armed {
-        println!("disable local user `{user}` (net user {user} /active:no)");
+        println!("disable local user `{}`, SID {sid} ({})", h(user), h(&disable_cmd));
         if crate::golden::is_legit(user) {
             println!("  NOTE: `{user}` is on the packet roster — disable it only if it is compromised.");
         }
-        println!("  undo: net user {user} /active:yes");
+        println!("  undo: {}", h(&enable_undo(user, &sid)));
         println!("\nNothing was changed. Add --arm to apply.");
         return EXIT_DRYRUN;
     }
     match net(&["user", user, "/active:no"]) {
         Ok(_) => {
             if is_active(user) == Some(false) {
-                audit(&format!("account disable {user}"));
-                println!("disabled local user `{user}`");
-                println!("  undo: net user {user} /active:yes");
+
+                let undo = enable_undo(user, &sid);
+                crate::win_restore::audit_or_warn(&format!("account disable {user} (SID {sid}); undo: {undo}"));
+                println!("disabled local user `{}`, SID {sid}", h(user));
+                println!("  undo: {}", h(&undo));
                 EXIT_OK
             } else {
                 eprintln!("hemostat account: ran `net user {user} /active:no` but {user} is still active");

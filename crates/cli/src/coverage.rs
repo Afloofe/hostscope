@@ -74,6 +74,20 @@ pub(crate) fn trust(r: &hemostat_sensor_linux::trust::Report) -> Covered {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "mod-tui"))]
+pub(crate) fn trust_against_arrival(r: &hemostat_sensor_linux::trust::Report, refused: Option<&str>) -> Covered {
+    let Some(why) = refused else { return trust(r) };
+    let arrival = format!(
+        "{why}; no anchor was compared with arrival, so a CA added since that can sign for any name \
+         may show as WARN, not the CRITICAL an added one is"
+    );
+    match trust(r) {
+        Covered::Fully => Covered::InPart(arrival),
+        Covered::InPart(part) => Covered::InPart(format!("{part}; {arrival}")),
+        Covered::NotAtAll(none) => Covered::NotAtAll(format!("{none}; {arrival}")),
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn accounts(r: &hemostat_sensor_linux::AccountReport) -> Covered {
     match (r.available, r.unread.is_empty()) {
@@ -161,6 +175,14 @@ pub(crate) fn injected(r: &hemostat_sensor_linux::HookedReport) -> Covered {
             "{} of {n} environment(s) refused, so the LD_PRELOAD and LD_AUDIT checks did not \
              run on them",
             r.env_unreadable
+        ));
+    }
+
+    if r.mounted_over > 0 {
+        gaps.push(format!(
+            "{} of {n} process(es) have something mounted over a file the kernel serves for them, \
+             which was not read — the proc-mount finding names them",
+            r.mounted_over
         ));
     }
     if gaps.is_empty() {

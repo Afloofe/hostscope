@@ -445,7 +445,7 @@ fn held_by(pid: u32) -> std::collections::BTreeSet<u32> {
     };
     rd.flatten()
         .filter_map(|e| e.file_name().to_str().map(str::to_owned))
-        .filter_map(|fd| fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok())
+        .filter_map(|fd| crate::saferead::read_pid_text(format!("/proc/{pid}/fdinfo/{fd}")).ok())
         .filter_map(|t| fdinfo_prog_id(&t))
         .collect()
 }
@@ -756,7 +756,7 @@ pub fn report() -> Report {
         });
     }
 
-    if let Ok(v) = fs::read_to_string("/proc/sys/kernel/unprivileged_bpf_disabled") {
+    if let Ok(v) = crate::saferead::read_kernel_text("/proc/sys/kernel/unprivileged_bpf_disabled") {
         if v.trim() == "0" {
             report.findings.push(Finding {
                 severity: Severity::Note,

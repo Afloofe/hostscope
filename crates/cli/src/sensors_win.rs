@@ -721,10 +721,19 @@ fn modules_covered(unopened: &[(bool, String)]) -> Covered {
 }
 
 #[cfg(all(target_os = "windows", feature = "mod-sensor-usn"))]
+fn usn_own_dir() -> Option<hemostat_sensor_win::usn::OwnDir> {
+    let dir = crate::win_private::verify(&[]).ok().flatten()?;
+    Some(hemostat_sensor_win::usn::OwnDir {
+        dir: dir.display().to_string(),
+        names: vec![crate::win_private::WATCHDOG_WRAPPER.to_string()],
+    })
+}
+
+#[cfg(all(target_os = "windows", feature = "mod-sensor-usn"))]
 pub(crate) fn print_usn(json: bool, volume: &str) -> u8 {
     use hemostat_sensor_win::usn;
 
-    let s = usn::sweep(volume);
+    let s = usn::sweep_with(volume, usn_own_dir());
 
     if json {
         let rows = finding_rows(&s.findings);
@@ -1865,7 +1874,7 @@ fn sysmon_swept() -> (Vec<hemostat_sensor_win::posture::Finding>, Covered) {
 #[cfg(all(target_os = "windows", feature = "mod-tui", feature = "mod-sensor-usn"))]
 fn usn_swept() -> (Vec<hemostat_sensor_win::posture::Finding>, Covered) {
 
-    let s = hemostat_sensor_win::usn::sweep("C:");
+    let s = hemostat_sensor_win::usn::sweep_with("C:", usn_own_dir());
     let c = usn_covered(&s);
     (s.findings, c)
 }

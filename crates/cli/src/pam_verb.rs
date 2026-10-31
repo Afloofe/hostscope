@@ -25,14 +25,21 @@ pub(crate) struct Finding {
     pub(crate) state: State,
 }
 
-pub(crate) fn scan() -> Result<Vec<Finding>, String> {
+pub(crate) enum Scanned {
+
+    GoldenOff,
+
+    Release { release: String, findings: Vec<Finding> },
+}
+
+pub(crate) fn scan() -> Result<Scanned, String> {
     if !crate::golden::active() {
-        return Ok(Vec::new());
+        return Ok(Scanned::GoldenOff);
     }
     let key = pam_golden::detect()?;
     let arch = pam_golden::host_arch();
     let mgr = hemostat_sensor_linux::pkg::manager();
-    Ok(judge(
+    let findings = judge(
         pam_golden::KNOWN,
         &key,
         arch,
@@ -42,7 +49,27 @@ pub(crate) fn scan() -> Result<Vec<Finding>, String> {
                 .map(|d| hex32(&d))
                 .map_err(|e| e.to_string())
         },
-    ))
+    );
+    Ok(Scanned::Release { release: release_of(&key, arch), findings })
+}
+
+fn release_of(key: &DistroKey, arch: &str) -> String {
+    format!("{} {} {arch}", key.id, key.version_id)
+}
+
+fn nothing_baked_why(release: &str, table: &[KnownModule]) -> String {
+    let mut baked: Vec<String> = Vec::new();
+    for m in table {
+        let r = format!("{} {} {}", m.distro_id, m.version_id, m.arch);
+        if !baked.contains(&r) {
+            baked.push(r);
+        }
+    }
+    let baked = if baked.is_empty() { "none".to_string() } else { baked.join(", ") };
+    format!(
+        "nothing is baked for {release} (ID and VERSION_ID from /etc/os-release, and the CPU arch); \
+         builds are baked for {baked}"
+    )
 }
 
 fn judge(
@@ -173,20 +200,17 @@ pub(crate) fn dispatch(args: &[String], json: bool) -> Option<u8> {
 }
 
 fn list(json: bool) -> u8 {
-    let findings = match scan() {
-        Ok(f) => f,
+    let (release, findings) = match scan() {
+        Ok(Scanned::Release { release, findings }) => (release, findings),
+        Ok(Scanned::GoldenOff) => return golden_off(json),
         Err(why) => return distro_unknown(&why, json),
     };
+    if findings.is_empty() {
+        return not_baked(&nothing_baked_why(&release, pam_golden::KNOWN), json);
+    }
     if json {
         let rows: Vec<String> = findings.iter().map(json_row).collect();
         jprintln!("{{\"pam_modules\":[{}]}}", rows.join(","));
-        return EXIT_OK;
-    }
-    if findings.is_empty() {
-        println!(
-            "  No baked known-good PAM modules apply here (the golden baseline is off, or this is \
-             not a pinned comp distro). Set HEMOSTAT_GOLDEN on a comp box."
-        );
         return EXIT_OK;
     }
     println!("{}", summary_line(&findings));
@@ -218,6 +242,38 @@ fn distro_unknown(why: &str, json: bool) -> u8 {
     EXIT_PARTIAL
 }
 
+const GOLDEN_OFF: &str = "  The golden baseline is off (HEMOSTAT_GOLDEN is not set), so no PAM module was \
+     checked: the baked known-good builds are for comp boxes alone. Set HEMOSTAT_GOLDEN on a comp box.";
+
+fn golden_off(json: bool) -> u8 {
+    if json {
+        jprintln!("{{\"pam_modules\":[],\"golden\":false}}");
+    } else {
+        println!("{GOLDEN_OFF}");
+    }
+    EXIT_OK
+}
+
+fn not_baked(why: &str, json: bool) -> u8 {
+    if json {
+        jprintln!("{{\"pam_modules\":[],\"not_baked\":\"{}\"}}", jesc(why));
+    } else {
+        println!(
+            "  {} — no baked known-good PAM module can be matched to this host, so none was checked.",
+            h(why)
+        );
+    }
+    EXIT_PARTIAL
+}
+
+fn unbaked_refusal(path: &str, release: &str, baked_paths: &[&str], table: &[KnownModule]) -> (u8, String) {
+    if baked_paths.is_empty() {
+        (EXIT_POLICY, format!("refusing to restore {path} — {}", nothing_baked_why(release, table)))
+    } else {
+        (EXIT_USAGE, not_baked_why(path, release, baked_paths))
+    }
+}
+
 fn restore(args: &[String], json: bool) -> u8 {
     let armed = args.iter().any(|a| a == "--arm");
     let path = match repeated_flag_values(args, "--restore-pam").as_deref() {
@@ -244,7 +300,7 @@ fn restore(args: &[String], json: bool) -> u8 {
         }
     };
     let arch = pam_golden::host_arch();
-    let release = format!("{} {} {arch}", key.id, key.version_id);
+    let release = release_of(&key, arch);
 
     let mgr = hemostat_sensor_linux::pkg::manager();
     let picked = pam_golden::pick(pam_golden::KNOWN, &key, arch, &path, |pkg| {
@@ -254,8 +310,9 @@ fn restore(args: &[String], json: bool) -> u8 {
         Some(Pick::Build(m)) => m,
         None => {
             let baked_paths = pam_golden::paths_for(pam_golden::KNOWN, &key, arch);
-            eprintln!("hemostat remediate: {}. Nothing was attempted", h(&not_baked_why(&path, &release, &baked_paths)));
-            return EXIT_USAGE;
+            let (code, why) = unbaked_refusal(&path, &release, &baked_paths, pam_golden::KNOWN);
+            eprintln!("hemostat remediate: {}. Nothing was attempted", h(&why));
+            return code;
         }
         Some(Pick::NoBuild { pkg, installed, baked }) => {
             eprintln!(
@@ -371,6 +428,8 @@ fn restore(args: &[String], json: bool) -> u8 {
         }
         Outcome::Applied(rec) => {
 
+            let journalled = crate::remediate_verb::append_record(journal.as_mut(), rec);
+
             let gated = baseline.as_ref().is_some_and(Probe::can_gate);
             let post = if gated { Some(pam_validate::probe()) } else { None };
 
@@ -385,7 +444,7 @@ fn restore(args: &[String], json: bool) -> u8 {
                     let rollback = hemostat_enforce_linux::undo(rec, &ApplyOptions::armed());
                     let rolled_back = matches!(rollback, Outcome::Applied(_));
 
-                    let kept_journal = !rolled_back && crate::remediate_verb::append_record(journal.as_mut(), rec);
+                    let kept_journal = !rolled_back && journalled;
                     drop(journal.take());
                     if !kept_journal {
                         let _ = std::fs::remove_file(&journal_path);
@@ -433,7 +492,6 @@ fn restore(args: &[String], json: bool) -> u8 {
                     EXIT_ENFORCER
                 }
                 AfterSwap::Keep | AfterSwap::KeepStillOpen | AfterSwap::Ungated => {
-                    let journalled = crate::remediate_verb::append_record(journal.as_mut(), rec);
                     if json {
                         let live = match decision {
                             AfterSwap::Keep => "passed",

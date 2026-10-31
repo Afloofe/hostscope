@@ -952,6 +952,7 @@ dependencies = [
  "hemostat-evfmt",
  "hemostat-export",
  "hemostat-fleet",
+ "hemostat-gui",
  "hemostat-lifecycle",
  "hemostat-modules",
  "hemostat-query",
@@ -1041,6 +1042,14 @@ dependencies = [
  "hemostat-evfmt",
  "hemostat-remote",
  "sha2",
+]
+
+[[package]]
+name = "hemostat-gui"
+version = "0.1.0"
+dependencies = [
+ "hemostat-tui",
+ "ratatui-core",
 ]
 
 [[package]]

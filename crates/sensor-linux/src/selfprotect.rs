@@ -166,7 +166,7 @@ pub fn shutdown_reaches_the_exempt_sender(
 }
 
 fn shutdown_path_evidence() -> (String, Option<String>) {
-    let comm = std::fs::read_to_string("/proc/1/comm")
+    let comm = crate::saferead::read_pid_text("/proc/1/comm")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unreadable".to_string());
 

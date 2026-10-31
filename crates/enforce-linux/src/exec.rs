@@ -520,23 +520,55 @@ pub fn undo_unmount(path: &Path, opts: &ApplyOptions) -> Outcome {
         });
     }
     match unmount_at(path) {
-        Ok(()) => Outcome::Applied(UndoRecord {
-            did: format!("unblocked {}: the bind mount is gone", path.display()),
-            undo: UndoKind::Irreversible { note: "unmounting is the undo".into() },
-            reversible: false,
-        }),
+        Ok((refused, null_after)) => lift_outcome(path, refused, null_after),
         Err(e) => Outcome::Failed(Failure {
             action: format!("unblock {}", path.display()),
-            reason: format!(
-                "could not unmount {}: {e}. The block is STILL IN PLACE — execution is still \
-                 refused",
-                path.display()
-            ),
+            reason: format!("could not reach {} to unmount it: {e}. Nothing was unmounted", path.display()),
         }),
     }
 }
 
-fn unmount_at(path: &Path) -> std::io::Result<()> {
+fn lift_outcome(path: &Path, refused: Option<std::io::Error>, null_after: std::io::Result<bool>) -> Outcome {
+    let p = path.display();
+    let failed = |reason: String| Outcome::Failed(Failure { action: format!("unblock {p}"), reason });
+    let lifted = |did: String| {
+        Outcome::Applied(UndoRecord {
+            did,
+            undo: UndoKind::Irreversible { note: "unmounting is the undo".into() },
+            reversible: false,
+        })
+    };
+    match (refused, null_after) {
+        (None, Ok(false)) => lifted(format!("unblocked {p}: the bind mount is gone")),
+        (Some(e), Ok(false)) if e.raw_os_error() == Some(libc::EINVAL) => lifted(format!(
+            "{p} was not blocked any more: it does not read as /dev/null and nothing is mounted \
+             over it, so there was nothing to unmount — the block was lifted by something else, or \
+             the host has restarted since"
+        )),
+        (Some(e), Ok(false)) => failed(format!(
+            "could not unmount {p}: {e}. It does not read as /dev/null, so the block is not what \
+             is in front of it now; `findmnt {p}` shows what is"
+        )),
+        (None, Ok(true)) => failed(format!(
+            "an unmount at {p} went through, but it still reads as /dev/null: something had been \
+             mounted over the block, and that is what came off. The block is STILL IN PLACE — \
+             execution is still refused. `findmnt {p}` shows what is mounted there; lifting again \
+             takes the block itself off"
+        )),
+        (Some(e), Ok(true)) => failed(format!(
+            "could not unmount {p}: {e}. The block is STILL IN PLACE — execution is still refused"
+        )),
+        (refused, Err(e)) => failed(format!(
+            "{}, and what {p} reads as now could not be read ({e}), so whether the block is still \
+             in place is not known; `findmnt {p}` shows it",
+            refused.map_or_else(|| "an unmount went through".to_string(), |r| format!("could not unmount it: {r}"))
+        )),
+    }
+}
+
+type Lifted = (Option<std::io::Error>, std::io::Result<bool>);
+
+fn unmount_at(path: &Path) -> std::io::Result<Lifted> {
     use std::io::{Error, ErrorKind};
     use std::os::fd::AsRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
@@ -548,16 +580,29 @@ fn unmount_at(path: &Path) -> std::io::Result<()> {
     } else {
         crate::paths::open_unredirected(dir)?
     };
+    let nul = |_| Error::new(ErrorKind::InvalidInput, "NUL in a path component");
+    let cname = std::ffi::CString::new(name.as_bytes()).map_err(nul)?;
     let mut target = format!("/proc/self/fd/{}/", dir.as_raw_fd()).into_bytes();
     target.extend_from_slice(name.as_bytes());
-    let target = std::ffi::CString::new(target)
-        .map_err(|_| Error::new(ErrorKind::InvalidInput, "NUL in a path component"))?;
+    let target = std::ffi::CString::new(target).map_err(nul)?;
 
     let rc = unsafe { libc::umount2(target.as_ptr(), libc::UMOUNT_NOFOLLOW) };
+    let refused = (rc != 0).then(Error::last_os_error);
+    Ok((refused, reads_as_null(&dir, &cname)))
+}
+
+fn reads_as_null(dir: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+
+    let rc = unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
     if rc != 0 {
-        return Err(Error::last_os_error());
+        let e = std::io::Error::last_os_error();
+        return if e.kind() == std::io::ErrorKind::NotFound { Ok(false) } else { Err(e) };
     }
-    Ok(())
+
+    let st = unsafe { st.assume_init() };
+    Ok(st.st_mode & libc::S_IFMT == libc::S_IFCHR && st.st_rdev == libc::makedev(1, 3))
 }
 
 pub fn can_bind_mount() -> bool {

@@ -36,7 +36,10 @@ fn self_digest() -> Option<[u8; 32]> {
     use sha2::Digest as _;
 
     #[cfg(target_os = "linux")]
-    let bytes = std::fs::read("/proc/self/exe").ok()?;
+    let bytes = hemostat_sensor_linux::saferead::read_whole_file(
+        std::path::Path::new("/proc/self/exe"),
+        hemostat_sensor_linux::saferead::MAX_HASH_BYTES,
+    )?;
     #[cfg(target_os = "windows")]
     let bytes = {
         let mut b = Vec::new();

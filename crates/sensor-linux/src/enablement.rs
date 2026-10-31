@@ -25,9 +25,25 @@ pub struct UnitFact {
 
     pub exec_starts: usize,
 
+    pub exec_start: String,
+
     pub hooks: Vec<String>,
 
     pub own: Option<Own>,
+
+    pub dbus: Option<DbusActivated>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbusActivated {
+
+    pub name: String,
+
+    pub service_package: String,
+
+    pub program: String,
+
+    pub program_package: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +122,126 @@ fn sentinel_argv(argv: &[String]) -> bool {
     matches!(argv, [_, verb, flag, _] if verb == "sentinel" && flag == "--watch")
 }
 
+const DBUS_SYSTEM_SERVICES: &str = "/usr/share/dbus-1/system-services";
+
+pub fn dbus_unit_name(id: &str) -> Option<&str> {
+    let rest = id.strip_suffix(".service")?.strip_prefix("dbus-:")?;
+    let (unique, rest) = rest.split_once('-')?;
+    if unique.is_empty() || !unique.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return None;
+    }
+    let (name, instance) = rest.rsplit_once('@')?;
+    if instance.is_empty() || !instance.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    well_known_bus_name(name).then_some(name)
+}
+
+fn well_known_bus_name(name: &str) -> bool {
+    name.len() <= 255
+        && name.split('.').count() >= 2
+        && name.split('.').all(|e| {
+            !e.is_empty()
+                && !e.starts_with(|c: char| c.is_ascii_digit())
+                && e.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DbusService {
+
+    name: String,
+
+    exec: Vec<String>,
+
+    systemd_service: bool,
+}
+
+fn parse_dbus_service(text: &str) -> Option<DbusService> {
+    let (mut in_section, mut sections) = (false, 0usize);
+    let (mut name, mut exec, mut systemd_service) = (None, None, false);
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_section = line == "[D-BUS Service]";
+            sections += usize::from(in_section);
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=').filter(|_| in_section) else { continue };
+        let value = value.trim().to_string();
+
+        let doubled = match key.trim() {
+            "Name" => name.replace(value).is_some(),
+            "Exec" => exec.replace(value).is_some(),
+            "SystemdService" => {
+                systemd_service = true;
+                false
+            }
+            _ => false,
+        };
+        if doubled {
+            return None;
+        }
+    }
+    if sections != 1 {
+        return None;
+    }
+    Some(DbusService { name: name?, exec: plain_command(&exec?)?, systemd_service })
+}
+
+fn plain_command(s: &str) -> Option<Vec<String>> {
+    const SPECIAL: &[char] = &[
+        '"', '\'', '\\', '$', '`', ';', '|', '&', '<', '>', '(', ')', '{', '}', '*', '?', '[', ']',
+        '~', '#', '%',
+    ];
+    if s.contains(SPECIAL) {
+        return None;
+    }
+    let words: Vec<String> = s.split_whitespace().map(str::to_string).collect();
+    words.first().is_some_and(|p| p.starts_with('/')).then_some(words)
+}
+
+fn exec_start_is(exec_start: &str, argv: &[String]) -> bool {
+    let Some(program) = argv.first() else { return false };
+    exec_start.starts_with(&format!("{{ path={program} ; argv[]={} ; ", argv.join(" ")))
+}
+
+fn bus_runs_one_command(u: &UnitFact) -> bool {
+    u.exec_starts == 1
+        && u.hooks.is_empty()
+        && matches!(u.service_type.as_str(), "simple" | "exec" | "dbus")
+        && u.notify_access == "none"
+}
+
+fn interpreter_of(first_line: &str) -> Option<&str> {
+    let interp = first_line.strip_prefix("#!")?.split_whitespace().next()?;
+    interp.starts_with('/').then_some(interp)
+}
+
+fn loads_interpreter_code(name: &[u8]) -> bool {
+    name.starts_with(b"PYTHON")
+        || name.starts_with(b"PERL5")
+        || name.starts_with(b"RUBY")
+        || matches!(name, b"PERLLIB" | b"NODE_OPTIONS" | b"NODE_PATH")
+}
+
+fn inert_for_a_script(environ: &[u8]) -> bool {
+    inert_environment(environ).is_some()
+        && !environ
+            .split(|b| *b == 0)
+            .any(|kv| loads_interpreter_code(kv.split(|b| *b == b'=').next().unwrap_or_default()))
+}
+
+const USER_HZ: u64 = 100;
+
+const CLOCK_SLACK: i64 = 2;
+
+fn changed_before(changed: i64, started: i64) -> bool {
+    changed.saturating_add(CLOCK_SLACK) < started
+}
+
 impl UnitFact {
 
     pub fn is_loaded(&self) -> bool {
@@ -143,7 +279,12 @@ pub fn parse_show(text: &str) -> Vec<UnitFact> {
             "Type" => cur.service_type = v.to_string(),
             "NotifyAccess" => cur.notify_access = v.to_string(),
 
-            "ExecStart" if !v.is_empty() => cur.exec_starts += 1,
+            "ExecStart" if !v.is_empty() => {
+                if cur.exec_starts == 0 {
+                    cur.exec_start = v.to_string();
+                }
+                cur.exec_starts += 1;
+            }
             _ if HOOKS.contains(&k) && !v.is_empty() && !cur.hooks.iter().any(|h| h == k) => {
                 cur.hooks.push(k.to_string());
             }
@@ -204,6 +345,29 @@ pub fn judge(units: &[UnitFact]) -> Vec<Finding> {
                 f.push(Finding::flag(Severity::Info, "HEMOSTAT's own unit", u.id.clone(), what, why));
                 continue;
             }
+            if let Some(d) = &u.dbus {
+                f.push(Finding::flag(
+                    Severity::Note,
+                    "transient unit",
+                    u.id.clone(),
+                    format!(
+                        "`{}` is the D-Bus activation of `{}`: the bus made it from the service file \
+                         `{}` ships, and its main process (pid {}) runs `{}`, which `{}` ships \
+                         unchanged",
+                        u.id, d.name, d.service_package, u.main_pid, d.program, d.program_package
+                    ),
+                    "dbus-broker starts a bus service whose file names no systemd unit as a \
+                     transient unit called dbus-<bus id>-<service>@<n>.service, so setroubleshoot \
+                     after an SELinux denial, or anything else the bus starts on demand, leaves one. \
+                     Recognised by what it runs, never by its name: the service file and every file \
+                     its command runs or reads are vouched for by the package manager, the unit runs \
+                     exactly that command, and the running image is that program or its script's \
+                     interpreter. The package database is the host's own and root can rewrite it, \
+                     which is why this stays on the page; a unit that only has the name stays \
+                     Critical",
+                ));
+                continue;
+            }
 
             let borrowed = if own_name(&u.id).is_some() {
                 " — it has the name of one of HEMOSTAT's own units, and what it runs is not \
@@ -261,7 +425,7 @@ pub fn report() -> Report {
     use std::process::Command;
 
     if let Some(init) = other_init(
-        std::fs::read_to_string("/proc/1/comm").ok().as_deref(),
+        crate::saferead::read_pid_text("/proc/1/comm").ok().as_deref(),
         std::fs::read_link("/proc/1/exe").ok().as_deref(),
         std::path::Path::new("/run/systemd/system").is_dir(),
     ) {
@@ -331,7 +495,108 @@ pub fn report() -> Report {
 
     let mut units = parse_show(&String::from_utf8_lossy(&shown.stdout));
     recognise_own(&mut units);
+    recognise_dbus(&mut units);
     conclude(names.len(), shown.status.success(), &shown.stderr, units)
+}
+
+#[cfg(target_os = "linux")]
+fn recognise_dbus(units: &mut [UnitFact]) {
+    use crate::saferead::{open_regular, read_bounded, read_proc, read_text, MAX_PROC_BYTES, NOT_REGULAR};
+    use std::os::unix::fs::MetadataExt as _;
+    use std::path::{Path, PathBuf};
+
+    const MAX_UNITS: usize = 8;
+    let regular = |p: &Path| std::fs::metadata(p).ok().filter(std::fs::Metadata::is_file);
+    let id_of = |m: &std::fs::Metadata| (m.dev(), m.ino());
+
+    let first_line = |p: &Path| -> Option<String> {
+        let (f, _) = open_regular(p, NOT_REGULAR).ok()?;
+        let (head, _) = read_bounded(&f, 256).ok()?;
+        String::from_utf8_lossy(&head).lines().next().map(str::to_string)
+    };
+    let boot = crate::persist::boot_time();
+    let mut vouching = crate::pkg::Vouching::default();
+
+    let candidates = units
+        .iter_mut()
+        .filter(|u| u.transient && u.is_loaded() && u.own.is_none() && u.main_pid > 0)
+        .filter(|u| dbus_unit_name(&u.id).is_some())
+        .take(MAX_UNITS);
+    for u in candidates {
+        let Some(name) = dbus_unit_name(&u.id).map(str::to_string) else { continue };
+        if !bus_runs_one_command(u) {
+            continue;
+        }
+        let service = Path::new(DBUS_SYSTEM_SERVICES).join(format!("{name}.service"));
+        let Ok(text) = read_text(&service) else { continue };
+        let Some(svc) = parse_dbus_service(&text) else { continue };
+        if svc.name != name || svc.systemd_service || !exec_start_is(&u.exec_start, &svc.exec) {
+            continue;
+        }
+        let Some(program) = svc.exec.first().map(PathBuf::from) else { continue };
+
+        let base = PathBuf::from(format!("/proc/{}", u.main_pid));
+        if !crate::hooked::shares_our_mount_ns(&base)
+            || std::fs::read_link(base.join("root")).ok().as_deref() != Some(Path::new("/"))
+        {
+            continue;
+        }
+        let Ok((environ, false)) = read_proc(&base.join("environ"), MAX_PROC_BYTES) else { continue };
+        if !inert_for_a_script(&environ) {
+            continue;
+        }
+        let image_now = || std::fs::metadata(base.join("exe")).ok().map(|m| id_of(&m));
+        let Some(image) = image_now() else { continue };
+        let Some(started) = crate::procfs::read_process(u.main_pid)
+            .zip(boot)
+            .and_then(|(p, b)| i64::try_from(b.saturating_add(p.starttime_ticks / USER_HZ)).ok())
+        else {
+            continue;
+        };
+        let Some(prog) = regular(&program) else { continue };
+
+        let mut runs = program.clone();
+        let mut reads: Vec<PathBuf> = svc
+            .exec
+            .iter()
+            .skip(1)
+            .filter(|a| a.starts_with('/'))
+            .map(PathBuf::from)
+            .filter(|p| regular(p).is_some())
+            .collect();
+        if id_of(&prog) != image {
+            let Some(interp) = first_line(&program).as_deref().and_then(interpreter_of).map(PathBuf::from) else {
+                continue;
+            };
+            let Ok(real) = interp.canonicalize() else { continue };
+
+            if regular(&real).map(|m| id_of(&m)) != Some(image) {
+                continue;
+            }
+            runs = real;
+            reads.push(program.clone());
+        }
+
+        let Some(service_package) = vouching.vouches_for(&service) else { continue };
+        let Some(program_package) = vouching.vouches_for(&program) else { continue };
+        if !std::iter::once(&runs).chain(reads.iter()).all(|p| vouching.vouches_for(p).is_some()) {
+            continue;
+        }
+
+        if read_text(&service).ok().as_ref() != Some(&text)
+            || image_now() != Some(image)
+            || regular(&runs).map(|m| id_of(&m)) != Some(image)
+            || !reads.iter().all(|p| regular(p).is_some_and(|m| changed_before(m.ctime(), started)))
+        {
+            continue;
+        }
+        u.dbus = Some(DbusActivated {
+            name,
+            service_package,
+            program: program.display().to_string(),
+            program_package,
+        });
+    }
 }
 
 #[cfg(target_os = "linux")]

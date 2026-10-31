@@ -16,7 +16,13 @@ use super::{Mechanism, Observation, Probe, Report};
 pub(super) const UNIT_FILES: &[&str] =
     &["systemd-system", "systemd-dropins", "systemd-user", "systemd-user-system", "systemd-timers"];
 
-pub(super) fn scan_file(m: &Mechanism, path: &Path, boot: Option<u64>, findings: &mut Vec<Finding>) -> bool {
+pub(super) fn scan_file(
+    m: &Mechanism,
+    path: &Path,
+    boot: Option<u64>,
+    vouch: &mut dyn FnMut(&Path) -> Option<String>,
+    findings: &mut Vec<Finding>,
+) -> bool {
     let display = path.display().to_string();
 
     match dead_link(path) {
@@ -34,6 +40,10 @@ pub(super) fn scan_file(m: &Mechanism, path: &Path, boot: Option<u64>, findings:
                  package removed without purging leaves behind, and also what an entry whose \
                  payload was deleted — or will be put back — looks like",
             ));
+            return true;
+        }
+        Some(DeadLink::Directory(to)) => {
+            findings.push(directory_link(m, path, display, &to));
             return true;
         }
         None => {}
@@ -90,6 +100,8 @@ pub(super) fn scan_file(m: &Mechanism, path: &Path, boot: Option<u64>, findings:
         directives(&text)
     };
     let mut flagged = false;
+
+    let mut judged: Vec<Finding> = Vec::new();
     for line in &lines {
 
         if m.id == "tmpfiles-d" {
@@ -106,7 +118,7 @@ pub(super) fn scan_file(m: &Mechanism, path: &Path, boot: Option<u64>, findings:
         let Some(payload) = payload_of(line) else { continue };
         if let Some(why) = suspicion(payload) {
             flagged = true;
-            findings.push(Finding::flag(
+            judged.push(Finding::flag(
                 Severity::Critical,
                 m.id,
                 display.clone(),
@@ -118,7 +130,7 @@ pub(super) fn scan_file(m: &Mechanism, path: &Path, boot: Option<u64>, findings:
 
         if let Some(why) = beacon_shape(payload) {
             flagged = true;
-            findings.push(Finding::flag(
+            judged.push(Finding::flag(
                 Severity::Warn,
                 m.id,
                 display.clone(),
@@ -207,7 +219,7 @@ pub(super) fn scan_file(m: &Mechanism, path: &Path, boot: Option<u64>, findings:
             for cmd in payloads {
                 if let Some(why) = suspicion(cmd) {
                     flagged = true;
-                    findings.push(Finding::flag(
+                    judged.push(Finding::flag(
                         Severity::Critical,
                         m.id,
                         display.clone(),
@@ -216,7 +228,7 @@ pub(super) fn scan_file(m: &Mechanism, path: &Path, boot: Option<u64>, findings:
                     ));
                 } else if let Some(why) = beacon_shape(cmd) {
                     flagged = true;
-                    findings.push(Finding::flag(
+                    judged.push(Finding::flag(
                         Severity::Warn,
                         m.id,
                         display.clone(),
@@ -227,6 +239,17 @@ pub(super) fn scan_file(m: &Mechanism, path: &Path, boot: Option<u64>, findings:
             }
         }
     }
+
+    if !judged.is_empty() && m.category != Category::Auth {
+        if let Some(pkg) = vouch(path) {
+            let unchanged = read_scan_target_bounded(path)
+                .is_some_and(|(again, cut)| cut == truncated && again == text);
+            if unchanged {
+                judged = judged.into_iter().map(|f| vouched(f, &pkg)).collect();
+            }
+        }
+    }
+    findings.append(&mut judged);
 
     if !flagged && !lines.is_empty() {
         findings.push(inventory_finding(m.category, m.id, &display, lines.len()));
@@ -254,6 +277,107 @@ pub(super) fn inventory_finding(
     Finding::info(id, display.to_string(), format!("{entries} directive line(s)"))
 }
 
+pub(super) fn directory_link(m: &Mechanism, path: &Path, display: String, to: &Path) -> Finding {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+
+    let target = match path.canonicalize() {
+        Ok(real) if real != to => format!("{} ({})", to.display(), real.display()),
+        _ => to.display().to_string(),
+    };
+    if let Some((reader, why)) = reads_directory_named(m.id, name) {
+        return Finding::flag(
+            Severity::Warn,
+            m.id,
+            display,
+            format!("a link to the directory {target}, which {reader}"),
+            why,
+        );
+    }
+    Finding::flag(
+        Severity::Note,
+        m.id,
+        display,
+        format!("a link to the directory {target}"),
+        "a directory is not an entry here: what reads this place takes the files in it and \
+         passes over a directory, so nothing behind this link runs from here, and it is not a \
+         path this sweep was refused. It is named because a link is put there by someone — one \
+         back to `.` or a parent is a way to send a recursive reader in circles",
+    )
+}
+
+pub(super) fn reads_directory_named(mech_id: &str, name: &str) -> Option<(&'static str, &'static str)> {
+    const UNIT_SUFFIXES: &[&str] = &[
+        ".service", ".socket", ".device", ".mount", ".automount", ".swap", ".target", ".path",
+        ".timer", ".slice", ".scope",
+    ];
+    let named = |suffixes: &[&str]| suffixes.iter().any(|s| name.len() > s.len() && name.ends_with(s));
+    if UNIT_FILES.contains(&mech_id) && named(&[".d", ".wants", ".requires", ".upholds"]) {
+        return Some((
+            "systemd follows and reads as part of the unit it is named for",
+            "systemd follows a link with this name, so what is behind it is loaded as part of \
+             that unit as if it were here, and a package does not ship one. Read what it points at",
+        ));
+    }
+    if UNIT_FILES.contains(&mech_id) && named(UNIT_SUFFIXES) {
+        return Some((
+            "systemd takes for the unit of that name, and cannot load",
+            "an entry with a unit's name in a unit directory is that unit to systemd, so a \
+             directory here is a unit that fails to load — and a unit of the same name further \
+             along the search path, the package's own, is shadowed by it. Read what it points at, \
+             and whether a unit by that name should be running",
+        ));
+    }
+    if mech_id == "sshd-config-d" && named(&[".conf"]) {
+        return Some((
+            "sshd's `Include` of sshd_config.d/*.conf reads as configuration",
+            "sshd reads every name its Include pattern matches as configuration, and a directory \
+             is not one: what sshd makes of it at its next start is not something to find out \
+             then. Read what it points at, and test the configuration with `sshd -t`",
+        ));
+    }
+    if mech_id == "networkmanager-dispatcher" && ["pre-up.d", "pre-down.d", "no-wait.d"].contains(&name) {
+        return Some((
+            "NetworkManager's dispatcher runs the scripts in",
+            "the dispatcher follows a link with this name and runs what is behind it as root on \
+             every interface change, and a package does not ship one. Read what it points at",
+        ));
+    }
+    if mech_id == "systemd-linger" {
+        return Some((
+            "logind takes, like any entry here, as that account lingering",
+            "a lingering account's user services start at boot and keep running with nobody \
+             logged in, and `loginctl enable-linger` writes an empty file here, never a link. \
+             Read what that account runs",
+        ));
+    }
+    None
+}
+
+pub(super) fn vouched(f: Finding, package: &str) -> Finding {
+    Finding {
+        severity: Severity::Note,
+        why: format!(
+            "{} — but the package manager says this file is exactly as `{package}` shipped it, \
+             so the line is the package's own rather than one added to it, and nothing is \
+             offered for removal. That answer comes from the host's own package database, which \
+             root can rewrite: if this line is not in the package's copy, the database was \
+             altered too",
+            f.why
+        ),
+        ..f
+    }
+}
+
+pub(super) fn rerun_advice(elevated: bool) -> &'static str {
+    if elevated {
+        "This sweep already ran as root, so re-running will not reach the paths that refused: a \
+         path that is not a regular file (a FIFO, socket or device is never opened), a mount that \
+         did not answer, or a security module's rule refuses even root. Look at each by hand"
+    } else {
+        "Re-run as root"
+    }
+}
+
 pub(super) fn verdict(any_path_existed: bool, any_read: bool, entries: usize, refused: usize) -> Coverage {
     if !any_path_existed {
 
@@ -274,6 +398,9 @@ pub(super) fn verdict(any_path_existed: bool, any_read: bool, entries: usize, re
 pub fn report() -> Report {
     let boot = boot_time();
     let (homes, homes_gap) = home_dirs_with_gap();
+    let elevated = crate::kernposture::euid() == Some(0);
+
+    let mut vouching = crate::pkg::Vouching::default();
     let mut findings = Vec::new();
     let mut observations = Vec::new();
 
@@ -326,7 +453,7 @@ pub fn report() -> Report {
                 Presence::Present => {}
             }
             any_path_existed = true;
-            if scan_file(m, &path, boot, &mut findings) {
+            if scan_file(m, &path, boot, &mut |p| vouching.vouches_for(p), &mut findings) {
                 any_read = true;
                 entries += 1;
             } else {
@@ -342,8 +469,11 @@ pub fn report() -> Report {
                 m.id,
                 refused.first().cloned().unwrap_or_else(|| m.name.to_string()),
                 "exists but could not be read",
-                "this mechanism is NOT clean, it is unchecked. Re-run as root; until then \
-                 treat this surface as unexamined",
+                format!(
+                    "this mechanism is NOT clean, it is unchecked. {}; until then treat this \
+                     surface as unexamined",
+                    rerun_advice(elevated)
+                ),
             ));
         }
 
@@ -354,9 +484,12 @@ pub fn report() -> Report {
                 m.id,
                 refused.first().cloned().unwrap_or_else(|| m.name.to_string()),
                 format!("read in part: {n} path(s) refused"),
-                "the paths that refused are unexamined, not clean, and what was found in \
-                 the rest says nothing about them. Re-run as root; until then treat this \
-                 mechanism as searched only where it let us look",
+                format!(
+                    "the paths that refused are unexamined, not clean, and what was found in \
+                     the rest says nothing about them. {}; until then treat this mechanism as \
+                     searched only where it let us look",
+                    rerun_advice(elevated)
+                ),
             ));
         }
 
